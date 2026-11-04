@@ -1,0 +1,4 @@
+
+import PageHolder from "../components/app/PageHolder.btsx";
+PageHolder(href='/' id={8})
+  div(className='h-screen w-full bg-surface')

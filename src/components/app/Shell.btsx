@@ -1,0 +1,7 @@
+import { type OctaneNode } from "octane";
+import ThemeProvider from "@/components/app/ThemeProvider.btsx";
+
+props {children}: {children: OctaneNode}
+ThemeProvider
+  div(className='min-h-screen w-full')
+    | #{children}

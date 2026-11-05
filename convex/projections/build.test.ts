@@ -1,6 +1,6 @@
 /// <reference types="vite/client" />
 import { convexTest } from "convex-test";
-import { beforeEach, expect, test } from "vitest";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { api } from "../_generated/api";
 import type { Id } from "../_generated/dataModel";
 import { MAX_CLAIMS } from "../claims/queries";
@@ -17,7 +17,18 @@ let otherOrgId: Id<"orgs">;
 // trust: web 0.9, directory 0.5, scraper 0.2, untrusted 0 (present but weightless)
 let sources: Id<"sources">[];
 
+// Only Date is faked: it makes claim _creationTime controllable (strictly increasing, never
+// tied) and lets a test move the clock between an incremental build and a rebuild.
+const BASE = 1_700_000_000_000;
+let clock = BASE;
+const tick = () => vi.setSystemTime(++clock);
+
+afterEach(() => vi.useRealTimers());
+
 beforeEach(async () => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  clock = BASE;
+  vi.setSystemTime(clock);
   raw = convexTest(schema, modules);
   const seeded = await raw.run(async (ctx) => {
     const orgId = await ctx.db.insert("orgs", { name: "Org 1", createdAt: 0 });
@@ -141,8 +152,17 @@ const METHODS: ClaimMethod[] = ["observed", "extracted", "inferred"];
  * observedAt all vary, and observedAt is unique per claim so the comparator never
  * has to fall through to the claim-id tiebreak (which would differ between two
  * accounts holding "the same" claims).
+ *
+ * Future-dated claims (observedAt far beyond the time they are recorded) exercise the
+ * clamp to _creationTime. Claim 1 is alone in its field's future. With `futurePair`,
+ * claims 22 and 37 are a second, competing pair in "industry": both observed/web, 37
+ * recorded later but 22 carries higher confidence, and 37 asserts the later observedAt.
+ * Clamped to creation time, 37 wins on recency. A clamp to wall-clock now would tie them
+ * (confidence picks 22) or, once the clock passes both dates, pick by raw observedAt.
+ * The pair is off for the order test, where arrival order legitimately changes
+ * _creationTime and therefore which of two future claims is newer.
  */
-function genClaims(seed: number): ClaimSpec[] {
+function genClaims(seed: number, futurePair = false): ClaimSpec[] {
   const rnd = mulberry32(seed);
   const out: ClaimSpec[] = [];
   for (let i = 0; i < 50; i++) {
@@ -156,12 +176,20 @@ function genClaims(seed: number): ClaimSpec[] {
       label: `c${i}`,
     });
   }
+  out[1] = { ...out[1], observedAt: BASE + 1e9 };
+  if (futurePair) {
+    out[22] = { ...out[22], sourceId: sources[0], method: "observed", confidence: 0.9, observedAt: BASE + 1e9 };
+    out[37] = { ...out[37], sourceId: sources[0], method: "observed", confidence: 0.6, observedAt: BASE + 2e9 };
+  }
   return out;
 }
 
 /** Insert then apply each claim in the given order, as the pipeline will. */
 async function applyInOrder(subjectId: string, specs: ClaimSpec[]) {
-  for (const spec of specs) await apply(subjectId, await append(subjectId, spec));
+  for (const spec of specs) {
+    tick();
+    await apply(subjectId, await append(subjectId, spec));
+  }
 }
 
 /** Replace claimId with the stable label so projections of different subjects compare. */
@@ -181,7 +209,7 @@ const winnersByLabel = (p: Awaited<ReturnType<typeof normalized>>) => Object.fro
 
 test("PROPERTY: rebuild equals incremental", async () => {
   for (const seed of [1, 2, 3]) {
-    const specs = genClaims(seed);
+    const specs = genClaims(seed, true);
     const id = await newAccount();
     await applyInOrder(id, specs);
 
@@ -190,6 +218,8 @@ test("PROPERTY: rebuild equals incremental", async () => {
     expect(new Set(specs.map((s) => s.method)).size).toBe(3);
     expect(new Set(specs.map((s) => s.sourceId)).size).toBeGreaterThanOrEqual(3);
     const winners = winnersByLabel(await normalized(id));
+    // 37 was recorded after 22, so the clamp (not raw observedAt, not confidence) decides.
+    expect(winners.industry).toBe("c37");
     expect(Object.keys(winners)).toHaveLength(FIELDS.length);
     // Winner is the latest-inserted claim for at most a minority of fields, so method/trust did real work.
     const latestWins = FIELDS.filter((f) => {
@@ -205,6 +235,8 @@ test("PROPERTY: rebuild equals incremental", async () => {
     // including every claimId pointer, is compared.
     const strip = ({ _id, _creationTime, ...rest }: Awaited<ReturnType<typeof getAccount>>) => rest;
     const incremental = strip(await getAccount(id));
+    // Move the clock past every observedAt: a rebuild must not depend on when it runs.
+    vi.setSystemTime(BASE + 5e9);
     await rebuild(id);
     expect(strip(await getAccount(id))).toEqual(incremental);
   }

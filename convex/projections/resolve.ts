@@ -11,12 +11,14 @@ const METHOD_RANK: Record<ClaimMethod, number> = {
 };
 
 /**
- * Effective observation time: a missing value is 0 (oldest) and a value in the
- * future is clamped to `now`, so a source cannot win by reporting tomorrow.
+ * Effective observation time: a missing value is 0 (oldest) and a value later
+ * than the moment we recorded the claim is clamped to its own `_creationTime`,
+ * so a source cannot win by reporting tomorrow. Both inputs live on the claim
+ * row, so the result never depends on when it is computed.
  */
-function effectiveObservedAt(claim: Claim, now: number): number {
+function effectiveObservedAt(claim: Claim): number {
   const at = claim.observedAt ?? 0;
-  return Math.min(Number.isFinite(at) ? at : 0, now);
+  return Math.min(Number.isFinite(at) ? at : 0, claim._creationTime);
 }
 
 /**
@@ -24,7 +26,7 @@ function effectiveObservedAt(claim: Claim, now: number): number {
  * Returns < 0 when `a` outranks `b`. The id comparison makes it a total order,
  * so the result is independent of input order.
  */
-function compareClaims(a: Claim, b: Claim, sources: SourceTrust, now: number): number {
+function compareClaims(a: Claim, b: Claim, sources: SourceTrust): number {
   const byMethod = METHOD_RANK[b.method] - METHOD_RANK[a.method];
   if (byMethod !== 0) return byMethod;
 
@@ -34,8 +36,8 @@ function compareClaims(a: Claim, b: Claim, sources: SourceTrust, now: number): n
   const trustB = sources.get(b.sourceId)?.trustWeight ?? 0;
   if (trustA !== trustB) return trustB - trustA;
 
-  const atA = effectiveObservedAt(a, now);
-  const atB = effectiveObservedAt(b, now);
+  const atA = effectiveObservedAt(a);
+  const atB = effectiveObservedAt(b);
   if (atA !== atB) return atB - atA;
 
   if (a.confidence !== b.confidence) return b.confidence - a.confidence;
@@ -51,9 +53,8 @@ function compareClaims(a: Claim, b: Claim, sources: SourceTrust, now: number): n
 export function resolveField(
   claims: Claim[],
   sources: SourceTrust,
-  now: number,
 ): { winner: Claim; contenders: Claim[] } | null {
   if (claims.length === 0) return null;
-  const contenders = [...claims].sort((a, b) => compareClaims(a, b, sources, now));
+  const contenders = [...claims].sort((a, b) => compareClaims(a, b, sources));
   return { winner: contenders[0], contenders };
 }

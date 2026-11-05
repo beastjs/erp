@@ -104,7 +104,7 @@ export async function applyClaimToProjection(
     subjectId: args.subjectId,
     field: claim.field,
   });
-  const resolved = resolveField(claims, await trustFor(ctx, orgId, claims), Date.now());
+  const resolved = resolveField(claims, await trustFor(ctx, orgId, claims));
   const others = subject.fields.filter((f) => f.field !== claim.field);
   await store(ctx, orgId, subject, args.subjectType, resolved ? [...others, toProjectedField(resolved.winner)] : others);
 }
@@ -119,12 +119,11 @@ export async function rebuildProjection(ctx: MutationCtx, args: SubjectArgs): Pr
     subjectId: args.subjectId,
   });
   const trust = await trustFor(ctx, orgId, claims);
-  const now = Date.now();
   const byField = new Map<string, Claim[]>();
   for (const c of claims) byField.set(c.field, [...(byField.get(c.field) ?? []), c]);
   const fields: ProjectedField[] = [];
   for (const group of byField.values()) {
-    const resolved = resolveField(group, trust, now);
+    const resolved = resolveField(group, trust);
     if (resolved) fields.push(toProjectedField(resolved.winner));
   }
   await store(ctx, orgId, subject, args.subjectType, fields);

@@ -8,10 +8,12 @@
  * @module
  */
 
+import type * as _shared_normalize from "../_shared/normalize.js";
 import type * as _shared_org from "../_shared/org.js";
 import type * as claims_mutations from "../claims/mutations.js";
 import type * as claims_queries from "../claims/queries.js";
 import type * as projections_build from "../projections/build.js";
+import type * as projections_identity from "../projections/identity.js";
 import type * as projections_queries from "../projections/queries.js";
 import type * as projections_resolve from "../projections/resolve.js";
 
@@ -22,10 +24,12 @@ import type {
 } from "convex/server";
 
 declare const fullApi: ApiFromModules<{
+  "_shared/normalize": typeof _shared_normalize;
   "_shared/org": typeof _shared_org;
   "claims/mutations": typeof claims_mutations;
   "claims/queries": typeof claims_queries;
   "projections/build": typeof projections_build;
+  "projections/identity": typeof projections_identity;
   "projections/queries": typeof projections_queries;
   "projections/resolve": typeof projections_resolve;
 }>;

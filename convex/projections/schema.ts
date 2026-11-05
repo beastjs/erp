@@ -1,6 +1,6 @@
 import { defineTable } from "convex/server";
 import { v, type Infer } from "convex/values";
-import { claimMethod } from "../claims/schema";
+import { claimMethod, subjectType } from "../claims/schema";
 
 /** The winning claim for one field, with enough provenance to explain it. */
 export const projectedField = v.object({
@@ -39,3 +39,19 @@ export const contacts = defineTable({
     title: v.optional(v.string()),
   }),
 }).index("by_org", ["orgId"]);
+
+/*
+ * A reversible record that `mergedFromId` is the same entity as `subjectId`.
+ * Never a destructive merge: both subjects stay. Unlinking stamps `reversedAt`
+ * rather than deleting, so the decision, its signals and its score stay auditable.
+ */
+export const identityLinks = defineTable({
+  orgId: v.id("orgs"),
+  subjectType,
+  subjectId: v.union(v.id("accounts"), v.id("contacts")),
+  mergedFromId: v.union(v.id("accounts"), v.id("contacts")),
+  score: v.number(),
+  signals: v.array(v.string()),
+  createdAt: v.number(),
+  reversedAt: v.optional(v.number()),
+}).index("by_subject", ["orgId", "subjectId"]);

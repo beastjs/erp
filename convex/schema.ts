@@ -1,12 +1,13 @@
 import { defineSchema, defineTable } from "convex/server";
 import { v } from "convex/values";
 import { claims } from "./claims/schema";
-import { accounts, contacts } from "./projections/schema";
+import { accounts, contacts, identityLinks } from "./projections/schema";
 
 export default defineSchema({
   claims,
   accounts,
   contacts,
+  identityLinks,
   orgs: defineTable({
     name: v.string(),
     createdAt: v.number(),

@@ -1,10 +1,10 @@
 /// <reference types="vite/client" />
 import { convexTest } from "convex-test";
-import { beforeEach, expect, test } from "vitest";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import type { Id } from "../_generated/dataModel";
 import schema from "../schema";
 import { DEFAULT_STRENGTH_BY_KIND, HALF_LIFE_MS, STRENGTH_WEIGHTS, decayedWeight, signalContribution, type Signal } from "./decay";
-import { activeSignals, appendSignal } from "./mutations";
+import { MAX_FUTURE_SKEW_MS, MAX_SIGNALS, activeSignals, appendSignal } from "./mutations";
 
 const modules = import.meta.glob("/convex/**/*.ts");
 const DAY = 24 * 60 * 60 * 1000;
@@ -75,7 +75,11 @@ let accountId: Id<"accounts">;
 let otherOrgAccount: Id<"accounts">;
 let otherT: typeof t;
 
+afterEach(() => vi.useRealTimers());
+
 beforeEach(async () => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(NOW);
   raw = convexTest(schema, modules);
   const s = await raw.run(async (ctx) => {
     const org = await ctx.db.insert("orgs", { name: "A", createdAt: 0 });
@@ -196,4 +200,38 @@ test("appendSignal rejects a source from another org", async () => {
     return ctx.db.insert("sources", { orgId: other, key: "x", kind: "crawler", trustWeight: 1, lawfulBasis: "legitimate_interest" });
   });
   await expect(t.run((ctx) => appendSignal(ctx, { ...base(), sourceId: foreign }))).rejects.toThrow("source not found");
+});
+
+test("fail-closed inputs are exactly 0, not merely in range", () => {
+  expect(decayedWeight({ strength: "high", observedAt: Infinity }, NOW)).toBe(0);
+  expect(decayedWeight({ strength: "high", observedAt: NaN }, NOW)).toBe(0);
+  expect(decayedWeight({ strength: "high", observedAt: NOW }, Infinity)).toBe(0);
+  for (const confidence of [Infinity, -Infinity, NaN, 5, 1.0000001, -0.1, 0]) {
+    expect(signalContribution({ strength: "high", observedAt: NOW, confidence }, NOW)).toBe(0);
+  }
+  expect(signalContribution({ strength: "high", observedAt: NOW, confidence: 1 }, NOW)).toBe(STRENGTH_WEIGHTS.high);
+});
+
+test("appendSignal rejects a future-dated observedAt beyond the skew but allows within it", async () => {
+  await expect(
+    t.run((ctx) => appendSignal(ctx, { ...base(), observedAt: Date.parse("2062-01-01") })),
+  ).rejects.toThrow("observedAt is in the future");
+  await expect(t.run((ctx) => appendSignal(ctx, { ...base(), observedAt: NOW + MAX_FUTURE_SKEW_MS + 1 }))).rejects.toThrow(
+    "observedAt is in the future",
+  );
+  await t.run((ctx) => appendSignal(ctx, { ...base(), observedAt: NOW + MAX_FUTURE_SKEW_MS }));
+});
+
+test("activeSignals refuses a partial read instead of dropping live signals behind expired ones", async () => {
+  await raw.run(async (ctx) => {
+    const orgId = (await ctx.db.query("orgs").first())!._id;
+    // one live old signal, then MAX_SIGNALS newer expired ones that would push it out of a naive window
+    await ctx.db.insert("signals", { orgId, subjectType: "account", subjectId: accountId, kind: "live", strength: "high", confidence: 1, observedAt: NOW - 100 * DAY });
+    for (let i = 0; i < MAX_SIGNALS; i++) {
+      await ctx.db.insert("signals", { orgId, subjectType: "account", subjectId: accountId, kind: `e${i}`, strength: "high", confidence: 1, observedAt: NOW - DAY - i, expiresAt: NOW - 1 });
+    }
+  });
+  await expect(
+    t.run((ctx) => activeSignals(ctx, { subjectType: "account", subjectId: accountId, now: NOW })),
+  ).rejects.toThrow(/more than 200 signals \(limit 200\)/);
 });

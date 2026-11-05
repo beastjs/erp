@@ -62,7 +62,8 @@ export function signalContribution(
   now: number,
 ): number {
   const c = signal.confidence;
-  if (!Number.isFinite(c) || c <= 0) return 0;
-  const w = decayedWeight(signal, now) * Math.min(c, 1);
+  // Fail closed: out-of-range confidence (including +Infinity, and finite values above 1) is 0, never clamped.
+  if (!Number.isFinite(c) || c <= 0 || c > 1) return 0;
+  const w = decayedWeight(signal, now) * c;
   return Number.isFinite(w) && w > 0 ? w : 0;
 }

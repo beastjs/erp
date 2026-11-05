@@ -8,6 +8,9 @@ import type { Signal, SignalStrength } from "./schema";
 /** Upper bound on signals read per subject; newest first, so the cap only drops the stalest. */
 export const MAX_SIGNALS = 200;
 
+/** A mutation may refuse observedAt this far ahead of its clock (timezone-parsed dates, drift). Catches typo'd years. */
+export const MAX_FUTURE_SKEW_MS = 24 * 60 * 60 * 1000;
+
 export type AppendSignalArgs = {
   subjectType: SubjectType;
   subjectId: string;
@@ -33,6 +36,9 @@ export async function appendSignal(ctx: MutationCtx, args: AppendSignalArgs): Pr
     throw new Error("confidence must be between 0 and 1");
   }
   if (!Number.isFinite(args.observedAt)) throw new Error("observedAt must be a finite number");
+  if (args.observedAt > Date.now() + MAX_FUTURE_SKEW_MS) {
+    throw new Error("observedAt is in the future");
+  }
   if (args.expiresAt !== undefined) {
     if (!Number.isFinite(args.expiresAt)) throw new Error("expiresAt must be a finite number");
     if (args.expiresAt <= args.observedAt) throw new Error("expiresAt must be after observedAt");
@@ -61,10 +67,10 @@ export async function appendSignal(ctx: MutationCtx, args: AppendSignalArgs): Pr
 }
 
 /**
- * KNOWN LIMITATION (unowned): this does not follow identityLinks. Signals on a merged-away account
+ * KNOWN LIMITATION (unowned, no task owns it yet; flagged for Task 10 and the final review): this does not follow identityLinks. Signals on a merged-away account
  * are stranded and never reach the survivor, so a merged account can score low for lack of intent it
  * really has. Link traversal needs decisions not yet made (transitivity, reversed links, the same
- * signal on two linked subjects); assigned to Task 10 / final review.
+ * signal on two linked subjects).
  *
  * The subject's signals that still carry weight at `now`, newest first, each annotated with its
  * decayed `weight` and its `contribution` (weight x confidence; intent uses `contribution`). Filters: zero-weight (expired) signals are omitted. `now` is an argument because
@@ -83,7 +89,14 @@ export async function activeSignals(
       q.eq("orgId", orgId).eq("subjectType", args.subjectType).eq("subjectId", subjectId),
     )
     .order("desc")
-    .take(MAX_SIGNALS);
+    .take(MAX_SIGNALS + 1);
+  // Filtering expiry happens after the read, so a silent cut could push live older signals out of the
+  // window and quietly lower intent. Refuse the partial read instead (same remedy as claimsForSubject).
+  if (rows.length > MAX_SIGNALS) {
+    throw new Error(
+      `subject ${args.subjectType}:${subjectId} has more than ${MAX_SIGNALS} signals (limit ${MAX_SIGNALS}); refusing a partial read`,
+    );
+  }
   return rows
     .map((s) => ({ ...s, weight: decayedWeight(s, args.now), contribution: signalContribution(s, args.now) }))
     .filter((s) => s.weight > 0);

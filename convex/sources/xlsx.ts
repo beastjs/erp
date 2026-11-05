@@ -270,9 +270,37 @@ function unescapeXml(s: string): string {
   return xml.replace(/_x([0-9a-fA-F]{4})_/g, (_m, h: string) => String.fromCharCode(parseInt(h, 16)));
 }
 
+/**
+ * Attributes of one open tag, read in a single left-to-right walk (every character is visited a bounded
+ * number of times, and `i` always advances). A regex with a greedy name prefix such as `[\w:.-]+\s*=`
+ * backtracks quadratically on a long run of name characters with no `=`.
+ */
 function attrs(tag: string): Record<string, string> {
   const out: Record<string, string> = {};
-  for (const m of tag.matchAll(/([\w:.-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g)) out[m[1]!] = unescapeXml(m[2] ?? m[3] ?? "");
+  const isSpace = (c: string) => c === " " || c === "\n" || c === "\t" || c === "\r";
+  const n = tag.length;
+  let i = 1; // past "<"
+  while (i < n && !isSpace(tag[i]!) && tag[i] !== ">" && tag[i] !== "/") i++; // the tag name
+  while (i < n) {
+    while (i < n && (isSpace(tag[i]!) || tag[i] === "/")) i++;
+    if (i >= n || tag[i] === ">") break;
+    const start = i;
+    while (i < n && !isSpace(tag[i]!) && tag[i] !== "=" && tag[i] !== ">" && tag[i] !== "/") i++;
+    const name = tag.slice(start, i);
+    while (i < n && isSpace(tag[i]!)) i++;
+    if (tag[i] !== "=") {
+      if (i === start) i++; // a stray character: step over it
+      continue; // an attribute with no value (not valid XML): ignored
+    }
+    i++;
+    while (i < n && isSpace(tag[i]!)) i++;
+    const q = tag[i];
+    if (q !== '"' && q !== "'") continue;
+    const end = tag.indexOf(q, i + 1);
+    if (end < 0) break;
+    if (name !== "") out[name] = unescapeXml(tag.slice(i + 1, end));
+    i = end + 1;
+  }
   return out;
 }
 

@@ -561,3 +561,22 @@ test("an unmapped cell that is garbage imports cleanly with columns, and cannot 
   expect(all[1]![1]).toBe(`${CELL_ERROR_PREFIX}invalid_shared_string: cell B3 points at missing shared string 99`);
   expect(all[2]![1]).toMatch(/^#cell_error: malformed_cell: /);
 });
+
+test("a long run of name characters with no '=' in a cell tag cannot make attribute parsing quadratic", () => {
+  // 1,000 cells x 7,000 name characters: ~7 MB inflated (inside the budget), a few KB uploaded. A regex with a greedy
+  // name prefix costs ~30 ms per tag (quadratic in tag size), i.e. ~30 s here.
+  const tag = `<c ${"a".repeat(7_000)}/>`;
+  const z = book({ sheet: row(1, s("A1", 0)) + `<row r="2">${tag.repeat(1_000)}</row>`, strings: ["H"] });
+  expect(z.length).toBeLessThan(100_000);
+  const { out, ms } = timed(() => parse(z).rows);
+  expect(out).toEqual([]);
+  expect(ms).toBeLessThan(WORK_BUDGET_MS);
+});
+
+test("attribute parsing reads names and values from both quote styles, spaces around '=', and ignores junk", () => {
+  const z = book({
+    strings: ["H"],
+    sheet: row(1, s("A1", 0)) + row(2, `<c  junk r = 'B2'   t="inlineStr" s="0" x=bare ="v"><is><t>ok</t></is></c>`),
+  });
+  expect(parse(z).rows).toEqual([["", "ok"]]);
+});

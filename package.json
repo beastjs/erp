@@ -9,6 +9,9 @@
     "preview": "rsbuild preview",
     "typecheck": "tsrx-tsc --noEmit",
     "check": "bun run typecheck && bun run build",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "check:core": "tsc --noEmit -p convex && vitest run && rsbuild build",
     "icons:build": "bun scripts/build-icons.ts --svg src/lib/icons/svg --out src/lib/icons/icons.ts",
     "icons:check": "bun scripts/build-icons.ts --svg src/lib/icons/svg --out src/lib/icons/icons.ts --check"
   },
@@ -18,6 +21,7 @@
     "@octanejs/tanstack-router": "^0.3.2",
     "beast-tsrx": "0.16.0",
     "clsx": "^2.1.1",
+    "convex": "^1.49.0",
     "octane": "0.16.0",
     "tailwind-merge": "^3.6.0"
   },
@@ -25,14 +29,17 @@
     "@beastjs/cli": "0.4.0",
     "@beastjs/devtools": "0.1.23",
     "@beastjs/page-builder": "0.3.0",
+    "@edge-runtime/vm": "^5.0.0",
     "@octanejs/rsbuild-plugin": "0.1.69",
     "@rsbuild/core": "^2.3.1",
     "@rsbuild/plugin-tailwindcss": "^2.0.3",
     "@tsrx/oxc": "0.23.0",
     "@tsrx/typescript-plugin": "0.6.3",
     "@types/node": "^26.2.0",
+    "convex-test": "^0.0.67",
     "svgo": "^4.1.0",
     "tailwindcss": "^4.3.3",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "vitest": "^5.1.0"
   }
 }

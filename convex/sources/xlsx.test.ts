@@ -585,20 +585,33 @@ test("attribute parsing reads names and values from both quote styles, spaces ar
 
 /** Blocks of "<tag " x2047 + ">" sized just UNDER MAX_TAG_CHARS, so the tag cap never fires but every `<tag ` candidate
  *  sits inside the previous tag's span: a scanner that advances by one candidate instead of past the tag is O(N*D). */
-const nested = (tag: string, bytes: number) => `<${tag} `.repeat(2047).concat(">").repeat(Math.floor(bytes / 8200));
+const nested = (tag: string, bytes: number) => {
+  const reps = Math.floor(8_000 / (tag.length + 2)); // block just under MAX_TAG_CHARS whatever the tag name's length
+  const block = `<${tag} `.repeat(reps) + ">";
+  return block.repeat(Math.floor(bytes / block.length));
+};
 
 test("a '>' that eventually arrives cannot make a structural-part scan quadratic (styles, rels, workbook)", () => {
   const FOUR_MIB = 4 * 1024 * 1024 - 4096;
   const base = { sheet: row(1, s("A1", 0)), strings: ["H"] };
-  const cases: Array<[string, Book]> = [
-    ["styles", { ...base, styles: `<styleSheet ${NS}><cellXfs>${nested("xf", FOUR_MIB)}</cellXfs></styleSheet>` }],
-    ["rels", { ...base, extra: { "xl/_rels/workbook.xml.rels": `<Relationships>${nested("Relationship", FOUR_MIB)}</Relationships>` } }],
-    ["workbook", { ...base, extra: { "xl/workbook.xml": `<workbook ${NS}>${nested("sheet", FOUR_MIB)}</workbook>` } }],
+  const NO_SHEET = "corrupt_workbook: a sheet has no name or relationship";
+  // [name, workbook, what must happen]: asserting the outcome as well as the time, so failing at byte 0 would not pass.
+  const cases: Array<[string, Book, string]> = [
+    ["styles", { ...base, styles: `<styleSheet ${NS}><cellXfs>${nested("xf", FOUR_MIB)}</cellXfs></styleSheet>` }, "parsed"],
+    ["rels", { ...base, extra: { "xl/_rels/workbook.xml.rels": `<Relationships>${nested("Relationship", FOUR_MIB)}</Relationships>` } }, NO_SHEET],
+    ["workbook", { ...base, extra: { "xl/workbook.xml": `<workbook ${NS}>${nested("sheet", FOUR_MIB)}</workbook>` } }, NO_SHEET],
   ];
-  for (const [name, b] of cases) {
+  for (const [name, b, expected] of cases) {
     const z = book(b);
     expect(z.length).toBeLessThan(200_000);
-    const { ms } = timed(() => message(() => parse(z)));
+    const { out, ms } = timed(() => {
+      try {
+        return parse(z).headers.join() === "H" ? "parsed" : "wrong table";
+      } catch (e) {
+        return (e as Error).message;
+      }
+    });
+    expect([name, out]).toEqual([name, expected]);
     // Tighter than WORK_BUDGET_MS on purpose: the structural-tag-count cap already bounds a scanner that fails to advance
     // to ~2.5 s per part, so a 5 s budget could not tell it from the fixed one. Fixed code takes tens of milliseconds.
     expect([name, ms < STRUCTURAL_BUDGET_MS]).toEqual([name, true]);
@@ -640,4 +653,24 @@ test("numeric whitespace entities are data whether or not columns is passed; an 
   expect(b[1]![1]).toMatch(/^#cell_error: invalid_number: cell B3 /);
   const empty = book({ strings: ["H"], sheet: row(1, s("A1", 0)) + row(2, '<c r="" t="inlineStr"><is><t>x</t></is></c>') });
   expect(parse(empty).rows).toEqual([["x"]]);
+});
+
+test("an open tag that never ends, arriving over thousands of inflate feeds, is refused by name without re-scanning the buffer each time", () => {
+  // ~8 MB of near-incompressible attribute-like text (5 bits per character) after "<row": about 1,200 feeds of ~7 KB each.
+  // A scanner that re-searches the accumulated buffer for '>' on every feed does ~5e9 character steps (many seconds).
+  let x = 123456789;
+  const alphabet = "abcdefghijklmnopqrstuvwxyz012345 ";
+  const parts: string[] = [];
+  for (let k = 0; k < 800; k++) {
+    let chunk = "";
+    for (let i = 0; i < 10_000; i++) {
+      x ^= x << 13; x ^= x >>> 17; x ^= x << 5; // xorshift32
+      chunk += alphabet[(x >>> 0) % 33];
+    }
+    parts.push(chunk);
+  }
+  const z = book({ strings: ["H"], sheet: row(1, s("A1", 0)) + `<row r="2" ${parts.join("")}` });
+  const { out, ms } = timed(() => message(() => parse(z)));
+  expect(out).toBe("corrupt_workbook: an unterminated or oversized <row> tag");
+  expect(ms).toBeLessThan(WORK_BUDGET_MS);
 });

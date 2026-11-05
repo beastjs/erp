@@ -204,6 +204,9 @@ class ElementScanner {
       }
       const gt = tagEnd(this.buf, start);
       if (gt < 0) {
+        // The open tag has not finished arriving. Without a bound, every feed would re-scan the whole accumulated
+        // buffer for its '>' (quadratic in the feeds); a real <row>/<si> open tag is tiny, so refuse an oversized one.
+        if (this.buf.length - start > MAX_TAG_CHARS) throw new Error(`corrupt_workbook: an unterminated or oversized <${this.tag}> tag`);
         pos = start;
         break;
       }
@@ -324,7 +327,12 @@ function openTag(xml: string): string {
 const MAX_TAG_CHARS = 8 * 1024;
 /** Excel's own column limit: a row with more `<c>` than this is not a spreadsheet row. */
 const MAX_CELLS_PER_ROW = 16_384;
-/** Far above any real part (Excel allows 64,000 cell formats, 255 sheets); a cap on structural tag count. */
+/**
+ * Far above any real part (Excel allows 64,000 cell formats, 255 sheets); a cap on structural tag count.
+ * WARNING: the "'>' that eventually arrives" timing test in xlsx.test.ts only discriminates a scanner that fails to
+ * advance BECAUSE of this cap: it bounds that scanner to ~2.5 s per part against ~tens of ms for the linear one.
+ * Raising this cap makes the test stronger; lowering it below ~100,000 makes the test silently pass a quadratic scan.
+ */
 const MAX_STRUCTURAL_TAGS = 200_000;
 
 /** Index of the next `<tag` that is really that tag (followed by whitespace, `/` or `>`), or -1. */

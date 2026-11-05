@@ -3,7 +3,7 @@ import { convexTest } from "convex-test";
 import { beforeEach, expect, test } from "vitest";
 import type { Id } from "../_generated/dataModel";
 import schema from "../schema";
-import { DEFAULT_STRENGTH_BY_KIND, HALF_LIFE_MS, STRENGTH_WEIGHTS, decayedWeight, type Signal } from "./decay";
+import { DEFAULT_STRENGTH_BY_KIND, HALF_LIFE_MS, STRENGTH_WEIGHTS, decayedWeight, signalContribution, type Signal } from "./decay";
 import { activeSignals, appendSignal } from "./mutations";
 
 const modules = import.meta.glob("/convex/**/*.ts");
@@ -149,4 +149,51 @@ test("appendSignal rejects bad confidence, bad times and foreign or missing subj
 
 test("appendSignal without an org identity fails closed", async () => {
   await expect(raw.run((ctx) => appendSignal(ctx, base()))).rejects.toThrow("no org context");
+});
+
+test("a half-confidence signal contributes half as much as an identical full-confidence one", () => {
+  const full = signalContribution({ ...sig({ observedAt: NOW - 10 * DAY }), confidence: 1 }, NOW);
+  const half = signalContribution({ ...sig({ observedAt: NOW - 10 * DAY }), confidence: 0.5 }, NOW);
+  expect(full).toBeGreaterThan(0);
+  expect(half).toBeCloseTo(full / 2, 12);
+});
+
+test("signalContribution is never NaN, negative or Infinity", () => {
+  for (const confidence of [NaN, Infinity, -Infinity, -1, 0, 0.3, 1, 5])
+    for (const now of [NOW, NaN, Infinity])
+      for (const observedAt of [NOW, NaN, -Infinity, NOW + DAY]) {
+        const c = signalContribution({ strength: "high", observedAt, confidence }, now);
+        expect(Number.isFinite(c)).toBe(true);
+        expect(c).toBeGreaterThanOrEqual(0);
+        expect(c).toBeLessThanOrEqual(STRENGTH_WEIGHTS.high);
+      }
+});
+
+test("activeSignals annotates contribution = weight x confidence", async () => {
+  await t.run((ctx) => appendSignal(ctx, { ...base(), confidence: 0.5 }));
+  const [s] = await t.run((ctx) => activeSignals(ctx, { subjectType: "account", subjectId: accountId, now: NOW }));
+  expect(s.contribution).toBeCloseTo(s.weight * 0.5, 12);
+});
+
+test("appendSignal rejects an exact duplicate event but allows distinct ones", async () => {
+  const sourceId = await raw.run(async (ctx) => {
+    const org = (await ctx.db.query("orgs").first())!._id;
+    return ctx.db.insert("sources", { orgId: org, key: "web", kind: "crawler", trustWeight: 1, lawfulBasis: "legitimate_interest" });
+  });
+  const ev = { ...base(), sourceId };
+  await t.run((ctx) => appendSignal(ctx, ev));
+  await expect(t.run((ctx) => appendSignal(ctx, { ...ev, confidence: 0.2 }))).rejects.toThrow("duplicate signal");
+  // different observedAt, kind, or source are different events
+  await t.run((ctx) => appendSignal(ctx, { ...ev, observedAt: ev.observedAt - 1 }));
+  await t.run((ctx) => appendSignal(ctx, { ...ev, kind: "executive_hired" }));
+  await t.run((ctx) => appendSignal(ctx, { ...ev, sourceId: undefined }));
+  expect(await raw.run((ctx) => ctx.db.query("signals").collect())).toHaveLength(4);
+});
+
+test("appendSignal rejects a source from another org", async () => {
+  const foreign = await raw.run(async (ctx) => {
+    const other = (await ctx.db.query("orgs").collect())[1]._id;
+    return ctx.db.insert("sources", { orgId: other, key: "x", kind: "crawler", trustWeight: 1, lawfulBasis: "legitimate_interest" });
+  });
+  await expect(t.run((ctx) => appendSignal(ctx, { ...base(), sourceId: foreign }))).rejects.toThrow("source not found");
 });

@@ -51,3 +51,18 @@ export function decayedWeight(
   const w = base * Math.pow(0.5, age / halfLife);
   return Number.isFinite(w) && w > 0 ? w : 0;
 }
+
+/**
+ * What a signal contributes to intent: decayedWeight x confidence. INTENT SCORING MUST USE THIS,
+ * NOT decayedWeight, or an unverified rumour counts as much as a confirmed announcement.
+ * Same guarantees as decayedWeight: finite, never negative, never above the strength's base weight.
+ */
+export function signalContribution(
+  signal: Pick<Signal, "strength" | "observedAt" | "expiresAt" | "confidence">,
+  now: number,
+): number {
+  const c = signal.confidence;
+  if (!Number.isFinite(c) || c <= 0) return 0;
+  const w = decayedWeight(signal, now) * Math.min(c, 1);
+  return Number.isFinite(w) && w > 0 ? w : 0;
+}

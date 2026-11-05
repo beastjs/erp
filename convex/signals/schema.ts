@@ -21,4 +21,6 @@ export const signals = defineTable({
   confidence: v.number(),
   observedAt: v.number(),
   expiresAt: v.optional(v.number()),
+  // Which source reported the event; part of the exact-duplicate key in appendSignal.
+  sourceId: v.optional(v.id("sources")),
 }).index("by_subject_observed", ["orgId", "subjectType", "subjectId", "observedAt"]);

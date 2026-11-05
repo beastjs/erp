@@ -1,5 +1,6 @@
 import { defineTable } from "convex/server";
 import { v } from "convex/values";
+import type { Doc } from "../_generated/dataModel";
 
 export const claimMethod = v.union(
   v.literal("observed"),
@@ -10,6 +11,7 @@ export const subjectType = v.union(v.literal("account"), v.literal("contact"));
 
 export type ClaimMethod = "observed" | "extracted" | "inferred";
 export type SubjectType = "account" | "contact";
+export type Claim = Doc<"claims">;
 
 /**
  * Append-only: one row is one field assertion. Rows are never patched,

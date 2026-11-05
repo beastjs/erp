@@ -11,6 +11,7 @@
 import type * as _shared_org from "../_shared/org.js";
 import type * as claims_mutations from "../claims/mutations.js";
 import type * as claims_queries from "../claims/queries.js";
+import type * as projections_resolve from "../projections/resolve.js";
 
 import type {
   ApiFromModules,
@@ -22,6 +23,7 @@ declare const fullApi: ApiFromModules<{
   "_shared/org": typeof _shared_org;
   "claims/mutations": typeof claims_mutations;
   "claims/queries": typeof claims_queries;
+  "projections/resolve": typeof projections_resolve;
 }>;
 
 /**

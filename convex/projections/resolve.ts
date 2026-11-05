@@ -1,7 +1,7 @@
-import type { Doc, Id } from "../_generated/dataModel";
-import type { ClaimMethod } from "../claims/schema";
+import type { Id } from "../_generated/dataModel";
+import type { Claim, ClaimMethod } from "../claims/schema";
 
-export type Claim = Doc<"claims">;
+export type { Claim };
 export type SourceTrust = Map<Id<"sources">, { trustWeight: number }>;
 
 const METHOD_RANK: Record<ClaimMethod, number> = {
@@ -28,6 +28,8 @@ function compareClaims(a: Claim, b: Claim, sources: SourceTrust, now: number): n
   const byMethod = METHOD_RANK[b.method] - METHOD_RANK[a.method];
   if (byMethod !== 0) return byMethod;
 
+  // A source absent from the map is deliberately trust 0: it ranks last within
+  // its method tier rather than outranking a trusted source.
   const trustA = sources.get(a.sourceId)?.trustWeight ?? 0;
   const trustB = sources.get(b.sourceId)?.trustWeight ?? 0;
   if (trustA !== trustB) return trustB - trustA;

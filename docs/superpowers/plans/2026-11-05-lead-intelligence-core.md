@@ -24,6 +24,8 @@
 - **Do not use `bun run check`, and do not try to fix what it reports.** `src/` carries 40 pre-existing type errors: `src/hooks/` imports seven `src/lib/` modules that do not exist (`iconify`, `svg-optimizer`, `image-converter`, `custom-icon-set`, `icon-favorites`, `svg-symbol`, `favorite-icon-import`), plus implicit-`any` fallout and a bad `IconName` import in `src/lib/navs.ts`. They predate this plan, the user has chosen to leave them, and they are out of scope for every task here. `convex/tsconfig.json` already sets `strict: true` and excludes `_generated`, so the new code is still fully checked.
 - Touch nothing under `src/` in any task. This plan adds `convex/` and `package.json` scripts only.
 - Pin the existing toolchain: `octane@0.16.0`, Bun as the runner. Do not upgrade existing dependencies. `convex@^1.49.0` and a scaffolded `convex/_generated/` are already present from a vendor install; Task 1 verifies and keeps them rather than reinstalling.
+- Test module maps use `import.meta.glob("/convex/**/*.ts")` (root-absolute). Vite rewrites same-directory keys in nested relative globs, so `"../**/*.ts"` breaks for tests in a subdirectory and `convex-test` then cannot resolve modules. `convex/_shared/org.test.ts` predates this convention and keeps its relative form because it passes; all new tests use the absolute one.
+- Running `bunx convex codegen` is permitted. It uploads functions to the dev deployment in `.env.local`, which the human partner has confirmed is disposable.
 - Read `convex/_generated/ai/guidelines.md` before writing any Convex code — the repo's `CLAUDE.md` requires it, and it overrides training-data assumptions about Convex APIs.
 
 ## Review Focus

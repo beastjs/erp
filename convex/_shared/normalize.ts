@@ -58,12 +58,18 @@ export function normalizePersonName(raw: string): string | null {
   return key.length > 0 ? key : null;
 }
 
-/** "https://www.LinkedIn.com/in/Jane/?x=1" -> "linkedin.com/in/jane". Null when no host and path remain. */
+/**
+ * "https://www.LinkedIn.com/in/Jane/?x=1" -> "linkedin.com/in/jane". Null unless URL-shaped: no
+ * whitespace, a dotted host, and a non-empty path (a bare host or a name like "j. smith" identifies nobody).
+ */
 export function normalizeProfileUrl(raw: string): string | null {
-  let s = base(raw).replace(/^[a-z][a-z0-9+.-]*:\/\//, "").replace(/^www\./, "");
-  s = s.split(/[?#]/)[0] ?? "";
-  s = s.replace(/\/+$/, "");
-  return s.includes(".") ? s : null;
+  const t = raw.normalize("NFKC").trim();
+  if (/\s/.test(t)) return null;
+  let s = t.toLowerCase().replace(/^[a-z][a-z0-9+.-]*:\/\//, "").replace(/^www\./, "");
+  s = (s.split(/[?#]/)[0] ?? "").replace(/\/+$/, "");
+  const slash = s.indexOf("/");
+  if (slash <= 0 || slash === s.length - 1) return null;
+  return s.slice(0, slash).includes(".") ? s : null;
 }
 
 /** Digits only (leading "+" dropped); null when fewer than 5 digits remain. */

@@ -4,6 +4,7 @@ import { beforeEach, expect, test } from "vitest";
 import { api } from "../_generated/api";
 import type { Id } from "../_generated/dataModel";
 import schema from "../schema";
+import { normalizeProfileUrl } from "../_shared/normalize";
 import { insertCandidate, registerSource } from "./mutations";
 import { CANDIDATE_CONTRACT_VERSION, computeDedupeHash, validateCandidate } from "./contract";
 
@@ -227,4 +228,15 @@ test("insertCandidate rejects a run from another org", async () => {
   await expect(
     t.run((ctx) => insertCandidate(ctx, { candidate: minimal(), sourceId, runId: foreignRun })),
   ).rejects.toThrow("run not found");
+});
+
+test("non-URL profileUrl values are not profile keys and do not collide", () => {
+  for (const bad of ["j. smith", "linkedin.com", "https://linkedin.com/", "www.linkedin.com"]) {
+    expect(normalizeProfileUrl(bad)).toBeNull();
+  }
+  expect(normalizeProfileUrl("HTTPS://www.linkedin.com/in/X/?a=1")).toBe("linkedin.com/in/x");
+  const h = (person: object) => computeDedupeHash({ company: { domain: "acme.com" }, person, acquisition: acq });
+  expect(h({ fullName: "Jane Doe", profileUrl: "linkedin.com" })).not.toBe(h({ fullName: "John Roe", profileUrl: "linkedin.com" }));
+  // a lone non-URL profileUrl identifies nobody
+  expect(validateCandidate({ company: { domain: "acme.com" }, person: { profileUrl: "j. smith" }, acquisition: acq }).ok).toBe(false);
 });

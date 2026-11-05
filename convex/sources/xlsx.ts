@@ -281,12 +281,96 @@ function openTag(xml: string): string {
   return xml.slice(0, tagEnd(xml, 0) + 1);
 }
 
-/** Concatenated text runs of a shared string / inline string, excluding phonetic (`rPh`) runs. */
+/*
+ * Every scan below is index based (indexOf plus a bounded delimiter check) and a failed candidate
+ * either throws or moves forward for good, so cost is linear in the input. Regexes with a lazy or
+ * negated-class body re-scan to the end of the input for every unterminated candidate, which is
+ * quadratic: a ~1 KB upload of repeated "<c" tokens is enough to burn minutes of CPU while every
+ * byte bound is respected. The byte budget bounds bytes, not work, so work must be linear by construction.
+ */
+
+/** A longest legitimate open tag is a few hundred characters; anything longer is not worth interpreting. */
+const MAX_TAG_CHARS = 8 * 1024;
+/** Excel's own column limit: a row with more `<c>` than this is not a spreadsheet row. */
+const MAX_CELLS_PER_ROW = 16_384;
+
+/** Index of the next `<tag` that is really that tag (followed by whitespace, `/` or `>`), or -1. */
+function nextOpen(xml: string, tag: string, from: number): number {
+  const needle = `<${tag}`;
+  for (let i = xml.indexOf(needle, from); i >= 0; i = xml.indexOf(needle, i + 1)) {
+    const c = xml[i + needle.length];
+    if (c === " " || c === ">" || c === "/" || c === "\n" || c === "\t" || c === "\r") return i;
+  }
+  return -1;
+}
+
+/** Every `<tag ...>` open tag in `xml` (a small structural part), as written. Unterminated or oversized is corrupt. */
+function tagsOf(xml: string, tag: string): string[] {
+  const out: string[] = [];
+  for (let i = nextOpen(xml, tag, 0); i >= 0; i = nextOpen(xml, tag, i + 1)) {
+    const gt = tagEnd(xml, i);
+    if (gt < 0 || gt - i > MAX_TAG_CHARS) throw new Error(`corrupt_workbook: an unterminated or oversized <${tag}> tag`);
+    out.push(xml.slice(i, gt + 1));
+  }
+  return out;
+}
+
+/** Text of the first `<tag>..</tag>` child ("" for a self-closed one), undefined if absent. */
+function childText(inner: string, tag: string): string | undefined {
+  const i = nextOpen(inner, tag, 0);
+  if (i < 0) return undefined;
+  const gt = tagEnd(inner, i);
+  if (gt < 0) throw new CellError(`malformed_cell: an unterminated <${tag}> tag`);
+  if (inner[gt - 1] === "/") return "";
+  const end = inner.indexOf(`</${tag}>`, gt + 1);
+  if (end < 0) throw new CellError(`malformed_cell: <${tag}> is never closed`);
+  return inner.slice(gt + 1, end);
+}
+
+/** The `<c>` elements of a row body, split by index so a legal `>` inside an attribute value cannot mis-split one. */
+function splitCells(row: string, from: number): Array<{ open: string; inner: string | undefined }> {
+  const out: Array<{ open: string; inner: string | undefined }> = [];
+  for (let i = nextOpen(row, "c", from); i >= 0; ) {
+    if (out.length >= MAX_CELLS_PER_ROW) throw new Error(`too_many_columns: a row has more than ${MAX_CELLS_PER_ROW} cells`);
+    const gt = tagEnd(row, i);
+    if (gt < 0 || gt - i > MAX_TAG_CHARS) throw new Error("corrupt_workbook: an unterminated or oversized <c> tag");
+    if (row[gt - 1] === "/") {
+      out.push({ open: row.slice(i, gt + 1), inner: undefined });
+      i = nextOpen(row, "c", gt + 1);
+      continue;
+    }
+    const end = row.indexOf("</c>", gt + 1);
+    if (end < 0) throw new Error("corrupt_workbook: a <c> element is never closed");
+    out.push({ open: row.slice(i, gt + 1), inner: row.slice(gt + 1, end) });
+    i = nextOpen(row, "c", end + 4);
+  }
+  return out;
+}
+
+/** Concatenated text runs of a shared string / inline string, excluding phonetic (`rPh`) runs. One linear pass. */
 function richText(xml: string): string {
-  const body = xml.replace(/<rPh\b[\s\S]*?<\/rPh>/g, "");
   let s = "";
-  for (const m of body.matchAll(/<t(?:\s[^>]*)?>([\s\S]*?)<\/t>/g)) s += unescapeXml(m[1]!);
-  return s;
+  let pos = 0;
+  let nextT = -2;
+  let nextP = -2;
+  for (;;) {
+    if (nextT !== -1 && nextT < pos) nextT = nextOpen(xml, "t", pos);
+    if (nextP !== -1 && nextP < pos) nextP = nextOpen(xml, "rPh", pos);
+    const useP = nextP >= 0 && (nextT < 0 || nextP < nextT);
+    const i = useP ? nextP : nextT;
+    if (i < 0) return s;
+    const tag = useP ? "rPh" : "t";
+    const gt = tagEnd(xml, i);
+    if (gt < 0) throw new CellError(`malformed_cell: an unterminated <${tag}> tag`);
+    if (xml[gt - 1] === "/") {
+      pos = gt + 1;
+      continue;
+    }
+    const end = xml.indexOf(`</${tag}>`, gt + 1);
+    if (end < 0) throw new CellError(`malformed_cell: <${tag}> is never closed`);
+    if (!useP) s += unescapeXml(xml.slice(gt + 1, end));
+    pos = end + tag.length + 3;
+  }
 }
 
 // ------------------------------------------------------------------ numbers and dates
@@ -294,11 +378,13 @@ function richText(xml: string): string {
 /** Exact decimal text of an Excel number, never routed through a float, never in exponent form. */
 function numberText(raw: string, where: string): string {
   const t = raw.trim();
+  // Real numbers are at most ~25 characters. The cap also bounds the regex work below on hostile input.
+  if (t.length > 64) throw new CellError(`invalid_number: ${where} holds a ${t.length} character number`);
   if (/^-?\d+(\.\d+)?$/.test(t)) return t;
   const m = /^([-+]?)(\d*)\.?(\d*)[eE]([-+]?\d+)$/.exec(t);
-  if (!m || (m[2] === "" && m[3] === "")) throw new Error(`corrupt_workbook: ${where} holds a non-numeric value "${t}"`);
+  if (!m || (m[2] === "" && m[3] === "")) throw new CellError(`invalid_number: ${where} holds a non-numeric value "${t}"`);
   const exp = parseInt(m[4]!, 10);
-  if (Math.abs(exp) > 400) throw new Error(`corrupt_workbook: ${where} has an absurd exponent`);
+  if (Math.abs(exp) > 400) throw new CellError(`invalid_number: ${where} has an absurd exponent`);
   const digits = m[2]! + m[3]!;
   const point = m[2]!.length + exp;
   let int: string;
@@ -329,6 +415,7 @@ type NumFmt = { kind: "date" | "time" | null; code: string | undefined };
 
 /** A cell is a date because of its number format, never its value. */
 function classifyFormat(id: number, code: string | undefined): NumFmt {
+  if (code !== undefined && code.length > 256) return { kind: null, code: undefined }; // not a real format; also bounds regex work
   if (code === undefined) {
     if (BUILTIN_DATE_IDS.has(id)) return { kind: "date", code };
     if (BUILTIN_TIME_IDS.has(id)) return { kind: "time", code };
@@ -466,10 +553,16 @@ function colIndex(ref: string): number {
  *   `YYYY-MM-DD`, or `YYYY-MM-DDTHH:MM:SSZ` (UTC) when the cell carries a time, which
  *   `Date.parse` reads unambiguously; time-only cells as `HH:MM:SS`. The workbook's 1900 or 1904
  *   epoch is honoured, 1900 leap-year bug included. A date-formatted cell that is not a real date
- *   (serial 60, zero, negative) throws `invalid_date`, because the mapper would otherwise read a
- *   bare "60" as epoch milliseconds. ISO date cells (t="d") pass through.
- * - BOOLEANS are TRUE/FALSE; error cells keep their text (#N/A), which no validator will accept.
- * - FORMULAS yield the cached value; a formula with no cached value throws `uncached_formula`.
+ *   (serial 60, zero, negative) is a bad CELL (`invalid_date`), because the mapper would otherwise
+ *   read a bare "60" as epoch milliseconds. ISO date cells (t="d") pass through.
+ * - BOOLEANS are TRUE/FALSE; Excel error values (#N/A) are bad cells (`error_value`).
+ * - FORMULAS yield the cached value; a formula with no cached value is a bad cell (`uncached_formula`).
+ * - BAD CELLS (also `invalid_number`, `invalid_shared_string`, `malformed_cell`) never throw: see CELL_ERROR_PREFIX.
+ *
+ * KNOWN, INTENTIONAL DIVERGENCE FROM CSV: `parseCsv` keeps a `,,` line as a record (the mapper then
+ * rejects it, so it shows up as a rejected row), while an all-blank spreadsheet row has no cells at all
+ * and is dropped here. Row numbers therefore count non-blank rows only, as the CSV reader's do for
+ * blank lines but not for `,,` lines.
  * - SHAPE: fully blank rows are dropped (as blank lines are in CSV) and the first non-blank row is
  *   the header. Headers are trimmed; a blank interior header stays "" (unmappable, as in CSV) and
  *   trailing blank headers are dropped. Merged cells keep their value in the top-left cell only.
@@ -489,14 +582,14 @@ export function parseXlsx(bytes: Uint8Array, opts: XlsxOptions): { headers: stri
   const relsEntry = entries.get("xl/_rels/workbook.xml.rels");
   if (!relsEntry) throw new Error("not_xlsx: the archive has no xl/_rels/workbook.xml.rels");
   const rels = new Map<string, { target: string; type: string }>();
-  for (const m of readSmallText(bytes, relsEntry, budget).matchAll(/<Relationship\b[^>]*>/g)) {
-    const a = attrs(m[0]);
+  for (const tag of tagsOf(readSmallText(bytes, relsEntry, budget), "Relationship")) {
+    const a = attrs(tag);
     if (a.Id && a.Target) rels.set(a.Id, { target: a.Target, type: a.Type ?? "" });
   }
-  const date1904 = /^(1|true)$/i.test(attrs(/<workbookPr\b[^>]*>/.exec(wbXml)?.[0] ?? "").date1904 ?? "");
+  const date1904 = /^(1|true)$/i.test(attrs(tagsOf(wbXml, "workbookPr")[0] ?? "").date1904 ?? "");
   const sheets: SheetRef[] = [];
-  for (const m of wbXml.matchAll(/<sheet\b[^>]*>/g)) {
-    const a = attrs(m[0]);
+  for (const tag of tagsOf(wbXml, "sheet")) {
+    const a = attrs(tag);
     const rid = Object.entries(a).find(([k]) => k === "id" || k.endsWith(":id"))?.[1];
     const rel = rid ? rels.get(rid) : undefined;
     if (!a.name || !rel) throw new Error("corrupt_workbook: a sheet has no name or relationship");
@@ -529,13 +622,18 @@ export function parseXlsx(bytes: Uint8Array, opts: XlsxOptions): { headers: stri
     if (e) {
       const styles = readSmallText(bytes, e, budget);
       const custom = new Map<number, string>();
-      for (const m of styles.matchAll(/<numFmt\b[^>]*>/g)) {
-        const a = attrs(m[0]);
+      for (const tag of tagsOf(styles, "numFmt")) {
+        const a = attrs(tag);
         if (a.numFmtId !== undefined && a.formatCode !== undefined) custom.set(Number(a.numFmtId), a.formatCode);
       }
-      const xfs = /<cellXfs\b[^>]*>([\s\S]*?)<\/cellXfs>/.exec(styles)?.[1] ?? "";
-      for (const m of xfs.matchAll(/<xf\b[^>]*>/g)) {
-        const id = Number(attrs(m[0]).numFmtId ?? 0);
+      let xfs = "";
+      try {
+        xfs = childText(styles, "cellXfs") ?? "";
+      } catch {
+        throw new Error("corrupt_workbook: xl/styles.xml has a malformed <cellXfs>");
+      }
+      for (const tag of tagsOf(xfs, "xf")) {
+        const id = Number(attrs(tag).numFmtId ?? 0);
         fmts.push(classifyFormat(id, custom.get(id)));
       }
     }
@@ -548,7 +646,15 @@ export function parseXlsx(bytes: Uint8Array, opts: XlsxOptions): { headers: stri
     const e = entries.get(resolveTarget(sstRel.target));
     if (e) {
       const scan = new ElementScanner("si");
-      streamText(bytes, e, budget, (t) => scan.feed(t, (xml) => shared.push(richText(xml))));
+      streamText(bytes, e, budget, (t) =>
+        scan.feed(t, (xml) => {
+          try {
+            shared.push(richText(xml));
+          } catch {
+            throw new Error("corrupt_workbook: xl/sharedStrings.xml has a malformed string item");
+          }
+        }),
+      );
     }
   }
 
@@ -559,20 +665,19 @@ export function parseXlsx(bytes: Uint8Array, opts: XlsxOptions): { headers: stri
   const rows: string[][] = [];
   let headers: string[] | null = null;
 
-  const cellValue = (xml: string, a: Record<string, string>, where: string): string => {
-    const inner = xml.slice(xml.indexOf(">") + 1);
+  const cellValue = (inner: string, a: Record<string, string>, where: string): string => {
     const t = a.t ?? "n";
-    const v = /<v(?:\s[^>]*)?>([\s\S]*?)<\/v>/.exec(inner)?.[1] ?? (/<v\s*\/>/.test(inner) ? "" : undefined);
-    if (t === "inlineStr") return richText(/<is\b[\s\S]*<\/is>/.exec(inner)?.[0] ?? "");
+    if (t === "inlineStr") return richText(inner);
+    const v = childText(inner, "v");
     // A numeric formula result is never empty, so no <v> (or an empty one, as openpyxl writes) means it was never calculated.
     // A text formula (t="str") may legitimately cache "".
-    if (/<f[\s>/]/.test(inner) && (v === undefined || (t === "n" && v.trim() === ""))) {
+    if (nextOpen(inner, "f", 0) >= 0 && (v === undefined || (t === "n" && v.trim() === ""))) {
       throw new CellError(`uncached_formula: ${where} has a formula but no cached value; open and re-save the workbook in Excel, or export CSV`);
     }
     if (v === undefined) return "";
     if (t === "s") {
       const s = shared[Number(v)];
-      if (s === undefined) throw new Error(`corrupt_workbook: ${where} points at missing shared string ${v}`);
+      if (s === undefined) throw new CellError(`invalid_shared_string: ${where} points at missing shared string ${v}`);
       return s;
     }
     if (t === "str") return unescapeXml(v);
@@ -587,22 +692,47 @@ export function parseXlsx(bytes: Uint8Array, opts: XlsxOptions): { headers: stri
     return fmt?.code !== undefined && !text.startsWith("-") ? applyDigitMask(text, fmt.code) : text;
   };
 
+  /**
+   * Would this cell come out blank if interpreted? Mirrors cellValue's blank outcomes WITHOUT converting
+   * anything, so an unmapped cell counts as data exactly when the interpreted path would keep its row
+   * (row numbers must not depend on whether `columns` was passed). A cell cellValue would turn into a
+   * marker is data.
+   */
+  const blankCell = (inner: string, a: Record<string, string>): boolean => {
+    const t = a.t ?? "n";
+    try {
+      if (t === "inlineStr") return richText(inner).trim() === "";
+      const v = childText(inner, "v");
+      if (nextOpen(inner, "f", 0) >= 0 && (v === undefined || (t === "n" && v.trim() === ""))) return false;
+      if (v === undefined) return true;
+      if (t === "s") {
+        const str = shared[Number(v)];
+        return str !== undefined && str.trim() === "";
+      }
+      if (t === "e" || t === "b") return false;
+      return unescapeXml(v).trim() === "";
+    } catch {
+      return false;
+    }
+  };
+
   const wanted = opts.columns ? new Set(opts.columns) : null;
   let mappedCols: Set<number> | null = null; // column positions to interpret; null = all (header row, or no `columns` given)
   const onRow = (rowXml: string) => {
     const cells: string[] = [];
     let sawUnmappedData = false;
     let cursor = -1;
-    for (const m of rowXml.slice(openTag(rowXml).length).matchAll(/<c\b([^>]*?)(?:\/>|>([\s\S]*?)<\/c>)/g)) {
-      const a = attrs(`<c${m[1]!}>`);
+    for (const { open, inner } of splitCells(rowXml, openTag(rowXml).length)) {
+      const a = attrs(open);
+      if (a.r !== undefined && (colIndex(a.r) < 0 || colIndex(a.r) > 0x7fffff)) throw new Error(`corrupt_workbook: malformed cell reference "${a.r}"`);
       const col = a.r ? colIndex(a.r) : cursor + 1;
       cursor = col;
-      if (m[2] === undefined) continue;
+      if (inner === undefined) continue;
       if (mappedCols && !mappedCols.has(col)) {
         // Not a column the caller reads: never interpreted, so it cannot fail anything. It still counts as
         // data for blank-row detection, so row numbers agree with the CSV reading of the same table.
-        if (/<v(?:\s[^>]*)?>[^<]|<is[\s>]/.test(m[2])) {
-          if (col < 0 || col >= MAX_XLSX_COLUMNS) throw new Error(`too_many_columns: data beyond column ${MAX_XLSX_COLUMNS} (cell ${a.r ?? col + 1})`);
+        if (!blankCell(inner, a)) {
+          if (col >= MAX_XLSX_COLUMNS) throw new Error(`too_many_columns: data beyond column ${MAX_XLSX_COLUMNS} (cell ${a.r ?? col + 1})`);
           sawUnmappedData = true;
         }
         continue;
@@ -610,13 +740,13 @@ export function parseXlsx(bytes: Uint8Array, opts: XlsxOptions): { headers: stri
       const where = `cell ${a.r ?? `#${col + 1}`}`;
       let value: string;
       try {
-        value = cellValue(`<c${m[1]!}>${m[2]}`, a, where);
+        value = cellValue(inner, a, where);
       } catch (err) {
         if (!(err instanceof CellError)) throw err;
         value = CELL_ERROR_PREFIX + err.message;
       }
       if (value === "") continue;
-      if (col < 0 || col >= MAX_XLSX_COLUMNS) throw new Error(`too_many_columns: data beyond column ${MAX_XLSX_COLUMNS} (cell ${a.r ?? col + 1})`);
+      if (col >= MAX_XLSX_COLUMNS) throw new Error(`too_many_columns: data beyond column ${MAX_XLSX_COLUMNS} (cell ${a.r ?? col + 1})`);
       cells[col] = value;
     }
     const full = Array.from(cells, (c) => c ?? ""); // Array.from fills holes with undefined

@@ -706,7 +706,7 @@ test("importCsv accepts a named sheet from a multi-sheet workbook", async () => 
 test("a bad cell in a mapped column rejects that row only; a bad cell in an unmapped column is never read", () =>
   withFakeTimers(async () => {
     const withDate = await t.mutation(api.sources.import.saveMapping, { name: "dated2", columns: { ...COLUMNS, Acquired: "acquisition.acquiredAt" } });
-    // Row 0: serial 60 (Excel's fictional 1900-02-29) in the MAPPED date column. Row 1: fine. The Notes column is unmapped and holds an error value.
+    // Row 0: serial 60 (Excel's fictional 1900-02-29) in the MAPPED date column. Row 1: a valid date.
     const table = [[...XLSX_HEAD, "Acquired"], ["a.com", "A", "a@a.com", "Ann", "Eng", "60"], ["b.com", "B", "b@b.com", "Bob", "Eng", "45658"]];
     await t.action(api.sources.import.importCsv, { runId, mappingId: withDate, storageId: await storeBytes(xlsxOf(table, { dateCol: 5 })) });
     await drain();

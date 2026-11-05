@@ -89,7 +89,7 @@ function book(b: Book): Uint8Array {
         `<Relationship Id="rIdS" Type="${REL}/styles" Target="styles.xml"/><Relationship Id="rIdT" Type="${REL}/sharedStrings" Target="sharedStrings.xml"/></Relationships>`,
     ),
     "xl/styles.xml": strToU8(b.styles ?? `<styleSheet ${NS}><cellXfs><xf numFmtId="0"/></cellXfs></styleSheet>`),
-    "xl/sharedStrings.xml": strToU8(`<sst ${NS}>${(b.strings ?? []).map((s) => `<si><t>${s}</t></si>`).join("")}</sst>`),
+    "xl/sharedStrings.xml": strToU8(`<sst ${NS}>${(b.strings ?? []).map((s) => `<si>${s.startsWith("<") ? s : `<t>${s}</t>`}</si>`).join("")}</sst>`),
   };
   sheets.forEach((_, i) => (files[`xl/worksheets/sheet${i + 1}.xml`] = strToU8(i === 0 ? sheetXml(b.sheet) : sheetXml(""))));
   for (const [k, v] of Object.entries(b.extra ?? {})) files[k] = typeof v === "string" ? strToU8(v) : v;
@@ -125,8 +125,9 @@ test("numbers are emitted as their exact stored digits: no float round trip, no 
     ["2.50E0", "2.5"],
   ];
   for (const [raw, out] of cases) expect(cellOf(raw, null)).toBe(out);
-  expect(message(() => cellOf("abc", null))).toBe('corrupt_workbook: cell A2 holds a non-numeric value "abc"');
-  expect(message(() => cellOf("1E999", null))).toBe("corrupt_workbook: cell A2 has an absurd exponent");
+  expect(cellOf("abc", null)).toBe(`${CELL_ERROR_PREFIX}invalid_number: cell A2 holds a non-numeric value "abc"`);
+  expect(cellOf("1E999", null)).toBe(`${CELL_ERROR_PREFIX}invalid_number: cell A2 has an absurd exponent`);
+  expect(cellOf("9".repeat(100), null)).toBe(`${CELL_ERROR_PREFIX}invalid_number: cell A2 holds a 100 character number`);
 });
 
 test("digit-placeholder formats restore leading zeros and punctuation; other formats leave digits alone", () => {
@@ -207,13 +208,13 @@ test("cell types: shared and inline strings, escapes, phonetic runs, booleans, e
             '<c r="F2" t="d"><v>2024-03-05T10:00:00Z</v></c>' +
             s("G2", 3),
         ),
-      strings: ["H", "a &amp; b &#65; &#x42; &lt;x&gt; _x000D_ _x005F_x0041_", "kanji<rPh sb=\"0\" eb=\"1\"><t>ignored</t></rPh>", "  padded  ", "h1", "h2", "h3", "h4", "h5", "h6", "h7"],
+      strings: ["H", "a &amp; b &#65; &#x42; &lt;x&gt; _x000D_ _x005F_x0041_", '<t>kanji</t><rPh sb="0" eb="1"><t>ignored</t></rPh>', "  padded  ", "h1", "h2", "h3", "h4", "h5", "h6", "h7"],
     }),
   );
   expect(out.rows).toEqual([["a & b A B <x> \r _x0041_", "kanji", "in line", "FALSE", `${CELL_ERROR_PREFIX}error_value: cell E2 holds the Excel error #N/A`, "2024-03-05T10:00:00Z", "  padded  "]]);
-  expect(message(() => parse(book({ sheet: row(1, s("A1", 0)) + row(2, s("A2", 9)), strings: ["H"] })))).toBe(
-    "corrupt_workbook: cell A2 points at missing shared string 9",
-  );
+  expect(parse(book({ sheet: row(1, s("A1", 0)) + row(2, s("A2", 9)), strings: ["H"] })).rows).toEqual([
+    [`${CELL_ERROR_PREFIX}invalid_shared_string: cell A2 points at missing shared string 9`],
+  ]);
 });
 
 test("shape: blank rows, leading blanks, styled-empty cells, sparse columns, blank and duplicate headers", () => {
@@ -437,4 +438,126 @@ test("a marker rejects its row with a reason naming the cell, for any target, an
     ],
   });
   expect(rowToCandidate(rec(rows[1]!), pairs, 0)).toMatchObject({ ok: true, candidate: { acquisition: { acquiredAt: Date.UTC(2025, 0, 1) } } });
+});
+
+// ------------------------------------------------------------------ work is bounded, not just bytes
+
+/** Wall-clock budget for hostile-input tests. Linear scans finish in well under a second; the quadratic scan this guards
+ *  against took 61.7 s on the same 200,000-token payload, so the margin is five orders of magnitude and this is not flaky. */
+const WORK_BUDGET_MS = 5_000;
+const timed = <T>(fn: () => T): { out: T; ms: number } => {
+  const t0 = performance.now();
+  const out = fn();
+  return { out, ms: performance.now() - t0 };
+};
+
+test("200,000 unterminated <c tokens in a ~1 KB upload fail by name, fast (the quadratic cell scan)", () => {
+  const z = book({ sheet: row(1, s("A1", 0)) + `<row r="2">${"<c ".repeat(200_000)}</row>`, strings: ["H"] });
+  expect(z.length).toBeLessThan(4_000);
+  const { out, ms } = timed(() => message(() => parse(z)));
+  expect(out).toBe("corrupt_workbook: an unterminated or oversized <c> tag");
+  expect(ms).toBeLessThan(WORK_BUDGET_MS);
+  // the variant where a '>' does eventually arrive, so the tag is "terminated" but absurd
+  const far = book({ sheet: row(1, s("A1", 0)) + `<row r="2">${"<c ".repeat(200_000)}></row>`, strings: ["H"] });
+  const farOut = timed(() => message(() => parse(far)));
+  expect(farOut.out).toBe("corrupt_workbook: an unterminated or oversized <c> tag");
+  expect(farOut.ms).toBeLessThan(WORK_BUDGET_MS);
+  // and the cap on the number of cells itself
+  const many = book({ sheet: row(1, s("A1", 0)) + `<row r="2">${"<c/>".repeat(200_000)}</row>`, strings: ["H"] });
+  const manyOut = timed(() => message(() => parse(many)));
+  expect(manyOut.out).toBe("too_many_columns: a row has more than 16384 cells");
+  expect(manyOut.ms).toBeLessThan(WORK_BUDGET_MS);
+});
+
+test("200,000 well-formed-looking but unclosed <c a=\"1\"> tokens are refused by name, fast", () => {
+  const z = book({ sheet: row(1, s("A1", 0)) + `<row r="2">${'<c r="A2">'.repeat(20_000)}</row>`, strings: ["H"] });
+  const { out, ms } = timed(() => message(() => parse(z)));
+  expect(out).toBe("corrupt_workbook: a <c> element is never closed");
+  expect(ms).toBeLessThan(WORK_BUDGET_MS);
+});
+
+test("an unterminated <c tag is refused by name, fast", () => {
+  const z = book({ sheet: row(1, s("A1", 0)) + `<row r="2"><c r="A2" ${"x ".repeat(100_000)}</row>`, strings: ["H"] });
+  const { out, ms } = timed(() => message(() => parse(z)));
+  expect(out).toMatch(/^corrupt_workbook: an unterminated or oversized <c> tag$/);
+  expect(ms).toBeLessThan(WORK_BUDGET_MS);
+});
+
+test("unterminated <t and <rPh tokens in a shared string do not make the string scan quadratic", () => {
+  for (const evil of ["<t>".repeat(80_000), "<rPh>".repeat(80_000), "<t>x</t><rPh>".repeat(1) + "<t>".repeat(80_000)]) {
+    const z = book({ sheet: row(1, s("A1", 0)), strings: [evil] });
+    const { out, ms } = timed(() => message(() => parse(z)));
+    expect(out).toBe("corrupt_workbook: xl/sharedStrings.xml has a malformed string item");
+    expect(ms).toBeLessThan(WORK_BUDGET_MS);
+  }
+  // ...and the same inside an inline string is a bad cell, not a bad file
+  const inline = book({ sheet: row(1, s("A1", 0)) + row(2, `<c r="A2" t="inlineStr"><is>${"<t>".repeat(80_000)}</is></c>`), strings: ["H"] });
+  const { out, ms } = timed(() => parse(inline).rows);
+  expect(out).toEqual([[`${CELL_ERROR_PREFIX}malformed_cell: <t> is never closed`]]);
+  expect(ms).toBeLessThan(WORK_BUDGET_MS);
+});
+
+test("hostile numbers and number formats are bounded too", () => {
+  const { out, ms } = timed(() => cellOf("1".repeat(2_000_000) + "x", null));
+  expect(out).toMatch(/^#cell_error: invalid_number: cell A2 holds a 2000001 character number$/);
+  expect(ms).toBeLessThan(WORK_BUDGET_MS);
+  expect(cellOf("45658", { id: 170, code: "[".repeat(300) })).toBe("45658"); // an implausibly long format is not interpreted
+  expect(message(() => cellOf("45658", { id: 170, code: "[".repeat(200_000) }))).toBe("corrupt_workbook: an unterminated or oversized <numFmt> tag");
+});
+
+test("unterminated structural tags in the workbook parts are refused by name, fast", () => {
+  const z = book({ sheet: row(1, s("A1", 0)), strings: ["H"], styles: `<styleSheet ${NS}><cellXfs>${"<xf ".repeat(300_000)}</cellXfs></styleSheet>` });
+  const { out, ms } = timed(() => message(() => parse(z)));
+  expect(out).toMatch(/^corrupt_workbook: /);
+  expect(ms).toBeLessThan(WORK_BUDGET_MS);
+});
+
+test("a legal '>' inside an attribute value does not mis-split a cell", () => {
+  const z = book({ strings: ["H"], sheet: row(1, s("A1", 0)) + row(2, '<c r="A2" t="inlineStr" x="a>b"><is><t>kept</t></is></c>') });
+  expect(parse(z).rows).toEqual([["kept"]]);
+});
+
+test("a malformed cell reference is a corrupt workbook, not a misleading too_many_columns", () => {
+  for (const r of ["12", "?7", "1A"]) {
+    const z = book({ strings: ["H"], sheet: row(1, s("A1", 0)) + row(2, `<c r="${r}" t="inlineStr"><is><t>x</t></is></c>`) });
+    expect(message(() => parse(z))).toBe(`corrupt_workbook: malformed cell reference "${r}"`);
+  }
+});
+
+// ------------------------------------------------------------------ mapped vs unmapped consistency
+
+test("whitespace-only cells in unmapped columns are blank exactly as they are when interpreted", () => {
+  const z = book({
+    strings: ["Name", "Notes", "Ann", "   ", "real"],
+    sheet:
+      row(1, s("A1", 0) + s("B1", 1)) +
+      row(2, s("A2", 2)) +
+      row(3, '<c r="B3" t="inlineStr"><is><t xml:space="preserve">  </t></is></c>') + // inline whitespace
+      row(4, s("B4", 3)) + // shared-string whitespace
+      row(5, '<c r="B5"><v> </v></c>') + // numeric-typed whitespace
+      row(6, s("B6", 4)),
+  });
+  const withColumns = parse(z, { columns: ["Name"] });
+  const without = parse(z);
+  expect(withColumns.rows).toEqual([["Ann"], []]); // rows 3-5 are blank; row 6 has real data in an unmapped column
+  expect(without.rows).toEqual([["Ann"], ["", "real"]]);
+  expect(withColumns.rows).toHaveLength(without.rows.length);
+});
+
+test("an unmapped cell that is garbage imports cleanly with columns, and cannot fail the file either way", () => {
+  const z = book({
+    strings: ["Name", "Notes", "Ann"],
+    sheet:
+      row(1, s("A1", 0) + s("B1", 1)) +
+      row(2, s("A2", 2) + '<c r="B2"><v>not-a-number</v></c>') + // garbage number
+      row(3, s("A3", 2) + '<c r="B3" t="s"><v>99</v></c>') + // dangling shared string
+      row(4, s("A4", 2) + '<c r="B4" t="inlineStr"><is><t>never closed</is></c>'), // malformed
+  });
+  expect(parse(z, { columns: ["Name"] }).rows).toEqual([["Ann"], ["Ann"], ["Ann"]]);
+  // Interpreted, each is a marker in that cell only; the good cell beside it is untouched.
+  const all = parse(z).rows;
+  expect(all.map((r) => r[0])).toEqual(["Ann", "Ann", "Ann"]);
+  expect(all[0]![1]).toBe(`${CELL_ERROR_PREFIX}invalid_number: cell B2 holds a non-numeric value "not-a-number"`);
+  expect(all[1]![1]).toBe(`${CELL_ERROR_PREFIX}invalid_shared_string: cell B3 points at missing shared string 99`);
+  expect(all[2]![1]).toMatch(/^#cell_error: malformed_cell: /);
 });

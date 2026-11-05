@@ -1,7 +1,9 @@
 import { defineSchema, defineTable } from "convex/server";
 import { v } from "convex/values";
+import { claims } from "./claims/schema";
 
 export default defineSchema({
+  claims,
   orgs: defineTable({
     name: v.string(),
     createdAt: v.number(),

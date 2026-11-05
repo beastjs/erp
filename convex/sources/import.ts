@@ -1,10 +1,8 @@
 import { v } from "convex/values";
-import { api } from "../_generated/api";
-import type { Id } from "../_generated/dataModel";
-import { internal } from "../_generated/api";
-import type { Doc } from "../_generated/dataModel";
+import { api, internal } from "../_generated/api";
+import type { Doc, Id } from "../_generated/dataModel";
 import { action, internalMutation, mutation, query, type MutationCtx } from "../_generated/server";
-import { asOrg, withOrg } from "../_shared/org";
+import { unsafeCtxAsOrgForInternalOnly, withOrg } from "../_shared/org";
 import { bumpRun, loadRun, settleRun } from "../runs/mutations";
 import { checkContractVersion, validateCandidate } from "./contract";
 import { parseCsv } from "./csv";
@@ -18,6 +16,17 @@ import { insertCandidate } from "./mutations";
  * link by link by the import chain driven from `importCsv`.
  */
 export const CHUNK_SIZE = 500;
+/**
+ * Hard caps on one chunked import. The file is parsed in memory by a single action, so it is capped by
+ * size (20 MB, roughly 100-200k ordinary CRM rows) and by row count, each with a named error. Streaming
+ * the parse so these can go is a larger change than this task takes on.
+ */
+export const MAX_IMPORT_BYTES = 20 * 1024 * 1024;
+export const MAX_IMPORT_ROWS = 200_000;
+/** A staged chunk closes at 500 rows OR this many bytes, whichever first: a document may not exceed 1 MB. */
+const STAGE_CHUNK_BYTES = 512 * 1024;
+/** A single row beyond this cannot share a document safely; refuse the file by name rather than fail mid-stage. */
+const MAX_STAGED_ROW_BYTES = 256 * 1024;
 type RowError = { row: number; errors: string[] };
 
 export const saveMapping = mutation({
@@ -121,6 +130,8 @@ export const importRows = mutation({
       throw new Error(`chunk_too_large: at most ${CHUNK_SIZE} rows per call (got ${args.rows.length}); use importCsv or send chunks`);
     }
     const run = await loadRun(ctx, orgId, args.runId, { active: true });
+    // A staged import settles on its own chunk counters; a second writer would make the run's progress ambiguous.
+    if (run.chunksExpected !== undefined) throw new Error("import_already_started: this run has a staged import; use a separate run");
     const mapping = await ctx.db.get(args.mappingId);
     if (!mapping || mapping.orgId !== orgId) throw new Error("mapping not found");
     return await importChunk(ctx, orgId, run, mapping, args.rows, args.rowOffset ?? 0);
@@ -136,40 +147,55 @@ export const importRows = mutation({
 // link is its own transaction, so a 100k-row file has no single-action ceiling, and the chain's state
 // (staged chunks left, run counters) is stored, so a stalled chain resumes with `resumeImport`.
 
-/** Stages one parsed slice. Cells are aligned with `columns` (the mapped headers only). */
-export const stageImportChunk = mutation({
+/**
+ * Stages one parsed slice. INTERNAL: only `importCsv`, which derived the org from the caller's
+ * identity, may call it; a client must not be able to stage arbitrary chunks into a run.
+ * Cells are aligned with `columns` (the mapped headers only).
+ */
+export const stageImportChunk = internalMutation({
   args: {
+    orgId: v.id("orgs"),
     runId: v.id("discoveryRuns"),
     mappingId: v.id("columnMappings"),
     seq: v.number(),
+    rowOffset: v.number(),
     columns: v.array(v.string()),
     rows: v.array(v.array(v.string())),
   },
-  handler: async (ctx, args) => {
-    const { orgId } = await withOrg(ctx, args);
+  handler: async (ctx, args): Promise<null> => {
     if (args.rows.length > CHUNK_SIZE) throw new Error(`chunk_too_large: at most ${CHUNK_SIZE} rows per staged chunk`);
-    const run = await loadRun(ctx, orgId, args.runId, { active: true });
-    if (run.rowsExpected !== undefined) throw new Error("import_already_started: this run already has an import");
+    const run = await loadRun(ctx, args.orgId, args.runId, { active: true });
+    if (run.chunksExpected !== undefined) throw new Error("import_already_started: this run already has an import");
     const mapping = await ctx.db.get(args.mappingId);
-    if (!mapping || mapping.orgId !== orgId) throw new Error("mapping not found");
+    if (!mapping || mapping.orgId !== args.orgId) throw new Error("mapping not found");
     // Idempotent for an action retried after a partial stage: the same slice replaces itself.
     const stale = await ctx.db.query("importChunks").withIndex("by_run_and_seq", (q) => q.eq("runId", run._id).eq("seq", args.seq)).first();
     if (stale) await ctx.db.delete(stale._id);
-    await ctx.db.insert("importChunks", { orgId, ...args });
+    await ctx.db.insert("importChunks", args);
     return null;
   },
 });
 
-/** Declares the staged total and starts the chain. A zero-row file completes immediately. */
-export const startStagedImport = mutation({
-  args: { runId: v.id("discoveryRuns"), totalRows: v.number() },
-  handler: async (ctx, args) => {
-    const { orgId } = await withOrg(ctx, args);
-    const run = await loadRun(ctx, orgId, args.runId, { active: true });
-    if (run.rowsExpected !== undefined) throw new Error("import_already_started: this run already has an import");
-    await ctx.db.patch(run._id, { rowsExpected: args.totalRows });
-    if (args.totalRows === 0) await settleRun(ctx, run._id);
-    else await ctx.scheduler.runAfter(0, internal.sources.import.processStagedChunk, { orgId, runId: run._id, seq: 0 });
+/**
+ * Declares the staged size and starts the chain. INTERNAL, and it validates the declaration itself: a
+ * NaN would wedge the run, an enormous value would schedule millions of links, a negative would
+ * complete it at once. A zero-row file completes immediately.
+ */
+export const startStagedImport = internalMutation({
+  args: { orgId: v.id("orgs"), runId: v.id("discoveryRuns"), totalRows: v.number(), totalChunks: v.number() },
+  handler: async (ctx, args): Promise<null> => {
+    const { totalRows, totalChunks } = args;
+    if (!(Number.isInteger(totalRows) && totalRows >= 0 && totalRows <= MAX_IMPORT_ROWS)) {
+      throw new Error(`totalRows must be an integer between 0 and ${MAX_IMPORT_ROWS}`);
+    }
+    if (!(Number.isInteger(totalChunks) && (totalRows === 0 ? totalChunks === 0 : totalChunks >= 1 && totalChunks <= totalRows))) {
+      throw new Error("totalChunks must be an integer: 0 for an empty file, otherwise between 1 and totalRows");
+    }
+    const run = await loadRun(ctx, args.orgId, args.runId, { active: true });
+    if (run.chunksExpected !== undefined) throw new Error("import_already_started: this run already has an import");
+    await ctx.db.patch(run._id, { rowsExpected: totalRows, chunksExpected: totalChunks, chunksProcessed: 0 });
+    if (totalChunks === 0) await settleRun(ctx, run._id);
+    else await ctx.scheduler.runAfter(0, internal.sources.import.processStagedChunk, { orgId: args.orgId, runId: run._id, seq: 0 });
     return null;
   },
 });
@@ -202,16 +228,17 @@ export const resumeImport = mutation({
 export const processStagedChunk = internalMutation({
   args: { orgId: v.id("orgs"), runId: v.id("discoveryRuns"), seq: v.number() },
   handler: async (rawCtx, args): Promise<null> => {
-    const ctx = asOrg(rawCtx, args.orgId);
+    const ctx = unsafeCtxAsOrgForInternalOnly(rawCtx, args.orgId);
     const run = await ctx.db.get(args.runId);
     if (!run || run.orgId !== args.orgId || run.status !== "running") return null;
     const chunk = await ctx.db.query("importChunks").withIndex("by_run_and_seq", (q) => q.eq("runId", args.runId).eq("seq", args.seq)).first();
     const mapping = chunk && (await ctx.db.get(chunk.mappingId));
     if (chunk && mapping) {
       const rows = chunk.rows.map((cells) => Object.fromEntries(chunk.columns.map((c, i) => [c, cells[i] ?? ""])));
-      const res = await importChunk(ctx, args.orgId, run, mapping, rows, args.seq * CHUNK_SIZE);
+      const res = await importChunk(ctx, args.orgId, run, mapping, rows, chunk.rowOffset);
       for (const r of res.rejected) await ctx.db.insert("importRejections", { orgId: args.orgId, runId: args.runId, ...r });
       await ctx.db.delete(chunk._id);
+      await bumpRun(ctx, run, { chunksProcessed: 1 });
       for (let i = 0; i < res.candidateIds.length; i += INGEST_BATCH) {
         await ctx.scheduler.runAfter(0, internal.sources.ingest.ingestStep, {
           orgId: args.orgId,
@@ -219,7 +246,7 @@ export const processStagedChunk = internalMutation({
         });
       }
     }
-    if ((args.seq + 1) * CHUNK_SIZE < (run.rowsExpected ?? 0)) {
+    if (args.seq + 1 < (run.chunksExpected ?? 0)) {
       await ctx.scheduler.runAfter(0, internal.sources.import.processStagedChunk, { orgId: args.orgId, runId: args.runId, seq: args.seq + 1 });
     }
     return null;
@@ -241,8 +268,17 @@ export const importCsv = action({
   handler: async (ctx, args): Promise<{ rows: number; chunks: number }> => {
     const blob = await ctx.storage.get(args.storageId);
     if (!blob) throw new Error("file_not_found: nothing is stored under that id");
+    if (blob.size > MAX_IMPORT_BYTES) {
+      throw new Error(`file_too_large: ${blob.size} bytes exceeds the ${MAX_IMPORT_BYTES} byte import limit; split the file`);
+    }
     const { headers, rows } = parseCsv(await blob.text());
+    if (rows.length > MAX_IMPORT_ROWS) {
+      throw new Error(`too_many_rows: ${rows.length} rows exceeds the ${MAX_IMPORT_ROWS} row import limit; split the file`);
+    }
+    // getMapping is authorized by the caller's identity, so its orgId is the identity-derived org that
+    // the internal staging functions below receive.
     const mapping = await ctx.runQuery(api.sources.import.getMapping, { mappingId: args.mappingId });
+    const orgId = mapping.orgId;
     const errors = validateMapping(mapping.columns);
     if (errors.length > 0) throw new Error(`invalid mapping: ${errors.join("; ")}`);
     const absent = mapping.columns.filter((c) => !headers.includes(c.column)).map((c) => c.column);
@@ -250,17 +286,46 @@ export const importCsv = action({
 
     const columns = mapping.columns.map((c) => c.column);
     const at = columns.map((c) => headers.indexOf(c));
-    let chunks = 0;
-    for (let offset = 0; offset < rows.length; offset += CHUNK_SIZE) {
-      await ctx.runMutation(api.sources.import.stageImportChunk, {
+    const enc = new TextEncoder();
+    // Close a chunk at CHUNK_SIZE rows or STAGE_CHUNK_BYTES, whichever comes first. All rows are
+    // measured before anything is staged, so an unstageable row fails the file with nothing written.
+    const plan: Array<{ offset: number; rows: string[][] }> = [];
+    let cur: { offset: number; rows: string[][] } = { offset: 0, rows: [] };
+    let curBytes = 0;
+    for (const [i, cells] of rows.entries()) {
+      const picked = at.map((c) => cells[c] ?? "");
+      const bytes = picked.reduce((n, cell) => n + enc.encode(cell).length + 8, 0);
+      if (bytes > MAX_STAGED_ROW_BYTES) {
+        throw new Error(`row_too_large: data row ${i} is ${bytes} bytes in its mapped columns (limit ${MAX_STAGED_ROW_BYTES})`);
+      }
+      if (cur.rows.length > 0 && (cur.rows.length >= CHUNK_SIZE || curBytes + bytes > STAGE_CHUNK_BYTES)) {
+        plan.push(cur);
+        cur = { offset: i, rows: [] };
+        curBytes = 0;
+      }
+      cur.rows.push(picked);
+      curBytes += bytes;
+    }
+    if (cur.rows.length > 0) plan.push(cur);
+
+    for (const [seq, chunk] of plan.entries()) {
+      await ctx.runMutation(internal.sources.import.stageImportChunk, {
+        orgId,
         runId: args.runId,
         mappingId: args.mappingId,
-        seq: chunks++,
+        seq,
+        rowOffset: chunk.offset,
         columns,
-        rows: rows.slice(offset, offset + CHUNK_SIZE).map((cells) => at.map((i) => cells[i] ?? "")),
+        rows: chunk.rows,
       });
     }
-    await ctx.runMutation(api.sources.import.startStagedImport, { runId: args.runId, totalRows: rows.length });
+    const chunks = plan.length;
+    await ctx.runMutation(internal.sources.import.startStagedImport, {
+      orgId,
+      runId: args.runId,
+      totalRows: rows.length,
+      totalChunks: chunks,
+    });
     return { rows: rows.length, chunks };
   },
 });

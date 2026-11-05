@@ -28,7 +28,7 @@ export async function withOrg<T>(
  * public function's args or from stored data a client controls. The org was derived from `withOrg` by
  * whichever public function scheduled the work.
  */
-export function asOrg<C extends Pick<QueryCtx, "auth">>(ctx: C, orgId: Id<"orgs">): C {
+export function unsafeCtxAsOrgForInternalOnly<C extends Pick<QueryCtx, "auth">>(ctx: C, orgId: Id<"orgs">): C {
   const auth = {
     getUserIdentity: async () => ({ orgId, subject: "internal", issuer: "internal", tokenIdentifier: `internal|${orgId}` }),
   } as unknown as C["auth"];

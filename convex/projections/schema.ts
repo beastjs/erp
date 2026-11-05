@@ -48,7 +48,9 @@ export const contacts = defineTable({
  * Lookup keys that let ingest find an existing contact instead of minting a duplicate. `scope` is
  * "any" for email (a mailbox identifies one person wherever they were seen) and the account id (or
  * "none") for profileUrl/phone/name, which only identify someone within a company. `value` is always
- * the output of the shared normalizers. Derived data: written only by ingest, rebuildable from claims.
+ * the output of the shared normalizers. Derived data: written only by ingest.
+ * TASK 13 (erasure) MUST delete an erased contact's keys: a stale key lets the contact be re-found and
+ * re-attached to new claims after erasure. There is no rebuild path or uniqueness enforcement yet.
  */
 export const contactKeys = defineTable({
   orgId: v.id("orgs"),

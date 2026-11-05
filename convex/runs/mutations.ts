@@ -9,7 +9,8 @@ export type RunCounter =
   | "duplicates"
   | "rowsRejected"
   | "candidatesConsumed"
-  | "candidatesRejected";
+  | "candidatesRejected"
+  | "chunksProcessed";
 
 /** Loads a run in the caller's org. Pass `active: true` to also refuse a finished run. */
 export async function loadRun(
@@ -36,22 +37,22 @@ export async function bumpRun(
   const fresh = (await ctx.db.get(run._id)) ?? run;
   const patch: Partial<Record<RunCounter, number>> = {};
   for (const [key, n] of Object.entries(delta) as Array<[RunCounter, number]>) {
-    if (n) patch[key] = fresh[key] + n;
+    if (n) patch[key] = (fresh[key] ?? 0) + n;
   }
   if (Object.keys(patch).length > 0) await ctx.db.patch(run._id, patch);
   await settleRun(ctx, run._id);
 }
 
 /**
- * Completes a staged import once everything it promised has happened: all expected rows processed
+ * Completes a staged import once everything it promised has happened: all staged chunks processed
  * and every inserted candidate consumed or rejected. Called after every counter change, so no
  * separate "finisher" step can be forgotten or lost.
  */
 export async function settleRun(ctx: MutationCtx, runId: Id<"discoveryRuns">): Promise<void> {
   const run = await ctx.db.get(runId);
-  if (!run || run.status !== "running" || run.rowsExpected === undefined) return;
+  if (!run || run.status !== "running" || run.chunksExpected === undefined) return;
   if (
-    run.rowsProcessed >= run.rowsExpected &&
+    (run.chunksProcessed ?? 0) >= run.chunksExpected &&
     run.candidatesConsumed + run.candidatesRejected >= run.candidatesInserted
   ) {
     await ctx.db.patch(runId, { status: "completed", finishedAt: Date.now() });

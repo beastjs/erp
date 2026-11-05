@@ -15,7 +15,7 @@ import type { SubjectType } from "../claims/schema";
 import { rebuildProjection } from "../projections/build";
 import { matchCandidate } from "../projections/identity";
 import { bumpRun, type RunCounter } from "../runs/mutations";
-import { asOrg, withOrg } from "../_shared/org";
+import { unsafeCtxAsOrgForInternalOnly, withOrg } from "../_shared/org";
 import { checkContractVersion, validateCandidate, type NormalizedCandidate } from "./contract";
 
 /** Per-mutation cap: each candidate costs ~30 document writes, and a mutation may write 16k. */
@@ -88,20 +88,28 @@ export function planClaims(c: NormalizedCandidate) {
     companyName: clean(co?.name),
     hasCompany: Boolean(co),
     hasPerson: Boolean(p),
+    /** Raw presence, not normalized: a malformed phone is still a claim to a strong identity. */
+    hasStrongIdentifier: Boolean(p?.email || p?.profileUrl || p?.phone),
   };
 }
 
 type Key = { scope: string; kind: "email" | "profile" | "phone" | "name"; value: string };
 
-/** Strongest first. Email identifies a person anywhere; the rest only within their company. */
-function contactKeysFor(plan: ReturnType<typeof planClaims>, accountId: Id<"accounts"> | null): Key[] {
+/**
+ * Strongest first. Email identifies a person anywhere; the rest only within their company.
+ * `lookup` is what may FIND an existing contact; `record` is what gets remembered for next time.
+ * A name is a lookup key only when the sighting carries no email, profileUrl or phone at all: two
+ * different people sharing a name inside one company is routine, and a name coincidence after a strong
+ * identifier missed would silently and irreversibly merge them (claims are append-only).
+ */
+function contactKeysFor(plan: ReturnType<typeof planClaims>, accountId: Id<"accounts"> | null): { lookup: Key[]; record: Key[] } {
   const scope = accountId ?? "none";
-  const keys: Key[] = [];
-  if (plan.email) keys.push({ scope: "any", kind: "email", value: plan.email });
-  if (plan.profile) keys.push({ scope, kind: "profile", value: plan.profile });
-  if (plan.phone) keys.push({ scope, kind: "phone", value: plan.phone });
-  if (plan.personName) keys.push({ scope, kind: "name", value: plan.personName });
-  return keys;
+  const strong: Key[] = [];
+  if (plan.email) strong.push({ scope: "any", kind: "email", value: plan.email });
+  if (plan.profile) strong.push({ scope, kind: "profile", value: plan.profile });
+  if (plan.phone) strong.push({ scope, kind: "phone", value: plan.phone });
+  const name: Key[] = plan.personName ? [{ scope, kind: "name", value: plan.personName }] : [];
+  return { lookup: plan.hasStrongIdentifier ? strong : name, record: [...strong, ...name] };
 }
 
 const findKey = (ctx: MutationCtx, orgId: Id<"orgs">, k: Key) =>
@@ -178,7 +186,7 @@ export async function ingestCandidate(ctx: MutationCtx, candidateId: Id<"candida
   let contactId: Id<"contacts"> | null = null;
   if (plan.hasPerson) {
     const keys = contactKeysFor(plan, accountId);
-    for (const k of keys) {
+    for (const k of keys.lookup) {
       const hit = await findKey(ctx, orgId, k);
       if (hit) {
         contactId = hit.contactId;
@@ -194,7 +202,7 @@ export async function ingestCandidate(ctx: MutationCtx, candidateId: Id<"candida
     await rebuildProjection(ctx, { subjectType: "contact", subjectId: contactId });
     // Record every identifier this sighting carried (never re-pointing an existing key), so the
     // next sighting can be found by any of them.
-    for (const k of keys) {
+    for (const k of keys.record) {
       if (!(await findKey(ctx, orgId, k))) await ctx.db.insert("contactKeys", { orgId, ...k, contactId });
     }
   }
@@ -209,7 +217,7 @@ export async function ingestCandidate(ctx: MutationCtx, candidateId: Id<"candida
  */
 export const ingestOne = internalMutation({
   args: { orgId: v.id("orgs"), candidateId: v.id("candidates") },
-  handler: async (ctx, args): Promise<Outcome> => ingestCandidate(asOrg(ctx, args.orgId), args.candidateId),
+  handler: async (ctx, args): Promise<Outcome> => ingestCandidate(unsafeCtxAsOrgForInternalOnly(ctx, args.orgId), args.candidateId),
 });
 
 /** Consumes up to INGEST_BATCH candidates; a candidate that cannot be processed is rejected with a reason instead of aborting its neighbours. */
@@ -217,12 +225,17 @@ export async function ingestBatch(
   ctx: MutationCtx,
   orgId: Id<"orgs">,
   candidateIds: Id<"candidates">[],
+  /** strict (public entry): an unknown id throws. Not strict (scheduled): it is skipped, since nobody is there to be told and the other ids must still be processed. */
+  strict = true,
 ): Promise<{ consumed: number; rejected: number }> {
   if (candidateIds.length > INGEST_BATCH) throw new Error(`batch_too_large: at most ${INGEST_BATCH} candidates per call`);
   const rows: Doc<"candidates">[] = [];
   for (const id of candidateIds) {
     const row = await ctx.db.get(id);
-    if (!row || row.orgId !== orgId) throw new Error("candidate not found");
+    if (!row || row.orgId !== orgId) {
+      if (strict) throw new Error("candidate not found");
+      continue;
+    }
     rows.push(row);
   }
   let consumed = 0;
@@ -265,7 +278,7 @@ export const ingestCandidates = mutation({
 export const ingestStep = internalMutation({
   args: { orgId: v.id("orgs"), candidateIds: v.array(v.id("candidates")) },
   handler: async (ctx, args): Promise<null> => {
-    await ingestBatch(asOrg(ctx, args.orgId), args.orgId, args.candidateIds);
+    await ingestBatch(unsafeCtxAsOrgForInternalOnly(ctx, args.orgId), args.orgId, args.candidateIds, false);
     return null;
   },
 });

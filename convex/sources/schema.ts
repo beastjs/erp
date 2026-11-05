@@ -72,6 +72,8 @@ export const importChunks = defineTable({
   runId: v.id("discoveryRuns"),
   mappingId: v.id("columnMappings"),
   seq: v.number(),
+  /** Index of rows[0] in the original file (chunks are byte-bounded, so seq*500 would be wrong). */
+  rowOffset: v.number(),
   columns: v.array(v.string()),
   rows: v.array(v.array(v.string())),
 }).index("by_run_and_seq", ["runId", "seq"]);

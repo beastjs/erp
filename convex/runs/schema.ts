@@ -24,6 +24,9 @@ export const discoveryRuns = defineTable({
   finishedAt: v.optional(v.number()),
   /** Set when a chunked import is staged: the run completes itself once this many rows are processed and every candidate is settled. */
   rowsExpected: v.optional(v.number()),
+  /** Staged chunks the chain must process, and how many it has. The run settles on these, not on a row count that two writers increment. */
+  chunksExpected: v.optional(v.number()),
+  chunksProcessed: v.optional(v.number()),
   /** Rows (or submitted candidates) taken off the input, whatever their outcome. */
   rowsProcessed: v.number(),
   candidatesInserted: v.number(),

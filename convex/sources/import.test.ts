@@ -1,10 +1,11 @@
 /// <reference types="vite/client" />
 import { convexTest } from "convex-test";
 import { beforeEach, expect, test, vi } from "vitest";
-import { api } from "../_generated/api";
+import { api, internal } from "../_generated/api";
 import type { Id } from "../_generated/dataModel";
 import schema from "../schema";
 import { CANDIDATE_CONTRACT_VERSION, checkContractVersion } from "./contract";
+import { MAX_IMPORT_BYTES, MAX_IMPORT_ROWS } from "./import";
 import { insertCandidate } from "./mutations";
 
 const modules = import.meta.glob("/convex/**/*.ts");
@@ -351,6 +352,24 @@ test("the strongest key wins: a later sighting that adds an email attaches to th
   expect(await all("contacts")).toHaveLength(1);
 });
 
+test("a different person sharing a name is NOT merged into the first: strong identifiers that miss suppress the name key", async () => {
+  await ingestPeople([peopleRow({ Name: "Jane Doe", Email: "jane.doe@acme.com" })]);
+  await ingestPeople([peopleRow({ Name: "Jane Doe", Email: "jane.doe2@acme.com" })]);
+  const contacts = await all("contacts");
+  expect(contacts).toHaveLength(2);
+  expect(contacts.map((c) => c.display.email).sort()).toEqual(["jane.doe2@acme.com", "jane.doe@acme.com"]);
+  // The second Jane's email is bound to HER contact, not the first's.
+  await ingestPeople([peopleRow({ Name: "J. Doe", Email: "jane.doe2@acme.com" })]);
+  expect(await all("contacts")).toHaveLength(2);
+});
+
+test("a name-only sighting still reuses a contact in the same account", async () => {
+  await ingestPeople([peopleRow({ Name: "Jane Doe", Email: "jane.doe@acme.com" })]);
+  await ingestPeople([peopleRow({ Name: "Jane Doe" })]);
+  expect(await all("contacts")).toHaveLength(1);
+});
+
+
 // ----------------------------------------------------------------- importCsv
 
 const store = (text: string) => raw.run((ctx) => ctx.storage.store(new Blob([text])));
@@ -442,6 +461,76 @@ test("importCsv on a header-only file completes the run with zero rows", async (
 test("importCsv refuses a second import into a run that already has one", async () => {
   await t.action(api.sources.import.importCsv, { runId, mappingId, storageId: await store(csvOf(1)) });
   await expect(t.action(api.sources.import.importCsv, { runId, mappingId, storageId: await store(csvOf(1)) })).rejects.toThrow("import_already_started");
+});
+
+
+test("the staging entry points validate the declared size and are not client-callable", async () => {
+  for (const totalRows of [Number.NaN, Number.POSITIVE_INFINITY, -1, 1.5, MAX_IMPORT_ROWS + 1]) {
+    await expect(
+      raw.mutation(internal.sources.import.startStagedImport, { orgId, runId, totalRows, totalChunks: 1 }),
+    ).rejects.toThrow("totalRows");
+  }
+  await expect(
+    raw.mutation(internal.sources.import.startStagedImport, { orgId, runId, totalRows: 10, totalChunks: 0 }),
+  ).rejects.toThrow("totalChunks");
+  expect((await getRun()).rowsExpected).toBeUndefined();
+  // The org travels as an internal argument, so a run from another org is still refused.
+  const otherOrg = await raw.run((ctx) => ctx.db.insert("orgs", { name: "Org 2", createdAt: 0 }));
+  await expect(
+    raw.mutation(internal.sources.import.startStagedImport, { orgId: otherOrg, runId, totalRows: 1, totalChunks: 1 }),
+  ).rejects.toThrow("run not found");
+});
+
+test("importCsv refuses an oversized file with a named error before reading it", async () => {
+  const big = await raw.run((ctx) => ctx.storage.store(new Blob([new Uint8Array(MAX_IMPORT_BYTES + 1)])));
+  await expect(t.action(api.sources.import.importCsv, { runId, mappingId, storageId: big })).rejects.toThrow("file_too_large");
+  expect(await all("importChunks")).toHaveLength(0);
+});
+
+test("staged chunks are bounded by bytes as well as rows, and a single huge row is a named error", () =>
+  withFakeTimers(async () => {
+    // 20 rows with a ~60KB cell: 500 rows would be 1.2MB, over a document. Each cell is also an invalid
+    // jobTitle (>2048 chars), so every row is rejected - which makes the row numbering checkable.
+    const fat = "x".repeat(60_000);
+    const lines = ["Company Site,Company,Email,Name,Title", ...Array.from({ length: 20 }, (_, i) => `co${i}.com,Co,p${i}@co.com,P,${fat}`)];
+    await t.action(api.sources.import.importCsv, { runId, mappingId, storageId: await store(lines.join("\n")) });
+    const chunks = await all("importChunks");
+    expect(chunks.length).toBeGreaterThanOrEqual(3);
+    for (const c of chunks) expect(JSON.stringify(c.rows).length).toBeLessThan(600_000);
+    expect(chunks.reduce((n, c) => n + c.rows.length, 0)).toBe(20);
+    await drain();
+    expect(await getRun()).toMatchObject({ status: "completed", rowsProcessed: 20, rowsRejected: 20, candidatesInserted: 0 });
+    const rows = (await t.query(api.runs.queries.rejectionsForRun, { runId })).map((r) => r.row);
+    expect(rows).toEqual(Array.from({ length: 20 }, (_, i) => i));
+  }), 60_000);
+
+test("a single row too large to stage is a named error and stages nothing", async () => {
+  const huge = ["Company Site,Company,Email,Name,Title", `a.com,Co,p@a.com,P,${"y".repeat(400_000)}`].join("\n");
+  await expect(t.action(api.sources.import.importCsv, { runId, mappingId, storageId: await store(huge) })).rejects.toThrow("row_too_large");
+  expect(await all("importChunks")).toHaveLength(0);
+});
+
+test("importRows refuses a run that already has a staged import, so the chain cannot be completed from under itself", () =>
+  withFakeTimers(async () => {
+    await t.action(api.sources.import.importCsv, { runId, mappingId, storageId: await store(csvOf(1001)) });
+    await expect(t.mutation(api.sources.import.importRows, { runId, mappingId, rows: [jane()] })).rejects.toThrow("import_already_started");
+    await drain();
+    expect(await getRun()).toMatchObject({ status: "completed", rowsProcessed: 1001, chunksExpected: 3, chunksProcessed: 3 });
+  }), 120_000);
+
+test("ingestStep skips an unknown candidate id instead of losing the rest of its batch; the public entry still throws", async () => {
+  const [good] = (await t.mutation(api.sources.import.importRows, { runId, mappingId, rows: [jane()] })).candidateIds;
+  const gone = await raw.run(async (ctx) => {
+    const id = await ctx.db.insert("candidates", {
+      orgId, sourceId, dedupeHash: "domain:x.com|", status: "pending", contractVersion: CANDIDATE_CONTRACT_VERSION,
+      candidate: { company: { domain: "x.com" }, acquisition: { acquiredAt: 1 } },
+    });
+    await ctx.db.delete(id);
+    return id;
+  });
+  await expect(t.mutation(api.sources.ingest.ingestCandidates, { candidateIds: [gone, good!] })).rejects.toThrow("candidate not found");
+  await raw.mutation(internal.sources.ingest.ingestStep, { orgId, candidateIds: [gone, good!] });
+  expect((await all("candidates"))[0]!.status).toBe("consumed");
 });
 
 // ------------------------------------------------------------ addManualLead

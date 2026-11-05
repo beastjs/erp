@@ -141,6 +141,16 @@ test("linkIdentity refuses a second active link for the same pair, in either ord
   await expect(link(b, a)).resolves.toBeDefined();
 });
 
+test("linkIdentity rejects NaN and out-of-range scores", async () => {
+  const a = await seedAccount({ domain: "a.com" });
+  const b = await seedAccount({ domain: "b.com" });
+  for (const score of [NaN, -0.1, 1.1, Infinity]) {
+    await expect(
+      t.run((ctx) => linkIdentity(ctx, { subjectType: "account", subjectId: a, mergedFromId: b, score, signals: [] })),
+    ).rejects.toThrow(/score must be between 0 and 1/);
+  }
+});
+
 describe("normalize", () => {
   test("domain", () => {
     expect(normalizeDomain(" HTTP://WWW.Acme.com:8080/x?y#z ")).toBe("acme.com");

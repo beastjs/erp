@@ -87,6 +87,7 @@ export async function linkIdentity(
   },
 ): Promise<Id<"identityLinks">> {
   const { orgId } = await withOrg(ctx, args);
+  if (!(args.score >= 0 && args.score <= 1)) throw new Error("score must be between 0 and 1");
   if (args.subjectId === args.mergedFromId) throw new Error("cannot link a subject to itself");
   const tbl = table(args.subjectType);
   for (const id of [args.subjectId, args.mergedFromId]) {
@@ -100,13 +101,15 @@ export async function linkIdentity(
     [args.subjectId, args.mergedFromId],
     [args.mergedFromId, args.subjectId],
   ] as const) {
-    const links = await ctx.db
+    // reversedAt is the last index column, so eq(undefined) selects exactly the active links:
+    // one point lookup, no scan and no bound to outgrow.
+    const active = await ctx.db
       .query("identityLinks")
-      .withIndex("by_subject", (q) => q.eq("orgId", orgId).eq("subjectId", from))
-      .take(100);
-    if (links.some((l) => l.mergedFromId === to && l.reversedAt === undefined)) {
-      throw new Error("an active link already exists for this pair");
-    }
+      .withIndex("by_pair", (q) =>
+        q.eq("orgId", orgId).eq("subjectId", from).eq("mergedFromId", to).eq("reversedAt", undefined),
+      )
+      .first();
+    if (active) throw new Error("an active link already exists for this pair");
   }
   return await ctx.db.insert("identityLinks", {
     orgId,

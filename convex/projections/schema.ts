@@ -54,4 +54,6 @@ export const identityLinks = defineTable({
   signals: v.array(v.string()),
   createdAt: v.number(),
   reversedAt: v.optional(v.number()),
-}).index("by_subject", ["orgId", "subjectId"]);
+})
+  .index("by_subject", ["orgId", "subjectId"])
+  .index("by_pair", ["orgId", "subjectId", "mergedFromId", "reversedAt"]);

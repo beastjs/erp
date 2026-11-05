@@ -472,7 +472,7 @@ test("200,000 unterminated <c tokens in a ~1 KB upload fail by name, fast (the q
 test("200,000 well-formed-looking but unclosed <c a=\"1\"> tokens are refused by name, fast", () => {
   const z = book({ sheet: row(1, s("A1", 0)) + `<row r="2">${'<c r="A2">'.repeat(20_000)}</row>`, strings: ["H"] });
   const { out, ms } = timed(() => message(() => parse(z)));
-  expect(out).toBe("corrupt_workbook: a <c> element is never closed");
+  expect(out).toBe("corrupt_workbook: <c> is never closed");
   expect(ms).toBeLessThan(WORK_BUDGET_MS);
 });
 
@@ -579,4 +579,65 @@ test("attribute parsing reads names and values from both quote styles, spaces ar
     sheet: row(1, s("A1", 0)) + row(2, `<c  junk r = 'B2'   t="inlineStr" s="0" x=bare ="v"><is><t>ok</t></is></c>`),
   });
   expect(parse(z).rows).toEqual([["", "ok"]]);
+});
+
+// ------------------------------------------------------------------ the shared scan primitive
+
+/** Blocks of "<tag " x2047 + ">" sized just UNDER MAX_TAG_CHARS, so the tag cap never fires but every `<tag ` candidate
+ *  sits inside the previous tag's span: a scanner that advances by one candidate instead of past the tag is O(N*D). */
+const nested = (tag: string, bytes: number) => `<${tag} `.repeat(2047).concat(">").repeat(Math.floor(bytes / 8200));
+
+test("a '>' that eventually arrives cannot make a structural-part scan quadratic (styles, rels, workbook)", () => {
+  const FOUR_MIB = 4 * 1024 * 1024 - 4096;
+  const base = { sheet: row(1, s("A1", 0)), strings: ["H"] };
+  const cases: Array<[string, Book]> = [
+    ["styles", { ...base, styles: `<styleSheet ${NS}><cellXfs>${nested("xf", FOUR_MIB)}</cellXfs></styleSheet>` }],
+    ["rels", { ...base, extra: { "xl/_rels/workbook.xml.rels": `<Relationships>${nested("Relationship", FOUR_MIB)}</Relationships>` } }],
+    ["workbook", { ...base, extra: { "xl/workbook.xml": `<workbook ${NS}>${nested("sheet", FOUR_MIB)}</workbook>` } }],
+  ];
+  for (const [name, b] of cases) {
+    const z = book(b);
+    expect(z.length).toBeLessThan(200_000);
+    const { ms } = timed(() => message(() => parse(z)));
+    // Tighter than WORK_BUDGET_MS on purpose: the structural-tag-count cap already bounds a scanner that fails to advance
+    // to ~2.5 s per part, so a 5 s budget could not tell it from the fixed one. Fixed code takes tens of milliseconds.
+    expect([name, ms < STRUCTURAL_BUDGET_MS]).toEqual([name, true]);
+  }
+});
+
+const STRUCTURAL_BUDGET_MS = 1_000;
+
+test("a tag that merely contains '<tag' inside an attribute value is one element, not several (the scan advances past what it consumed)", () => {
+  // cells
+  const cell = `<c r="A2" t="inlineStr" x="<c r='B2' t='inlineStr'>"><is><t>one</t></is></c>`;
+  expect(parse(book({ strings: ["H"], sheet: row(1, s("A1", 0)) + row(2, cell) })).rows).toEqual([["one"]]);
+  // structural tags
+  const wb = `<workbook ${NS}><sheets><sheet name="S" sheetId="1" x="<sheet name='B' r:id='rId2'>" r:id="rId1"/></sheets></workbook>`;
+  expect(parse(book({ strings: ["H"], sheet: row(1, s("A1", 0)), extra: { "xl/workbook.xml": wb } })).headers).toEqual(["H"]);
+});
+
+test("the same nested-candidate shape inside a row is bounded for cells", () => {
+  const z = book({ strings: ["H"], sheet: row(1, s("A1", 0)) + `<row r="2">${nested("c", 4 * 1024 * 1024)}</row>` });
+  const { out, ms } = timed(() => message(() => parse(z)));
+  expect(out).toBe("corrupt_workbook: <c> is never closed");
+  expect(ms).toBeLessThan(WORK_BUDGET_MS);
+});
+
+test("a structural tag count above the cap is refused by name", () => {
+  const z = book({ strings: ["H"], sheet: row(1, s("A1", 0)), styles: `<styleSheet ${NS}><cellXfs>${"<xf/>".repeat(200_001)}</cellXfs></styleSheet>` });
+  expect(message(() => parse(z))).toBe("corrupt_workbook: more than 200000 <xf> tags");
+});
+
+test("numeric whitespace entities are data whether or not columns is passed; an empty r falls back to the next column", () => {
+  const z = book({
+    strings: ["Name", "Notes", "Ann"],
+    sheet: row(1, s("A1", 0) + s("B1", 1)) + row(2, s("A2", 2)) + row(3, '<c r="B3"><v>&#32;</v></c>') + row(4, '<c r="B4"><v> </v></c>'),
+  });
+  const a = parse(z, { columns: ["Name"] }).rows;
+  const b = parse(z).rows;
+  expect(a).toEqual([["Ann"], []]); // row 3 (entity) is data in both readings; row 4 (raw space) is blank in both
+  expect(b).toHaveLength(a.length);
+  expect(b[1]![1]).toMatch(/^#cell_error: invalid_number: cell B3 /);
+  const empty = book({ strings: ["H"], sheet: row(1, s("A1", 0)) + row(2, '<c r="" t="inlineStr"><is><t>x</t></is></c>') });
+  expect(parse(empty).rows).toEqual([["x"]]);
 });

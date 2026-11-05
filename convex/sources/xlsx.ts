@@ -310,17 +310,22 @@ function openTag(xml: string): string {
 }
 
 /*
- * Every scan below is index based (indexOf plus a bounded delimiter check) and a failed candidate
- * either throws or moves forward for good, so cost is linear in the input. Regexes with a lazy or
- * negated-class body re-scan to the end of the input for every unterminated candidate, which is
- * quadratic: a ~1 KB upload of repeated "<c" tokens is enough to burn minutes of CPU while every
- * byte bound is respected. The byte budget bounds bytes, not work, so work must be linear by construction.
+ * WORK MUST BE LINEAR BY CONSTRUCTION. The byte budget bounds bytes, not work: a ~1 KB upload of repeated
+ * "<c" tokens burned 61.7 s in a lazy regex, and each later hazard was the same mistake in a new place
+ * (a scanner that does not advance past what it consumed, or one that re-scans to the end for every
+ * unterminated candidate). So every element scan in this module goes through `nextElement`, the single
+ * primitive that guarantees: the candidate is a real tag, its open tag is bounded, a required close either
+ * exists or the scan THROWS, and the returned cursor is strictly past everything consumed. Callers
+ * cannot get any of those wrong because they never see the raw indices. Regexes are only used on input
+ * already bounded in length.
  */
 
 /** A longest legitimate open tag is a few hundred characters; anything longer is not worth interpreting. */
 const MAX_TAG_CHARS = 8 * 1024;
 /** Excel's own column limit: a row with more `<c>` than this is not a spreadsheet row. */
 const MAX_CELLS_PER_ROW = 16_384;
+/** Far above any real part (Excel allows 64,000 cell formats, 255 sheets); a cap on structural tag count. */
+const MAX_STRUCTURAL_TAGS = 200_000;
 
 /** Index of the next `<tag` that is really that tag (followed by whitespace, `/` or `>`), or -1. */
 function nextOpen(xml: string, tag: string, from: number): number {
@@ -332,45 +337,59 @@ function nextOpen(xml: string, tag: string, from: number): number {
   return -1;
 }
 
+type Scanned = {
+  /** Where the element starts in the text scanned. */
+  start: number;
+  /** The open tag as written. */
+  open: string;
+  /** Content between the tags; undefined for a self-closed element or when no close was asked for. */
+  inner: string | undefined;
+  /** Where to resume: always greater than `start`, and past everything this element consumed. */
+  next: number;
+};
+
+/**
+ * The scan primitive. Finds the next `<tag` at or after `from`; null if none. Throws `fail(...)` if its
+ * open tag is unterminated or longer than MAX_TAG_CHARS, or (when `close`) if a non-self-closed element
+ * has no `</tag>`. A scan never returns a candidate it did not fully consume, and never retries one.
+ */
+function nextElement(xml: string, tag: string, from: number, close: boolean, fail: (what: string) => Error): Scanned | null {
+  const start = nextOpen(xml, tag, from);
+  if (start < 0) return null;
+  const gt = tagEnd(xml, start);
+  if (gt < 0 || gt - start > MAX_TAG_CHARS) throw fail(`an unterminated or oversized <${tag}> tag`);
+  const open = xml.slice(start, gt + 1);
+  if (!close || xml[gt - 1] === "/") return { start, open, inner: undefined, next: gt + 1 };
+  const end = xml.indexOf(`</${tag}>`, gt + 1);
+  if (end < 0) throw fail(`<${tag}> is never closed`);
+  return { start, open, inner: xml.slice(gt + 1, end), next: end + tag.length + 3 };
+}
+
+const structural = (what: string) => new Error(`corrupt_workbook: ${what}`);
+const badCell = (what: string) => new CellError(`malformed_cell: ${what}`);
+
 /** Every `<tag ...>` open tag in `xml` (a small structural part), as written. Unterminated or oversized is corrupt. */
 function tagsOf(xml: string, tag: string): string[] {
   const out: string[] = [];
-  for (let i = nextOpen(xml, tag, 0); i >= 0; i = nextOpen(xml, tag, i + 1)) {
-    const gt = tagEnd(xml, i);
-    if (gt < 0 || gt - i > MAX_TAG_CHARS) throw new Error(`corrupt_workbook: an unterminated or oversized <${tag}> tag`);
-    out.push(xml.slice(i, gt + 1));
+  for (let el = nextElement(xml, tag, 0, false, structural); el; el = nextElement(xml, tag, el.next, false, structural)) {
+    if (out.length >= MAX_STRUCTURAL_TAGS) throw structural(`more than ${MAX_STRUCTURAL_TAGS} <${tag}> tags`);
+    out.push(el.open);
   }
   return out;
 }
 
 /** Text of the first `<tag>..</tag>` child ("" for a self-closed one), undefined if absent. */
 function childText(inner: string, tag: string): string | undefined {
-  const i = nextOpen(inner, tag, 0);
-  if (i < 0) return undefined;
-  const gt = tagEnd(inner, i);
-  if (gt < 0) throw new CellError(`malformed_cell: an unterminated <${tag}> tag`);
-  if (inner[gt - 1] === "/") return "";
-  const end = inner.indexOf(`</${tag}>`, gt + 1);
-  if (end < 0) throw new CellError(`malformed_cell: <${tag}> is never closed`);
-  return inner.slice(gt + 1, end);
+  const el = nextElement(inner, tag, 0, true, badCell);
+  return el ? (el.inner ?? "") : undefined;
 }
 
 /** The `<c>` elements of a row body, split by index so a legal `>` inside an attribute value cannot mis-split one. */
 function splitCells(row: string, from: number): Array<{ open: string; inner: string | undefined }> {
   const out: Array<{ open: string; inner: string | undefined }> = [];
-  for (let i = nextOpen(row, "c", from); i >= 0; ) {
+  for (let el = nextElement(row, "c", from, true, structural); el; el = nextElement(row, "c", el.next, true, structural)) {
     if (out.length >= MAX_CELLS_PER_ROW) throw new Error(`too_many_columns: a row has more than ${MAX_CELLS_PER_ROW} cells`);
-    const gt = tagEnd(row, i);
-    if (gt < 0 || gt - i > MAX_TAG_CHARS) throw new Error("corrupt_workbook: an unterminated or oversized <c> tag");
-    if (row[gt - 1] === "/") {
-      out.push({ open: row.slice(i, gt + 1), inner: undefined });
-      i = nextOpen(row, "c", gt + 1);
-      continue;
-    }
-    const end = row.indexOf("</c>", gt + 1);
-    if (end < 0) throw new Error("corrupt_workbook: a <c> element is never closed");
-    out.push({ open: row.slice(i, gt + 1), inner: row.slice(gt + 1, end) });
-    i = nextOpen(row, "c", end + 4);
+    out.push({ open: el.open, inner: el.inner });
   }
   return out;
 }
@@ -379,25 +398,16 @@ function splitCells(row: string, from: number): Array<{ open: string; inner: str
 function richText(xml: string): string {
   let s = "";
   let pos = 0;
-  let nextT = -2;
-  let nextP = -2;
+  let t: Scanned | null | undefined; // undefined = not looked for yet; null = none left
+  let p: Scanned | null | undefined;
   for (;;) {
-    if (nextT !== -1 && nextT < pos) nextT = nextOpen(xml, "t", pos);
-    if (nextP !== -1 && nextP < pos) nextP = nextOpen(xml, "rPh", pos);
-    const useP = nextP >= 0 && (nextT < 0 || nextP < nextT);
-    const i = useP ? nextP : nextT;
-    if (i < 0) return s;
-    const tag = useP ? "rPh" : "t";
-    const gt = tagEnd(xml, i);
-    if (gt < 0) throw new CellError(`malformed_cell: an unterminated <${tag}> tag`);
-    if (xml[gt - 1] === "/") {
-      pos = gt + 1;
-      continue;
-    }
-    const end = xml.indexOf(`</${tag}>`, gt + 1);
-    if (end < 0) throw new CellError(`malformed_cell: <${tag}> is never closed`);
-    if (!useP) s += unescapeXml(xml.slice(gt + 1, end));
-    pos = end + tag.length + 3;
+    if (t === undefined || (t !== null && t.start < pos)) t = nextElement(xml, "t", pos, true, badCell);
+    if (p === undefined || (p !== null && p.start < pos)) p = nextElement(xml, "rPh", pos, true, badCell);
+    const phonetic = p !== null && (t === null || p.start < t.start);
+    const el = phonetic ? p : t;
+    if (el === null || el === undefined) return s;
+    if (!phonetic && el.inner !== undefined) s += unescapeXml(el.inner);
+    pos = el.next;
   }
 }
 
@@ -428,6 +438,8 @@ function numberText(raw: string, where: string): string {
     frac = digits.slice(point);
   }
   int = int.replace(/^0+(?=\d)/, "");
+  // /0+$/ is quadratic on a long run of zeros followed by a non-zero. What bounds `frac` is the exponent clamp above
+  // (|exp| <= 400 gives at most ~464 characters), not the 64-character length cap. Keep that clamp.
   frac = frac.replace(/0+$/, "");
   const sign = m[1] === "-" && (/[1-9]/.test(int) || frac !== "") ? "-" : "";
   return sign + int + (frac ? "." + frac : "");
@@ -738,7 +750,8 @@ export function parseXlsx(bytes: Uint8Array, opts: XlsxOptions): { headers: stri
         return str !== undefined && str.trim() === "";
       }
       if (t === "e" || t === "b") return false;
-      return unescapeXml(v).trim() === "";
+      if (t === "str" || t === "d") return unescapeXml(v).trim() === "";
+      return v.trim() === ""; // numeric: blank is decided on the raw text, exactly as cellValue does
     } catch {
       return false;
     }
@@ -752,8 +765,11 @@ export function parseXlsx(bytes: Uint8Array, opts: XlsxOptions): { headers: stri
     let cursor = -1;
     for (const { open, inner } of splitCells(rowXml, openTag(rowXml).length)) {
       const a = attrs(open);
-      if (a.r !== undefined && (colIndex(a.r) < 0 || colIndex(a.r) > 0x7fffff)) throw new Error(`corrupt_workbook: malformed cell reference "${a.r}"`);
-      const col = a.r ? colIndex(a.r) : cursor + 1;
+      let col: number;
+      if (a.r) {
+        col = colIndex(a.r);
+        if (col < 0 || col > 0x7fffff) throw new Error(`corrupt_workbook: malformed cell reference "${a.r}"`);
+      } else col = cursor + 1; // no (or empty) reference: the next column along
       cursor = col;
       if (inner === undefined) continue;
       if (mappedCols && !mappedCols.has(col)) {

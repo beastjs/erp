@@ -22,6 +22,7 @@
     "beast-tsrx": "0.16.0",
     "clsx": "^2.1.1",
     "convex": "^1.49.0",
+    "fflate": "0.8.3",
     "octane": "0.16.0",
     "tailwind-merge": "^3.6.0"
   },

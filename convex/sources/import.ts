@@ -9,6 +9,7 @@ import { parseCsv } from "./csv";
 import { INGEST_BATCH, ingestCandidate } from "./ingest";
 import { missingColumns, rowToCandidate, validateMapping, type ColumnPair } from "./mapping";
 import { insertCandidate } from "./mutations";
+import { parseXlsx, sniffFormat } from "./xlsx";
 
 /**
  * Rows per mutation. A mutation may write 16k documents and read 32k; an inserted candidate costs a
@@ -254,7 +255,7 @@ export const processStagedChunk = internalMutation({
 });
 
 /**
- * Reads an uploaded CSV from storage, validates it against the mapping, stages it as chunks and starts
+ * Reads an uploaded CSV or .xlsx from storage (see `sniffFormat`; .xls is refused by name), validates it against the mapping, stages it as chunks and starts
  * the self-scheduling chain (see above). It returns as soon as the file is staged; the import itself
  * proceeds in the background and is observable on the run (`rowsProcessed` of `rowsExpected`, then
  * `status: "completed"`). Rejected rows are kept in `importRejections` (`rejectionsForRun`).
@@ -264,14 +265,30 @@ export const processStagedChunk = internalMutation({
  * smaller documents, and unmapped headers (blank, or starting with "_") never meet a validator.
  */
 export const importCsv = action({
-  args: { runId: v.id("discoveryRuns"), mappingId: v.id("columnMappings"), storageId: v.id("_storage") },
+  args: {
+    runId: v.id("discoveryRuns"),
+    mappingId: v.id("columnMappings"),
+    storageId: v.id("_storage"),
+    /** Worksheet to read from an .xlsx; required when the workbook has several visible sheets. Not valid for CSV. */
+    sheet: v.optional(v.string()),
+  },
   handler: async (ctx, args): Promise<{ rows: number; chunks: number }> => {
     const blob = await ctx.storage.get(args.storageId);
     if (!blob) throw new Error("file_not_found: nothing is stored under that id");
     if (blob.size > MAX_IMPORT_BYTES) {
       throw new Error(`file_too_large: ${blob.size} bytes exceeds the ${MAX_IMPORT_BYTES} byte import limit; split the file`);
     }
-    const { headers, rows } = parseCsv(await blob.text());
+    // The format comes from the bytes, not the file name. The size check above bounds the UPLOAD only:
+    // an .xlsx is a zip, so parseXlsx bounds what it inflates and how many rows it builds as it goes.
+    const format = sniffFormat(new Uint8Array(await blob.slice(0, 8).arrayBuffer()));
+    if (format === "xls") {
+      throw new Error("unsupported_format: legacy .xls and password-protected workbooks cannot be read; save as .xlsx (no password) or CSV");
+    }
+    if (format === "csv" && args.sheet !== undefined) throw new Error("sheet_not_applicable: a sheet name only applies to .xlsx files");
+    const { headers, rows } =
+      format === "xlsx"
+        ? parseXlsx(new Uint8Array(await blob.arrayBuffer()), { sheet: args.sheet, maxRows: MAX_IMPORT_ROWS })
+        : parseCsv(await blob.text());
     if (rows.length > MAX_IMPORT_ROWS) {
       throw new Error(`too_many_rows: ${rows.length} rows exceeds the ${MAX_IMPORT_ROWS} row import limit; split the file`);
     }

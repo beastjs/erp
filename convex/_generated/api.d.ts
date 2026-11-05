@@ -31,6 +31,7 @@ import type * as sources_import from "../sources/import.js";
 import type * as sources_ingest from "../sources/ingest.js";
 import type * as sources_mapping from "../sources/mapping.js";
 import type * as sources_mutations from "../sources/mutations.js";
+import type * as sources_xlsx from "../sources/xlsx.js";
 
 import type {
   ApiFromModules,
@@ -62,6 +63,7 @@ declare const fullApi: ApiFromModules<{
   "sources/ingest": typeof sources_ingest;
   "sources/mapping": typeof sources_mapping;
   "sources/mutations": typeof sources_mutations;
+  "sources/xlsx": typeof sources_xlsx;
 }>;
 
 /**

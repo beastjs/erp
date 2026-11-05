@@ -1,5 +1,6 @@
 /// <reference types="vite/client" />
 import { convexTest } from "convex-test";
+import { strToU8, zipSync } from "fflate";
 import { beforeEach, expect, test, vi } from "vitest";
 import { api, internal } from "../_generated/api";
 import type { Id } from "../_generated/dataModel";
@@ -630,4 +631,74 @@ test("submitCandidates refuses an oversized batch and a source from another org"
       sourceId, contractVersion: CANDIDATE_CONTRACT_VERSION, candidates: [lead()],
     }),
   ).rejects.toThrow("source not found");
+});
+
+
+// ----------------------------------------------------------------- importCsv with .xlsx
+
+const NS = 'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"';
+/** A minimal workbook; every cell is an inline string except the date column, which is a date-formatted serial. */
+function xlsxOf(table: string[][], opts: { sheets?: string[]; dateCol?: number } = {}): Uint8Array {
+  const sheets = opts.sheets ?? ["Leads"];
+  const cell = (v: string, r: number, c: number) =>
+    opts.dateCol === c && r > 0 ? `<c r="${"ABCDEF"[c]}${r + 1}" s="1"><v>${v}</v></c>` : `<c r="${"ABCDEF"[c]}${r + 1}" t="inlineStr"><is><t>${v}</t></is></c>`;
+  const rows = table.map((cells, r) => `<row r="${r + 1}">${cells.map((v, c) => cell(v, r, c)).join("")}</row>`).join("");
+  const files: Record<string, Uint8Array> = {
+    "xl/workbook.xml": strToU8(`<workbook ${NS}><sheets>${sheets.map((n, i) => `<sheet name="${n}" sheetId="${i + 1}" r:id="rId${i + 1}"/>`).join("")}</sheets></workbook>`),
+    "xl/_rels/workbook.xml.rels": strToU8(
+      `<Relationships>${sheets.map((_, i) => `<Relationship Id="rId${i + 1}" Type="http://x/worksheet" Target="worksheets/sheet${i + 1}.xml"/>`).join("")}<Relationship Id="rS" Type="http://x/styles" Target="styles.xml"/></Relationships>`,
+    ),
+    "xl/styles.xml": strToU8(`<styleSheet ${NS}><cellXfs><xf numFmtId="0"/><xf numFmtId="14"/></cellXfs></styleSheet>`),
+  };
+  sheets.forEach((_, i) => (files[`xl/worksheets/sheet${i + 1}.xml`] = strToU8(`<worksheet ${NS}><sheetData>${i === 0 ? rows : ""}</sheetData></worksheet>`)));
+  return zipSync(files);
+}
+const storeBytes = (bytes: Uint8Array) => raw.run((ctx) => ctx.storage.store(new Blob([bytes as BlobPart])));
+const XLSX_HEAD = ["Company Site", "Company", "Email", "Name", "Title"];
+
+test("importCsv reads an .xlsx the same way: sniffed from the bytes, imported through the same chain", () =>
+  withFakeTimers(async () => {
+    const table = [XLSX_HEAD, ...Array.from({ length: 1001 }, (_, i) => [`co${i}.com`, `Co ${i}`, `p${i}@co${i}.com`, `Person ${i}`, "Eng"])];
+    const out = await t.action(api.sources.import.importCsv, { runId, mappingId, storageId: await storeBytes(xlsxOf(table)) });
+    expect(out).toEqual({ rows: 1001, chunks: 3 });
+    await drain();
+    expect(await getRun()).toMatchObject({ status: "completed", rowsProcessed: 1001, candidatesInserted: 1001 });
+  }), 120_000);
+
+test("an .xlsx imports the same candidates as the equivalent CSV, with the Excel date arriving as the right acquiredAt", () =>
+  withFakeTimers(async () => {
+    const mappingWithDate = await t.mutation(api.sources.import.saveMapping, {
+      name: "dated",
+      columns: { ...COLUMNS, Acquired: "acquisition.acquiredAt" },
+    });
+    const table = [[...XLSX_HEAD, "Acquired"], ["a.com", "A", "a@a.com", "Ann", "Eng", "45658"]]; // 2025-01-01
+    await t.action(api.sources.import.importCsv, { runId, mappingId: mappingWithDate, storageId: await storeBytes(xlsxOf(table, { dateCol: 5 })) });
+    await drain();
+    expect(await getRun()).toMatchObject({ status: "completed", candidatesInserted: 1, rowsRejected: 0 });
+    const [cand] = await all("candidates");
+    expect(cand!.candidate.acquisition.acquiredAt).toBe(Date.UTC(2025, 0, 1));
+  }));
+
+test("importCsv refuses unreadable or ambiguous workbooks by name, before staging anything", async () => {
+  const ole = Uint8Array.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1, 0, 0, 0, 0]);
+  const run = async (bytes: Uint8Array, sheet?: string) =>
+    t.action(api.sources.import.importCsv, { runId, mappingId, storageId: await storeBytes(bytes), ...(sheet === undefined ? {} : { sheet }) });
+  await expect(run(ole)).rejects.toThrow("unsupported_format: legacy .xls");
+  await expect(run(xlsxOf([XLSX_HEAD], { sheets: ["Leads", "Other"] }))).rejects.toThrow("ambiguous_sheet");
+  await expect(run(xlsxOf([XLSX_HEAD], { sheets: ["Leads", "Other"] }), "Nope")).rejects.toThrow("sheet_not_found");
+  await expect(run(strToU8(csvOf(2)), "Leads")).rejects.toThrow("sheet_not_applicable");
+  await expect(run(xlsxOf([["Company Site", "Email"], ["a.com", "a@a.com"]]))).rejects.toThrow("missing_columns: Company, Name, Title");
+  expect(await all("candidates")).toHaveLength(0);
+  expect(await all("importChunks")).toHaveLength(0);
+  expect((await getRun()).status).toBe("running");
+});
+
+test("importCsv accepts a named sheet from a multi-sheet workbook", async () => {
+  const out = await t.action(api.sources.import.importCsv, {
+    runId,
+    mappingId,
+    storageId: await storeBytes(xlsxOf([XLSX_HEAD, ["a.com", "A", "a@a.com", "Ann", "Eng"]], { sheets: ["Leads", "Other"] })),
+    sheet: "Leads",
+  });
+  expect(out).toEqual({ rows: 1, chunks: 1 });
 });

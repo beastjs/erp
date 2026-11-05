@@ -53,13 +53,13 @@ export type NormalizedCandidate = {
   };
 };
 
-const PERSON_STRING_FIELDS = [
+export const PERSON_STRING_FIELDS = [
   "fullName", "firstName", "lastName", "jobTitle", "department", "seniority", "email", "phone", "profileUrl",
 ] as const;
-const COMPANY_STRING_FIELDS = [
+export const COMPANY_STRING_FIELDS = [
   "name", "website", "domain", "industry", "size", "revenueRange", "location", "country", "description",
 ] as const;
-const ACQUISITION_STRING_FIELDS = ["campaign", "channel", "queryContext", "landingPage", "referral"] as const;
+export const ACQUISITION_STRING_FIELDS = ["campaign", "channel", "queryContext", "landingPage", "referral"] as const;
 
 const MAX_STRING = 2048;
 const MAX_TECH_STACK = 100;
@@ -199,4 +199,39 @@ export function computeDedupeHash(candidate: NormalizedCandidate): string {
   const domain = candidate.company?.domain ? normalizeDomain(candidate.company.domain) : null;
   if (!domain) throw new Error("candidate has no usable identifier");
   return `domain:${domain}|${key ?? ""}`;
+}
+
+const SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
+
+/**
+ * Compares a PRODUCER-declared contract version with Core's. Compatible only when
+ *   - MAJOR is equal (a different MAJOR means fields were removed/renamed/tightened: guessing would
+ *     silently mis-read data, so refuse), and
+ *   - the producer's MINOR is not ahead of Core's (it may send optional fields Core has not shipped
+ *     yet; the contract says Core deploys first), and
+ *   - PATCH is ignored (no shape change).
+ * Anything that is not plain `MAJOR.MINOR.PATCH` is refused rather than coerced: a pre-release tag or
+ * a missing part is exactly the case where a producer does not know what it is sending.
+ */
+export function checkContractVersion(declared: unknown): { ok: true } | { ok: false; error: string } {
+  const parse = (x: unknown) => {
+    const m = typeof x === "string" ? SEMVER.exec(x) : null;
+    return m ? { major: Number(m[1]), minor: Number(m[2]) } : null;
+  };
+  const core = parse(CANDIDATE_CONTRACT_VERSION)!;
+  const theirs = parse(declared);
+  if (!theirs) return { ok: false, error: `contract_version_unsupported: "${String(declared)}" is not MAJOR.MINOR.PATCH` };
+  if (theirs.major !== core.major) {
+    return {
+      ok: false,
+      error: `contract_version_unsupported: producer declares ${String(declared)}, Core speaks ${CANDIDATE_CONTRACT_VERSION} (MAJOR differs)`,
+    };
+  }
+  if (theirs.minor > core.minor) {
+    return {
+      ok: false,
+      error: `contract_version_unsupported: producer declares ${String(declared)}, ahead of Core ${CANDIDATE_CONTRACT_VERSION}; deploy Core first`,
+    };
+  }
+  return { ok: true };
 }

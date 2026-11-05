@@ -10,6 +10,19 @@ import { CANDIDATE_CONTRACT_VERSION, computeDedupeHash, validateCandidate } from
 
 const modules = import.meta.glob("/convex/**/*.ts");
 
+const blankRun = {
+  status: "running" as const,
+  creditBudget: 0,
+  creditsUsed: 0,
+  startedAt: 0,
+  rowsProcessed: 0,
+  candidatesInserted: 0,
+  duplicates: 0,
+  rowsRejected: 0,
+  candidatesConsumed: 0,
+  candidatesRejected: 0,
+};
+
 const minimal = () => ({
   company: { domain: "acme.com" },
   acquisition: { acquiredAt: 1000 },
@@ -223,7 +236,7 @@ test("insertCandidate rejects a run from another org", async () => {
   const otherOrg = await raw.run((ctx) => ctx.db.insert("orgs", { name: "Org 2", createdAt: 0 }));
   const foreignRun = await raw.run(async (ctx) => {
     const src = await ctx.db.insert("sources", { orgId: otherOrg, key: "x", kind: "csv", trustWeight: 1, lawfulBasis: "consent" });
-    return ctx.db.insert("discoveryRuns", { orgId: otherOrg, sourceId: src, status: "running" });
+    return ctx.db.insert("discoveryRuns", { ...blankRun, orgId: otherOrg, sourceId: src });
   });
   await expect(
     t.run((ctx) => insertCandidate(ctx, { candidate: minimal(), sourceId, runId: foreignRun })),

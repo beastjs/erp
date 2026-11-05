@@ -28,7 +28,10 @@ export const accounts = defineTable({
     name: v.optional(v.string()),
     domain: v.optional(v.string()),
   }),
-}).index("by_org", ["orgId"]);
+})
+  .index("by_org", ["orgId"])
+  // Ingest looks accounts up by the normalized domain the winning claim carries.
+  .index("by_org_and_domain", ["orgId", "display.domain"]);
 
 export const contacts = defineTable({
   orgId: v.id("orgs"),
@@ -38,7 +41,9 @@ export const contacts = defineTable({
     email: v.optional(v.string()),
     title: v.optional(v.string()),
   }),
-}).index("by_org", ["orgId"]);
+})
+  .index("by_org", ["orgId"])
+  .index("by_org_and_email", ["orgId", "display.email"]);
 
 /*
  * A reversible record that `mergedFromId` is the same entity as `subjectId`.

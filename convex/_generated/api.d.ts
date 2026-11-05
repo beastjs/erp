@@ -16,7 +16,13 @@ import type * as projections_build from "../projections/build.js";
 import type * as projections_identity from "../projections/identity.js";
 import type * as projections_queries from "../projections/queries.js";
 import type * as projections_resolve from "../projections/resolve.js";
+import type * as runs_mutations from "../runs/mutations.js";
+import type * as runs_queries from "../runs/queries.js";
 import type * as sources_contract from "../sources/contract.js";
+import type * as sources_csv from "../sources/csv.js";
+import type * as sources_import from "../sources/import.js";
+import type * as sources_ingest from "../sources/ingest.js";
+import type * as sources_mapping from "../sources/mapping.js";
 import type * as sources_mutations from "../sources/mutations.js";
 
 import type {
@@ -34,7 +40,13 @@ declare const fullApi: ApiFromModules<{
   "projections/identity": typeof projections_identity;
   "projections/queries": typeof projections_queries;
   "projections/resolve": typeof projections_resolve;
+  "runs/mutations": typeof runs_mutations;
+  "runs/queries": typeof runs_queries;
   "sources/contract": typeof sources_contract;
+  "sources/csv": typeof sources_csv;
+  "sources/import": typeof sources_import;
+  "sources/ingest": typeof sources_ingest;
+  "sources/mapping": typeof sources_mapping;
   "sources/mutations": typeof sources_mutations;
 }>;
 

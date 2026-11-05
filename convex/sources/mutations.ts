@@ -2,7 +2,7 @@ import { v } from "convex/values";
 import type { Id } from "../_generated/dataModel";
 import { mutation, type MutationCtx } from "../_generated/server";
 import { withOrg } from "../_shared/org";
-import { CANDIDATE_CONTRACT_VERSION, computeDedupeHash, validateCandidate } from "./contract";
+import { CANDIDATE_CONTRACT_VERSION, checkContractVersion, computeDedupeHash, validateCandidate } from "./contract";
 import { lawfulBasis, sourceKind } from "./schema";
 
 export const registerSource = mutation({
@@ -33,9 +33,18 @@ export const registerSource = mutation({
  */
 export async function insertCandidate(
   ctx: MutationCtx,
-  args: { candidate: unknown; sourceId: Id<"sources">; runId?: Id<"discoveryRuns"> },
+  args: {
+    candidate: unknown;
+    sourceId: Id<"sources">;
+    runId?: Id<"discoveryRuns">;
+    /** What the producer declared. Omit only for in-process sources, which speak Core's own version. */
+    contractVersion?: string;
+  },
 ): Promise<Id<"candidates"> | null> {
   const { orgId } = await withOrg(ctx, args);
+  const contractVersion = args.contractVersion ?? CANDIDATE_CONTRACT_VERSION;
+  const version = checkContractVersion(contractVersion);
+  if (!version.ok) throw new Error(version.error);
   const checked = validateCandidate(args.candidate);
   if (!checked.ok) throw new Error(`invalid candidate: ${checked.errors.join("; ")}`);
   const dedupeHash = computeDedupeHash(checked.value);
@@ -58,7 +67,7 @@ export async function insertCandidate(
     runId: args.runId,
     dedupeHash,
     status: "pending",
-    contractVersion: CANDIDATE_CONTRACT_VERSION,
+    contractVersion,
     candidate: checked.value,
   });
 }

@@ -18,6 +18,8 @@ import type * as projections_queries from "../projections/queries.js";
 import type * as projections_resolve from "../projections/resolve.js";
 import type * as runs_mutations from "../runs/mutations.js";
 import type * as runs_queries from "../runs/queries.js";
+import type * as signals_decay from "../signals/decay.js";
+import type * as signals_mutations from "../signals/mutations.js";
 import type * as sources_contract from "../sources/contract.js";
 import type * as sources_csv from "../sources/csv.js";
 import type * as sources_import from "../sources/import.js";
@@ -42,6 +44,8 @@ declare const fullApi: ApiFromModules<{
   "projections/resolve": typeof projections_resolve;
   "runs/mutations": typeof runs_mutations;
   "runs/queries": typeof runs_queries;
+  "signals/decay": typeof signals_decay;
+  "signals/mutations": typeof signals_mutations;
   "sources/contract": typeof sources_contract;
   "sources/csv": typeof sources_csv;
   "sources/import": typeof sources_import;

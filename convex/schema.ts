@@ -3,6 +3,7 @@ import { v } from "convex/values";
 import { claims } from "./claims/schema";
 import { sources, candidates, columnMappings, importChunks, importRejections } from "./sources/schema";
 import { discoveryRuns } from "./runs/schema";
+import { signals } from "./signals/schema";
 import { accounts, contacts, contactKeys, identityLinks } from "./projections/schema";
 
 export default defineSchema({
@@ -21,4 +22,5 @@ export default defineSchema({
   importChunks,
   importRejections,
   discoveryRuns,
+  signals,
 });

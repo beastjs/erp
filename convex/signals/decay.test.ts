@@ -1,0 +1,152 @@
+/// <reference types="vite/client" />
+import { convexTest } from "convex-test";
+import { beforeEach, expect, test } from "vitest";
+import type { Id } from "../_generated/dataModel";
+import schema from "../schema";
+import { DEFAULT_STRENGTH_BY_KIND, HALF_LIFE_MS, STRENGTH_WEIGHTS, decayedWeight, type Signal } from "./decay";
+import { activeSignals, appendSignal } from "./mutations";
+
+const modules = import.meta.glob("/convex/**/*.ts");
+const DAY = 24 * 60 * 60 * 1000;
+const NOW = 1_800_000_000_000;
+
+const sig = (over: Partial<Signal> = {}) =>
+  ({ strength: "high", observedAt: NOW, ...over }) as Pick<Signal, "strength" | "observedAt" | "expiresAt">;
+
+test("a signal observed today keeps its full strength weight", () => {
+  for (const s of ["high", "medium", "low"] as const) {
+    expect(decayedWeight(sig({ strength: s }), NOW)).toBe(STRENGTH_WEIGHTS[s]);
+  }
+});
+
+test("weight halves after exactly one half-life", () => {
+  const w = decayedWeight(sig({ observedAt: NOW - HALF_LIFE_MS.high }), NOW);
+  expect(w).toBeCloseTo(STRENGTH_WEIGHTS.high / 2, 10);
+});
+
+test("a six-month-old high signal decays below a fresh medium signal", () => {
+  const old = decayedWeight(sig({ strength: "high", observedAt: NOW - 180 * DAY }), NOW);
+  expect(old).toBeLessThan(decayedWeight(sig({ strength: "medium" }), NOW));
+});
+
+test("an expired signal has weight 0 even inside its half-life", () => {
+  const s = sig({ observedAt: NOW - DAY, expiresAt: NOW - 1 });
+  expect(decayedWeight(s, NOW)).toBe(0);
+  expect(decayedWeight(sig({ observedAt: NOW - DAY, expiresAt: NOW + DAY }), NOW)).toBeGreaterThan(0);
+});
+
+test("decayedWeight never returns NaN, a negative number or Infinity", () => {
+  const nows = [NOW, NaN, Infinity, -Infinity, -1, 0, Number.MAX_VALUE];
+  const observed = [NOW, NaN, Infinity, -Infinity, NOW + 10 * DAY, -1e300, 0];
+  for (const strength of ["high", "medium", "low"] as const)
+    for (const now of nows)
+      for (const observedAt of observed)
+        for (const expiresAt of [undefined, NaN, Infinity, NOW - 1, NOW + DAY]) {
+          const w = decayedWeight({ strength, observedAt, expiresAt }, now);
+          expect(Number.isFinite(w)).toBe(true);
+          expect(w).toBeGreaterThanOrEqual(0);
+          expect(w).toBeLessThanOrEqual(STRENGTH_WEIGHTS[strength]);
+        }
+  // an unknown strength that slipped past validation must not leak NaN either
+  expect(decayedWeight({ strength: "bogus" as never, observedAt: NOW }, NOW)).toBe(0);
+});
+
+test("strength weights order high > medium > low, and so do half-lives", () => {
+  expect(STRENGTH_WEIGHTS.high).toBeGreaterThan(STRENGTH_WEIGHTS.medium);
+  expect(STRENGTH_WEIGHTS.medium).toBeGreaterThan(STRENGTH_WEIGHTS.low);
+  expect(HALF_LIFE_MS.high).toBeGreaterThan(HALF_LIFE_MS.medium);
+  expect(HALF_LIFE_MS.medium).toBeGreaterThan(HALF_LIFE_MS.low);
+});
+
+test("default strengths follow the spec", () => {
+  expect(DEFAULT_STRENGTH_BY_KIND).toMatchObject({
+    funding_announcement: "high",
+    executive_hired: "high",
+    major_expansion: "high",
+    relevant_hiring: "medium",
+    technology_detected: "medium",
+    website_activity: "low",
+  });
+});
+
+let raw: ReturnType<typeof convexTest>;
+let t: ReturnType<ReturnType<typeof convexTest>["withIdentity"]>;
+let accountId: Id<"accounts">;
+let otherOrgAccount: Id<"accounts">;
+let otherT: typeof t;
+
+beforeEach(async () => {
+  raw = convexTest(schema, modules);
+  const s = await raw.run(async (ctx) => {
+    const org = await ctx.db.insert("orgs", { name: "A", createdAt: 0 });
+    const other = await ctx.db.insert("orgs", { name: "B", createdAt: 0 });
+    return {
+      org,
+      other,
+      account: await ctx.db.insert("accounts", { orgId: org, fields: [], display: {} }),
+      otherAccount: await ctx.db.insert("accounts", { orgId: other, fields: [], display: {} }),
+    };
+  });
+  accountId = s.account;
+  otherOrgAccount = s.otherAccount;
+  t = raw.withIdentity({ subject: "u1", orgId: s.org });
+  otherT = raw.withIdentity({ subject: "u2", orgId: s.other });
+});
+
+const base = () => ({
+  subjectType: "account" as const,
+  subjectId: accountId as string,
+  kind: "funding_announcement",
+  strength: "high" as const,
+  confidence: 0.9,
+  observedAt: NOW - DAY,
+});
+
+test("appendSignal stores a signal and activeSignals returns it annotated with weight", async () => {
+  await t.run((ctx) => appendSignal(ctx, base()));
+  const out = await t.run((ctx) => activeSignals(ctx, { subjectType: "account", subjectId: accountId, now: NOW }));
+  expect(out).toHaveLength(1);
+  expect(out[0].weight).toBe(decayedWeight(out[0], NOW));
+  expect(out[0].kind).toBe("funding_announcement");
+});
+
+test("activeSignals drops expired signals and orders newest first", async () => {
+  await t.run(async (ctx) => {
+    await appendSignal(ctx, { ...base(), kind: "old", observedAt: NOW - 10 * DAY });
+    await appendSignal(ctx, { ...base(), kind: "gone", observedAt: NOW - 5 * DAY, expiresAt: NOW - DAY });
+    await appendSignal(ctx, { ...base(), kind: "new", observedAt: NOW - DAY });
+  });
+  const out = await t.run((ctx) => activeSignals(ctx, { subjectType: "account", subjectId: accountId, now: NOW }));
+  expect(out.map((s) => s.kind)).toEqual(["new", "old"]);
+});
+
+test("activeSignals never shows another org's signals", async () => {
+  await t.run((ctx) => appendSignal(ctx, base()));
+  const out = await otherT.run((ctx) => activeSignals(ctx, { subjectType: "account", subjectId: accountId, now: NOW }));
+  expect(out).toEqual([]);
+});
+
+test("appendSignal rejects bad confidence, bad times and foreign or missing subjects", async () => {
+  const bad: Array<Partial<ReturnType<typeof base>> & { expiresAt?: number }> = [
+    { confidence: NaN },
+    { confidence: 1.1 },
+    { confidence: -0.1 },
+    { confidence: Infinity },
+    { observedAt: NaN },
+    { observedAt: Infinity },
+    { expiresAt: NaN },
+    { expiresAt: Infinity },
+    { expiresAt: NOW - 2 * DAY },
+    { subjectId: otherOrgAccount as string },
+    { subjectId: "nonsense" },
+    { subjectType: "contact" as never },
+  ];
+  for (const over of bad) {
+    await expect(t.run((ctx) => appendSignal(ctx, { ...base(), ...over }))).rejects.toThrow();
+  }
+  expect(await raw.run((ctx) => ctx.db.query("signals").collect())).toEqual([]);
+});
+
+test("appendSignal without an org identity fails closed", async () => {
+  await expect(raw.run((ctx) => appendSignal(ctx, base()))).rejects.toThrow("no org context");
+});

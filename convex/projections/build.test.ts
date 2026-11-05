@@ -131,6 +131,22 @@ test("rebuild drops anything in the projection that no claim supports", async ()
   expect(account.display).toEqual({ domain: "x.com" });
 });
 
+test("source trust decides the projected winner, in both the incremental and rebuild paths", async () => {
+  const id = await newAccount();
+  // Same method. The low-trust claim is newer and more confident, so only trust can make the other win.
+  const trusted = await append(id, {
+    field: "name", value: "Trusted Inc", sourceId: sources[0], method: "observed", confidence: 0.5, observedAt: 100,
+  });
+  const weak = await append(id, {
+    field: "name", value: "Weak Inc", sourceId: sources[2], method: "observed", confidence: 1, observedAt: 900,
+  });
+  await apply(id, trusted);
+  await apply(id, weak);
+  expect((await getAccount(id)).fields[0]).toMatchObject({ value: "Trusted Inc", claimId: trusted });
+  await rebuild(id);
+  expect((await getAccount(id)).fields[0]).toMatchObject({ value: "Trusted Inc", claimId: trusted });
+});
+
 // ---- property tests -------------------------------------------------------
 
 /** Deterministic PRNG so a failure is reproducible. */

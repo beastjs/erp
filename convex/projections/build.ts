@@ -94,14 +94,14 @@ export async function applyClaimToProjection(
     !claim ||
     claim.orgId !== orgId ||
     claim.subjectType !== args.subjectType ||
-    claim.subjectId !== args.subjectId
+    claim.subjectId !== subject.id
   ) {
     throw new Error("claim not found for subject");
   }
   // Deliberately not caught: claimsForField throws past MAX_CLAIMS rather than truncate.
   const claims: Claim[] = await ctx.runQuery(api.claims.queries.claimsForField, {
     subjectType: args.subjectType,
-    subjectId: args.subjectId,
+    subjectId: subject.id,
     field: claim.field,
   });
   const resolved = resolveField(claims, await trustFor(ctx, orgId, claims));
@@ -116,11 +116,15 @@ export async function rebuildProjection(ctx: MutationCtx, args: SubjectArgs): Pr
   // Deliberately not caught: claimsForSubject throws past MAX_CLAIMS rather than truncate.
   const claims: Claim[] = await ctx.runQuery(api.claims.queries.claimsForSubject, {
     subjectType: args.subjectType,
-    subjectId: args.subjectId,
+    subjectId: subject.id,
   });
   const trust = await trustFor(ctx, orgId, claims);
   const byField = new Map<string, Claim[]>();
-  for (const c of claims) byField.set(c.field, [...(byField.get(c.field) ?? []), c]);
+  for (const c of claims) {
+    const group = byField.get(c.field);
+    if (group) group.push(c);
+    else byField.set(c.field, [c]);
+  }
   const fields: ProjectedField[] = [];
   for (const group of byField.values()) {
     const resolved = resolveField(group, trust);

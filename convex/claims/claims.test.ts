@@ -13,8 +13,9 @@ let raw: ReturnType<typeof convexTest>;
 let sourceId: Id<"sources">;
 let otherOrgId: Id<"orgs">;
 let orgId: Id<"orgs">;
+let contactId: Id<"contacts">;
 
-const subject = { subjectType: "account" as const, subjectId: "acct-1" };
+let subject: { subjectType: "account"; subjectId: string };
 
 beforeEach(async () => {
   raw = convexTest(schema, modules);
@@ -22,11 +23,15 @@ beforeEach(async () => {
     const orgId = await ctx.db.insert("orgs", { name: "Org 1", createdAt: 0 });
     const other = await ctx.db.insert("orgs", { name: "Org 2", createdAt: 0 });
     const source = await ctx.db.insert("sources", { orgId, key: "web", trustWeight: 1 });
-    return { orgId, other, source };
+    const account = await ctx.db.insert("accounts", { orgId, fields: [], display: {} });
+    const contact = await ctx.db.insert("contacts", { orgId, fields: [], display: {} });
+    return { orgId, other, source, account, contact };
   });
   sourceId = seeded.source;
   otherOrgId = seeded.other;
   orgId = seeded.orgId;
+  contactId = seeded.contact;
+  subject = { subjectType: "account", subjectId: seeded.account };
   t = raw.withIdentity({ subject: "u1", orgId: seeded.orgId });
 });
 
@@ -135,4 +140,13 @@ test("reads throw instead of truncating when a subject exceeds MAX_CLAIMS", asyn
   await expect(
     t.query(api.claims.queries.claimsForField, { ...subject, field: "domain" }),
   ).rejects.toThrow(limit);
+});
+
+test("appendClaim rejects a subject id that is not valid for the declared subjectType", async () => {
+  const append = (over: object) =>
+    t.mutation(api.claims.mutations.appendClaim, { ...observedDomainClaim(), ...over });
+  await expect(append({ subjectId: "acct-1" })).rejects.toThrow("invalid subject id");
+  // A contact id presented as an account, and an account id presented as a contact.
+  await expect(append({ subjectId: contactId })).rejects.toThrow("invalid subject id");
+  await expect(append({ subjectType: "contact" })).rejects.toThrow("invalid subject id");
 });

@@ -28,6 +28,10 @@ export const appendClaim = mutation({
     if (!(args.confidence >= 0 && args.confidence <= 1)) {
       throw new Error("confidence must be between 0 and 1");
     }
+    // subjectId is stored as a string, so canonicalize it here: a claim stored under any other
+    // spelling would be invisible to its own subject's index reads and silently dropped.
+    const subjectId = ctx.db.normalizeId(args.subjectType === "account" ? "accounts" : "contacts", args.subjectId);
+    if (!subjectId) throw new Error("invalid subject id");
     const source = await ctx.db.get(args.sourceId);
     if (!source || source.orgId !== orgId) throw new Error("source not found");
     if (args.runId) {
@@ -36,6 +40,7 @@ export const appendClaim = mutation({
     }
     return await ctx.db.insert("claims", {
       ...args,
+      subjectId,
       orgId,
       confidence: Math.min(args.confidence, METHOD_CEILINGS[args.method]),
     });

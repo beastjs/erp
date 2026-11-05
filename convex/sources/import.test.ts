@@ -1,6 +1,6 @@
 /// <reference types="vite/client" />
 import { convexTest } from "convex-test";
-import { beforeEach, expect, test } from "vitest";
+import { beforeEach, expect, test, vi } from "vitest";
 import { api } from "../_generated/api";
 import type { Id } from "../_generated/dataModel";
 import schema from "../schema";
@@ -46,7 +46,7 @@ const jane = () => ({
   Title: "CTO",
 });
 
-const all = <T extends "claims" | "accounts" | "contacts" | "candidates">(table: T) =>
+const all = <T extends "claims" | "accounts" | "contacts" | "candidates" | "importChunks">(table: T) =>
   raw.run((ctx) => ctx.db.query(table).collect());
 const getRun = () => t.query(api.runs.queries.getRun, { runId });
 
@@ -312,34 +312,114 @@ test("ingestCandidates refuses another org's candidate and an oversized batch", 
   await expect(t.mutation(api.sources.ingest.ingestCandidates, { candidateIds: ids })).rejects.toThrow("batch_too_large");
 });
 
+// ---------------------------------------------- contact resolution within an account
+
+const PEOPLE = { "Company Site": "company.domain", Name: "person.fullName", Profile: "person.profileUrl", Phone: "person.phone", Email: "person.email" };
+const peopleRow = (o: Record<string, string>) => ({ "Company Site": "acme.com", Name: "", Profile: "", Phone: "", Email: "", ...o });
+const ingestPeople = async (rows: Array<Record<string, string>>) => {
+  const mid = await t.mutation(api.sources.import.saveMapping, { name: `people-${Math.random()}`, columns: PEOPLE });
+  const imported = await t.mutation(api.sources.import.importRows, { runId, mappingId: mid, rows });
+  await t.mutation(api.sources.ingest.ingestCandidates, { candidateIds: imported.candidateIds });
+};
+
+test("re-observing a contact known only by profileUrl reuses it (spelling variants included)", async () => {
+  await ingestPeople([peopleRow({ Profile: "https://www.linkedin.com/in/jane-doe/" })]);
+  await ingestPeople([peopleRow({ Profile: "http://LinkedIn.com/in/Jane-Doe?utm=x" })]);
+  expect(await all("contacts")).toHaveLength(1);
+});
+
+test("re-observing a contact known only by phone reuses it", async () => {
+  await ingestPeople([peopleRow({ Phone: "+1 (555) 010-2030" })]);
+  await ingestPeople([peopleRow({ Phone: "1.555.010.2030" })]);
+  expect(await all("contacts")).toHaveLength(1);
+});
+
+test("a contact known only by name is reused within the same account, but not across accounts", async () => {
+  await ingestPeople([peopleRow({ Name: "Jane Doe" })]);
+  await ingestPeople([peopleRow({ Name: "  JANE  doe " })]);
+  expect(await all("contacts")).toHaveLength(1);
+  await ingestPeople([peopleRow({ Name: "Jane Doe", "Company Site": "globex.com" })]);
+  expect(await all("contacts")).toHaveLength(2);
+});
+
+test("the strongest key wins: a later sighting that adds an email attaches to the contact found by profile", async () => {
+  await ingestPeople([peopleRow({ Profile: "linkedin.com/in/jane" })]);
+  await ingestPeople([peopleRow({ Profile: "linkedin.com/in/jane", Email: "jane@acme.com" })]);
+  expect(await all("contacts")).toHaveLength(1);
+  // ...and now the email alone finds her, from anywhere.
+  await ingestPeople([peopleRow({ Email: "JANE@acme.com", "Company Site": "other.com" })]);
+  expect(await all("contacts")).toHaveLength(1);
+});
+
 // ----------------------------------------------------------------- importCsv
 
 const store = (text: string) => raw.run((ctx) => ctx.storage.store(new Blob([text])));
 const csvOf = (n: number) =>
   ["Company Site,Company,Email,Name,Title", ...Array.from({ length: n }, (_, i) => `co${i}.com,Co ${i},p${i}@co${i}.com,Person ${i},Eng`)].join("\n");
+// Scheduled continuations are the point of these tests, so time is faked and drained explicitly.
+const drain = () => raw.finishAllScheduledFunctions(vi.runAllTimers);
+const withFakeTimers = async (fn: () => Promise<void>) => {
+  vi.useFakeTimers();
+  try {
+    await fn();
+  } finally {
+    vi.useRealTimers();
+  }
+};
 
-test("importCsv is chunked: a large file reports progress per chunk", async () => {
-  const out = await t.action(api.sources.import.importCsv, { runId, mappingId, storageId: await store(csvOf(1001)) });
-  expect(out.chunks).toEqual([
-    { offset: 0, processed: 500, inserted: 500 },
-    { offset: 500, processed: 500, inserted: 500 },
-    { offset: 1000, processed: 1, inserted: 1 },
-  ]);
-  expect(out).toMatchObject({ inserted: 1001, duplicates: 0, rejectedCount: 0, consumed: 1001 });
-  expect(await getRun()).toMatchObject({ status: "completed", rowsProcessed: 1001, candidatesInserted: 1001, candidatesConsumed: 1001 });
-  expect((await getRun()).finishedAt).toBeDefined();
-}, 120_000);
+test("importCsv stages the file; self-scheduled chunks (no auth identity) import it and report progress per chunk", () =>
+  withFakeTimers(async () => {
+    const out = await t.action(api.sources.import.importCsv, { runId, mappingId, storageId: await store(csvOf(1001)) });
+    expect(out).toEqual({ rows: 1001, chunks: 3 });
+    expect((await getRun()).rowsExpected).toBe(1001);
+    expect(await all("importChunks")).toHaveLength(3);
+    expect(await all("candidates")).toHaveLength(0); // nothing is inserted by the action itself
 
-test("importCsv collects rejected rows across chunks, numbered against the file", async () => {
-  const lines = csvOf(3).split("\n");
-  lines.splice(2, 0, ",,not-an-email,Bad,Eng"); // data row 1
-  const out = await t.action(api.sources.import.importCsv, { runId, mappingId, storageId: await store(lines.join("\n")) });
-  expect(out.inserted).toBe(3);
-  expect(out.rejectedCount).toBe(1);
-  expect(out.rejected.map((r) => r.row)).toEqual([1]);
-});
+    // Walk the chain one scheduled step at a time and record the run's progress counter.
+    const seen = new Set<number>();
+    for (let i = 0; i < 200 && (await getRun()).status === "running"; i++) {
+      vi.runOnlyPendingTimers();
+      await raw.finishInProgressScheduledFunctions();
+      seen.add((await getRun()).rowsProcessed);
+    }
+    expect([...seen]).toEqual(expect.arrayContaining([500, 1000, 1001]));
+    const run = await getRun();
+    expect(run).toMatchObject({ status: "completed", rowsProcessed: 1001, candidatesInserted: 1001, candidatesConsumed: 1001, candidatesRejected: 0 });
+    expect(run.finishedAt).toBeDefined();
+    expect(await all("importChunks")).toHaveLength(0); // staged chunks are removed as they are processed
+  }), 120_000);
 
-test("importCsv fails with a named error before inserting anything", async () => {
+test("importCsv keeps rejected rows, numbered against the file, for after the run", () =>
+  withFakeTimers(async () => {
+    const lines = csvOf(3).split("\n");
+    lines.splice(2, 0, ",,not-an-email,Bad,Eng"); // data row 1
+    await t.action(api.sources.import.importCsv, { runId, mappingId, storageId: await store(lines.join("\n")) });
+    await drain();
+    expect(await getRun()).toMatchObject({ status: "completed", candidatesInserted: 3, rowsRejected: 1 });
+    const rejections = await t.query(api.runs.queries.rejectionsForRun, { runId });
+    expect(rejections.map((r) => r.row)).toEqual([1]);
+    expect(rejections[0]!.errors.join(" ")).toContain("email");
+  }));
+
+test("a stalled import resumes from the first unprocessed chunk", () =>
+  withFakeTimers(async () => {
+    await t.action(api.sources.import.importCsv, { runId, mappingId, storageId: await store(csvOf(1001)) });
+    // Process exactly the first chunk, then "lose" the rest of the chain.
+    vi.runOnlyPendingTimers();
+    await raw.finishInProgressScheduledFunctions();
+    await raw.run(async (ctx) => {
+      for (const s of await ctx.db.system.query("_scheduled_functions").collect()) {
+        if (s.state.kind === "pending") await ctx.scheduler.cancel(s._id);
+      }
+    });
+    expect((await getRun()).rowsProcessed).toBe(500);
+    expect((await getRun()).status).toBe("running");
+    await t.mutation(api.sources.import.resumeImport, { runId });
+    await drain();
+    expect(await getRun()).toMatchObject({ status: "completed", rowsProcessed: 1001, candidatesInserted: 1001 });
+  }), 120_000);
+
+test("importCsv fails with a named error before staging or inserting anything", async () => {
   const cases: Array<[string, string]> = [
     ["", "empty_file"],
     ["Company Site,Email,Email\na.com,a@a.com,b@a.com", "duplicate_headers: Email"],
@@ -349,13 +429,19 @@ test("importCsv fails with a named error before inserting anything", async () =>
     await expect(t.action(api.sources.import.importCsv, { runId, mappingId, storageId: await store(text) })).rejects.toThrow(message);
   }
   expect(await all("candidates")).toHaveLength(0);
+  expect(await all("importChunks")).toHaveLength(0);
   expect((await getRun()).status).toBe("running");
 });
 
 test("importCsv on a header-only file completes the run with zero rows", async () => {
   const out = await t.action(api.sources.import.importCsv, { runId, mappingId, storageId: await store("Company Site,Company,Email,Name,Title\n") });
-  expect(out).toMatchObject({ inserted: 0, chunks: [], consumed: 0 });
+  expect(out).toEqual({ rows: 0, chunks: 0 });
   expect((await getRun()).status).toBe("completed");
+});
+
+test("importCsv refuses a second import into a run that already has one", async () => {
+  await t.action(api.sources.import.importCsv, { runId, mappingId, storageId: await store(csvOf(1)) });
+  await expect(t.action(api.sources.import.importCsv, { runId, mappingId, storageId: await store(csvOf(1)) })).rejects.toThrow("import_already_started");
 });
 
 // ------------------------------------------------------------ addManualLead

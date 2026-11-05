@@ -1,7 +1,7 @@
 import type { Id } from "../_generated/dataModel";
 import type { MutationCtx } from "../_generated/server";
 import { withOrg } from "../_shared/org";
-import { api } from "../_generated/api";
+import { loadClaimsForField, loadClaimsForSubject } from "../claims/queries";
 import type { Claim, SubjectType } from "../claims/schema";
 import { resolveField, type SourceTrust } from "./resolve";
 import type { ProjectedField } from "./schema";
@@ -99,7 +99,7 @@ export async function applyClaimToProjection(
     throw new Error("claim not found for subject");
   }
   // Deliberately not caught: claimsForField throws past MAX_CLAIMS rather than truncate.
-  const claims: Claim[] = await ctx.runQuery(api.claims.queries.claimsForField, {
+  const claims: Claim[] = await loadClaimsForField(ctx, orgId, {
     subjectType: args.subjectType,
     subjectId: subject.id,
     field: claim.field,
@@ -114,7 +114,7 @@ export async function rebuildProjection(ctx: MutationCtx, args: SubjectArgs): Pr
   const { orgId } = await withOrg(ctx, args);
   const subject = await loadSubject(ctx, orgId, args);
   // Deliberately not caught: claimsForSubject throws past MAX_CLAIMS rather than truncate.
-  const claims: Claim[] = await ctx.runQuery(api.claims.queries.claimsForSubject, {
+  const claims: Claim[] = await loadClaimsForSubject(ctx, orgId, {
     subjectType: args.subjectType,
     subjectId: subject.id,
   });

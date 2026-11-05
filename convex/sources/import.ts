@@ -1,9 +1,11 @@
 import { v } from "convex/values";
 import { api } from "../_generated/api";
 import type { Id } from "../_generated/dataModel";
-import { action, mutation, query } from "../_generated/server";
-import { withOrg } from "../_shared/org";
-import { bumpRun, loadRun } from "../runs/mutations";
+import { internal } from "../_generated/api";
+import type { Doc } from "../_generated/dataModel";
+import { action, internalMutation, mutation, query, type MutationCtx } from "../_generated/server";
+import { asOrg, withOrg } from "../_shared/org";
+import { bumpRun, loadRun, settleRun } from "../runs/mutations";
 import { checkContractVersion, validateCandidate } from "./contract";
 import { parseCsv } from "./csv";
 import { INGEST_BATCH, ingestCandidate } from "./ingest";
@@ -13,12 +15,9 @@ import { insertCandidate } from "./mutations";
 /**
  * Rows per mutation. A mutation may write 16k documents and read 32k; an inserted candidate costs a
  * handful, so 500 leaves headroom for the dedupe lookups and the run counter. Larger inputs are driven
- * chunk by chunk by `importCsv` (an action), because actions can loop and mutations cannot.
+ * link by link by the import chain driven from `importCsv`.
  */
 export const CHUNK_SIZE = 500;
-/** Rejected rows `importCsv` hands back; the true count is always returned alongside. */
-const REJECTED_SAMPLE = 1000;
-
 type RowError = { row: number; errors: string[] };
 
 export const saveMapping = mutation({
@@ -59,6 +58,56 @@ export const getMapping = query({
  * passes `candidateIds` to `ingestCandidates` in batches. `rowOffset` is the index of rows[0] in the
  * original file, so rejected row numbers point at the source.
  */
+/** Maps and inserts one chunk of rows as pending candidates. Shared by the public mutation and the scheduled chain. */
+async function importChunk(
+  ctx: MutationCtx,
+  orgId: Id<"orgs">,
+  run: Doc<"discoveryRuns">,
+  mapping: Doc<"columnMappings">,
+  rows: Array<Record<string, string>>,
+  offset: number,
+) {
+  if (rows.length > CHUNK_SIZE) {
+    throw new Error(`chunk_too_large: at most ${CHUNK_SIZE} rows per call (got ${rows.length}); use importCsv or send chunks`);
+  }
+  // Re-checked here: saveMapping is not the only way a row reaches the table.
+  const mappingErrors = validateMapping(mapping.columns);
+  if (mappingErrors.length > 0) throw new Error(`invalid mapping: ${mappingErrors.join("; ")}`);
+  const missing = missingColumns(rows, mapping.columns);
+  if (missing.length > 0) throw new Error(`missing_columns: ${missing.join(", ")}`);
+
+  const rejected: RowError[] = [];
+  const candidateIds: Id<"candidates">[] = [];
+  let duplicates = 0;
+  for (const [i, row] of rows.entries()) {
+    const mapped = rowToCandidate(row, mapping.columns, run.startedAt);
+    if (!mapped.ok) {
+      rejected.push({ row: offset + i, errors: mapped.errors });
+      continue;
+    }
+    const id = await insertCandidate(ctx, { candidate: mapped.candidate, sourceId: run.sourceId, runId: run._id });
+    if (id) candidateIds.push(id);
+    else duplicates++;
+  }
+  await bumpRun(ctx, run, {
+    rowsProcessed: rows.length,
+    candidatesInserted: candidateIds.length,
+    duplicates,
+    rowsRejected: rejected.length,
+  });
+  return { inserted: candidateIds.length, duplicates, rejected, candidateIds };
+}
+
+/**
+ * Maps and inserts ONE chunk (at most CHUNK_SIZE rows) as pending candidates. A malformed row is data,
+ * not an exception: it lands in `rejected` and the rest of the chunk goes ahead. What does throw is a
+ * problem with the whole input (bad mapping, a mapped column absent from every row, a finished run),
+ * and it throws before anything is written.
+ *
+ * Candidates are inserted, not ingested: ingest writes ~30 documents per candidate, so the caller
+ * passes `candidateIds` to `ingestCandidates` in batches. `rowOffset` is the index of rows[0] in the
+ * original file, so rejected row numbers point at the source. Whole files go through `importCsv`.
+ */
 export const importRows = mutation({
   args: {
     runId: v.id("discoveryRuns"),
@@ -74,61 +123,122 @@ export const importRows = mutation({
     const run = await loadRun(ctx, orgId, args.runId, { active: true });
     const mapping = await ctx.db.get(args.mappingId);
     if (!mapping || mapping.orgId !== orgId) throw new Error("mapping not found");
-    // Re-checked here: saveMapping is not the only way a row reaches the table.
-    const mappingErrors = validateMapping(mapping.columns);
-    if (mappingErrors.length > 0) throw new Error(`invalid mapping: ${mappingErrors.join("; ")}`);
-    const missing = missingColumns(args.rows, mapping.columns);
-    if (missing.length > 0) throw new Error(`missing_columns: ${missing.join(", ")}`);
-
-    const offset = args.rowOffset ?? 0;
-    const rejected: RowError[] = [];
-    const candidateIds: Id<"candidates">[] = [];
-    let duplicates = 0;
-    for (const [i, row] of args.rows.entries()) {
-      const mapped = rowToCandidate(row, mapping.columns, run.startedAt);
-      if (!mapped.ok) {
-        rejected.push({ row: offset + i, errors: mapped.errors });
-        continue;
-      }
-      const id = await insertCandidate(ctx, { candidate: mapped.candidate, sourceId: run.sourceId, runId: run._id });
-      if (id) candidateIds.push(id);
-      else duplicates++;
-    }
-    await bumpRun(ctx, run, {
-      rowsProcessed: args.rows.length,
-      candidatesInserted: candidateIds.length,
-      duplicates,
-      rowsRejected: rejected.length,
-    });
-    return { inserted: candidateIds.length, duplicates, rejected, candidateIds };
+    return await importChunk(ctx, orgId, run, mapping, args.rows, args.rowOffset ?? 0);
   },
 });
 
-export type ImportCsvResult = {
-  /** One entry per chunk, in order: progress a caller (or a log) can follow. */
-  chunks: Array<{ offset: number; processed: number; inserted: number }>;
-  inserted: number;
-  duplicates: number;
-  rejectedCount: number;
-  /** The first REJECTED_SAMPLE rejected rows; `rejectedCount` is the true total. */
-  rejected: RowError[];
-  consumed: number;
-};
+// ------------------------------------------------------------ self-scheduling import chain
+//
+// importCsv (an action: file IO and parsing) stages the parsed file as chunk rows and starts the chain.
+// Each link is an internalMutation that imports one chunk, schedules its ingest batches and the next
+// link, and finishes. The org is derived ONCE, from the caller's identity, in the public entry point
+// and travels down as an explicit argument, because scheduled functions run with no identity. Every
+// link is its own transaction, so a 100k-row file has no single-action ceiling, and the chain's state
+// (staged chunks left, run counters) is stored, so a stalled chain resumes with `resumeImport`.
+
+/** Stages one parsed slice. Cells are aligned with `columns` (the mapped headers only). */
+export const stageImportChunk = mutation({
+  args: {
+    runId: v.id("discoveryRuns"),
+    mappingId: v.id("columnMappings"),
+    seq: v.number(),
+    columns: v.array(v.string()),
+    rows: v.array(v.array(v.string())),
+  },
+  handler: async (ctx, args) => {
+    const { orgId } = await withOrg(ctx, args);
+    if (args.rows.length > CHUNK_SIZE) throw new Error(`chunk_too_large: at most ${CHUNK_SIZE} rows per staged chunk`);
+    const run = await loadRun(ctx, orgId, args.runId, { active: true });
+    if (run.rowsExpected !== undefined) throw new Error("import_already_started: this run already has an import");
+    const mapping = await ctx.db.get(args.mappingId);
+    if (!mapping || mapping.orgId !== orgId) throw new Error("mapping not found");
+    // Idempotent for an action retried after a partial stage: the same slice replaces itself.
+    const stale = await ctx.db.query("importChunks").withIndex("by_run_and_seq", (q) => q.eq("runId", run._id).eq("seq", args.seq)).first();
+    if (stale) await ctx.db.delete(stale._id);
+    await ctx.db.insert("importChunks", { orgId, ...args });
+    return null;
+  },
+});
+
+/** Declares the staged total and starts the chain. A zero-row file completes immediately. */
+export const startStagedImport = mutation({
+  args: { runId: v.id("discoveryRuns"), totalRows: v.number() },
+  handler: async (ctx, args) => {
+    const { orgId } = await withOrg(ctx, args);
+    const run = await loadRun(ctx, orgId, args.runId, { active: true });
+    if (run.rowsExpected !== undefined) throw new Error("import_already_started: this run already has an import");
+    await ctx.db.patch(run._id, { rowsExpected: args.totalRows });
+    if (args.totalRows === 0) await settleRun(ctx, run._id);
+    else await ctx.scheduler.runAfter(0, internal.sources.import.processStagedChunk, { orgId, runId: run._id, seq: 0 });
+    return null;
+  },
+});
+
+/** Re-arms a stalled chain: ingest for candidates still pending, and the first chunk still staged. Safe to call on a healthy chain: a chunk is imported at most once. */
+export const resumeImport = mutation({
+  args: { runId: v.id("discoveryRuns") },
+  handler: async (ctx, args) => {
+    const { orgId } = await withOrg(ctx, args);
+    const run = await loadRun(ctx, orgId, args.runId, { active: true });
+    // Ingest batches can be lost too, so re-arm candidates still pending (a bounded slice per call;
+    // call again for more). Ingest skips anything already consumed, so over-arming is harmless.
+    const pending = await ctx.db
+      .query("candidates")
+      .withIndex("by_org_and_run_and_status", (q) => q.eq("orgId", orgId).eq("runId", run._id).eq("status", "pending"))
+      .take(CHUNK_SIZE);
+    for (let i = 0; i < pending.length; i += INGEST_BATCH) {
+      await ctx.scheduler.runAfter(0, internal.sources.ingest.ingestStep, {
+        orgId,
+        candidateIds: pending.slice(i, i + INGEST_BATCH).map((c) => c._id),
+      });
+    }
+    const next = await ctx.db.query("importChunks").withIndex("by_run_and_seq", (q) => q.eq("runId", run._id)).first();
+    if (next) await ctx.scheduler.runAfter(0, internal.sources.import.processStagedChunk, { orgId, runId: run._id, seq: next.seq });
+    return { resumedAt: next?.seq ?? null, rearmedCandidates: pending.length };
+  },
+});
+
+/** One link of the chain. Imports chunk `seq`, deletes it, and schedules its ingest batches and the next link. */
+export const processStagedChunk = internalMutation({
+  args: { orgId: v.id("orgs"), runId: v.id("discoveryRuns"), seq: v.number() },
+  handler: async (rawCtx, args): Promise<null> => {
+    const ctx = asOrg(rawCtx, args.orgId);
+    const run = await ctx.db.get(args.runId);
+    if (!run || run.orgId !== args.orgId || run.status !== "running") return null;
+    const chunk = await ctx.db.query("importChunks").withIndex("by_run_and_seq", (q) => q.eq("runId", args.runId).eq("seq", args.seq)).first();
+    const mapping = chunk && (await ctx.db.get(chunk.mappingId));
+    if (chunk && mapping) {
+      const rows = chunk.rows.map((cells) => Object.fromEntries(chunk.columns.map((c, i) => [c, cells[i] ?? ""])));
+      const res = await importChunk(ctx, args.orgId, run, mapping, rows, args.seq * CHUNK_SIZE);
+      for (const r of res.rejected) await ctx.db.insert("importRejections", { orgId: args.orgId, runId: args.runId, ...r });
+      await ctx.db.delete(chunk._id);
+      for (let i = 0; i < res.candidateIds.length; i += INGEST_BATCH) {
+        await ctx.scheduler.runAfter(0, internal.sources.ingest.ingestStep, {
+          orgId: args.orgId,
+          candidateIds: res.candidateIds.slice(i, i + INGEST_BATCH),
+        });
+      }
+    }
+    if ((args.seq + 1) * CHUNK_SIZE < (run.rowsExpected ?? 0)) {
+      await ctx.scheduler.runAfter(0, internal.sources.import.processStagedChunk, { orgId: args.orgId, runId: args.runId, seq: args.seq + 1 });
+    }
+    return null;
+  },
+});
 
 /**
- * Reads an uploaded CSV from storage and drives the import: parse (IO, so an action), then for each
- * chunk of CHUNK_SIZE rows an `importRows` mutation followed by `ingestCandidates` batches. It is a
- * loop in an action rather than self-scheduling mutations because scheduled functions run without the
- * caller's auth identity, and every org-scoped write here derives its org from that identity.
+ * Reads an uploaded CSV from storage, validates it against the mapping, stages it as chunks and starts
+ * the self-scheduling chain (see above). It returns as soon as the file is staged; the import itself
+ * proceeds in the background and is observable on the run (`rowsProcessed` of `rowsExpected`, then
+ * `status: "completed"`). Rejected rows are kept in `importRejections` (`rejectionsForRun`).
  *
- * The whole file's headers are checked against the mapping BEFORE the first row is written, so a
- * wrong file fails with a named error instead of leaving a half-imported dataset. Progress is also
- * visible live on the run (`rowsProcessed`, ...), and the run is finished at the end. If the action
- * dies mid-way the run stays `running` with its counters showing exactly how far it got.
+ * The whole file's headers are checked against the mapping BEFORE anything is staged, so a wrong file
+ * fails with a named error instead of leaving a half-imported dataset. Only mapped columns are staged:
+ * smaller documents, and unmapped headers (blank, or starting with "_") never meet a validator.
  */
 export const importCsv = action({
   args: { runId: v.id("discoveryRuns"), mappingId: v.id("columnMappings"), storageId: v.id("_storage") },
-  handler: async (ctx, args): Promise<ImportCsvResult> => {
+  handler: async (ctx, args): Promise<{ rows: number; chunks: number }> => {
     const blob = await ctx.storage.get(args.storageId);
     if (!blob) throw new Error("file_not_found: nothing is stored under that id");
     const { headers, rows } = parseCsv(await blob.text());
@@ -138,38 +248,20 @@ export const importCsv = action({
     const absent = mapping.columns.filter((c) => !headers.includes(c.column)).map((c) => c.column);
     if (absent.length > 0) throw new Error(`missing_columns: ${absent.join(", ")}`);
 
-    // Only mapped columns travel to the mutation: smaller payloads, and unmapped headers (which may
-    // be blank or start with "_", neither of which a record key allows) never reach a validator.
-    const index = new Map(mapping.columns.map((c) => [c.column, headers.indexOf(c.column)]));
-    const toRecord = (cells: string[]) => {
-      const rec: Record<string, string> = {};
-      for (const [column, i] of index) rec[column] = cells[i] ?? "";
-      return rec;
-    };
-
-    const out: ImportCsvResult = { chunks: [], inserted: 0, duplicates: 0, rejectedCount: 0, rejected: [], consumed: 0 };
+    const columns = mapping.columns.map((c) => c.column);
+    const at = columns.map((c) => headers.indexOf(c));
+    let chunks = 0;
     for (let offset = 0; offset < rows.length; offset += CHUNK_SIZE) {
-      const slice = rows.slice(offset, offset + CHUNK_SIZE).map(toRecord);
-      const res = await ctx.runMutation(api.sources.import.importRows, {
+      await ctx.runMutation(api.sources.import.stageImportChunk, {
         runId: args.runId,
         mappingId: args.mappingId,
-        rows: slice,
-        rowOffset: offset,
+        seq: chunks++,
+        columns,
+        rows: rows.slice(offset, offset + CHUNK_SIZE).map((cells) => at.map((i) => cells[i] ?? "")),
       });
-      for (let i = 0; i < res.candidateIds.length; i += INGEST_BATCH) {
-        const ingested = await ctx.runMutation(api.sources.ingest.ingestCandidates, {
-          candidateIds: res.candidateIds.slice(i, i + INGEST_BATCH),
-        });
-        out.consumed += ingested.consumed;
-      }
-      out.chunks.push({ offset, processed: slice.length, inserted: res.inserted });
-      out.inserted += res.inserted;
-      out.duplicates += res.duplicates;
-      out.rejectedCount += res.rejected.length;
-      for (const r of res.rejected) if (out.rejected.length < REJECTED_SAMPLE) out.rejected.push(r);
     }
-    await ctx.runMutation(api.runs.mutations.finishRun, { runId: args.runId });
-    return out;
+    await ctx.runMutation(api.sources.import.startStagedImport, { runId: args.runId, totalRows: rows.length });
+    return { rows: rows.length, chunks };
   },
 });
 

@@ -1,7 +1,8 @@
 import { v } from "convex/values";
-import { query } from "../_generated/server";
+import type { Id } from "../_generated/dataModel";
+import { query, type QueryCtx } from "../_generated/server";
 import { withOrg } from "../_shared/org";
-import { subjectType } from "./schema";
+import { subjectType, type SubjectType } from "./schema";
 
 /**
  * Most claims a single subject (or subject+field) may hold for a read. Exceeding
@@ -17,17 +18,34 @@ function withinLimit<T>(rows: T[], what: string): T[] {
   return rows;
 }
 
+/** Plain helpers so projection rebuilds read claims in-transaction, without a nested query (which would lose the auth identity in internal contexts). */
+export async function loadClaimsForSubject(ctx: QueryCtx, orgId: Id<"orgs">, a: { subjectType: SubjectType; subjectId: string }) {
+  const rows = await ctx.db
+    .query("claims")
+    .withIndex("by_subject", (q) => q.eq("orgId", orgId).eq("subjectType", a.subjectType).eq("subjectId", a.subjectId))
+    .take(MAX_CLAIMS + 1);
+  return withinLimit(rows, `subject ${a.subjectType}:${a.subjectId}`);
+}
+
+export async function loadClaimsForField(
+  ctx: QueryCtx,
+  orgId: Id<"orgs">,
+  a: { subjectType: SubjectType; subjectId: string; field: string },
+) {
+  const rows = await ctx.db
+    .query("claims")
+    .withIndex("by_subject_field", (q) =>
+      q.eq("orgId", orgId).eq("subjectType", a.subjectType).eq("subjectId", a.subjectId).eq("field", a.field),
+    )
+    .take(MAX_CLAIMS + 1);
+  return withinLimit(rows, `subject ${a.subjectType}:${a.subjectId} field ${a.field}`);
+}
+
 export const claimsForSubject = query({
   args: { subjectType, subjectId: v.string() },
   handler: async (ctx, args) => {
     const { orgId } = await withOrg(ctx, args);
-    const rows = await ctx.db
-      .query("claims")
-      .withIndex("by_subject", (q) =>
-        q.eq("orgId", orgId).eq("subjectType", args.subjectType).eq("subjectId", args.subjectId),
-      )
-      .take(MAX_CLAIMS + 1);
-    return withinLimit(rows, `subject ${args.subjectType}:${args.subjectId}`);
+    return await loadClaimsForSubject(ctx, orgId, args);
   },
 });
 
@@ -35,16 +53,6 @@ export const claimsForField = query({
   args: { subjectType, subjectId: v.string(), field: v.string() },
   handler: async (ctx, args) => {
     const { orgId } = await withOrg(ctx, args);
-    const rows = await ctx.db
-      .query("claims")
-      .withIndex("by_subject_field", (q) =>
-        q
-          .eq("orgId", orgId)
-          .eq("subjectType", args.subjectType)
-          .eq("subjectId", args.subjectId)
-          .eq("field", args.field),
-      )
-      .take(MAX_CLAIMS + 1);
-    return withinLimit(rows, `subject ${args.subjectType}:${args.subjectId} field ${args.field}`);
+    return await loadClaimsForField(ctx, orgId, args);
   },
 });

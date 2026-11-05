@@ -50,7 +50,7 @@ export const candidates = defineTable({
   candidate: v.any(), // validated by validateCandidate at the write boundary
 })
   .index("by_org_and_dedupe_hash_and_status", ["orgId", "dedupeHash", "status"])
-  .index("by_org_and_run", ["orgId", "runId"]);
+  .index("by_org_and_run_and_status", ["orgId", "runId", "status"]);
 
 /**
  * Header -> target field, saved per org. Stored as pairs, not a record: spreadsheet headers are
@@ -61,3 +61,25 @@ export const columnMappings = defineTable({
   name: v.string(),
   columns: v.array(v.object({ column: v.string(), target: v.string() })),
 }).index("by_org_and_name", ["orgId", "name"]);
+
+/**
+ * A parsed CSV slice waiting for its turn in the self-scheduling import chain. Cells are positional
+ * (aligned with `columns`) because headers are free-form and cannot all be record keys. Deleted in
+ * the same transaction that imports it, so what remains for a run is exactly what is still to do.
+ */
+export const importChunks = defineTable({
+  orgId: v.id("orgs"),
+  runId: v.id("discoveryRuns"),
+  mappingId: v.id("columnMappings"),
+  seq: v.number(),
+  columns: v.array(v.string()),
+  rows: v.array(v.array(v.string())),
+}).index("by_run_and_seq", ["runId", "seq"]);
+
+/** Rows a chunked import turned away, kept because the chain has no caller to return them to. */
+export const importRejections = defineTable({
+  orgId: v.id("orgs"),
+  runId: v.id("discoveryRuns"),
+  row: v.number(),
+  errors: v.array(v.string()),
+}).index("by_run", ["runId", "row"]);

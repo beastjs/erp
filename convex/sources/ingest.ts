@@ -6,6 +6,7 @@ import {
   emailDomain,
   normalizeDomain,
   normalizeEmail,
+  normalizePersonName,
   normalizePhone,
   normalizeProfileUrl,
 } from "../_shared/normalize";
@@ -14,7 +15,7 @@ import type { SubjectType } from "../claims/schema";
 import { rebuildProjection } from "../projections/build";
 import { matchCandidate } from "../projections/identity";
 import { bumpRun, type RunCounter } from "../runs/mutations";
-import { withOrg } from "../_shared/org";
+import { asOrg, withOrg } from "../_shared/org";
 import { checkContractVersion, validateCandidate, type NormalizedCandidate } from "./contract";
 
 /** Per-mutation cap: each candidate costs ~30 document writes, and a mutation may write 16k. */
@@ -50,6 +51,9 @@ export function planClaims(c: NormalizedCandidate) {
   const contact: Pair[] = [];
   const p = c.person;
   let email: string | null = null;
+  let profile: string | null = null;
+  let phone: string | null = null;
+  let personName: string | null = null;
   if (p) {
     email = p.email ? normalizeEmail(p.email) : null;
     const name = clean(p.fullName) ?? clean([p.firstName, p.lastName].filter(Boolean).join(" "));
@@ -60,10 +64,11 @@ export function planClaims(c: NormalizedCandidate) {
     if (clean(p.department)) contact.push(["department", clean(p.department)]);
     if (clean(p.seniority)) contact.push(["seniority", clean(p.seniority)]);
     if (email) contact.push(["email", email]);
-    const phone = p.phone ? normalizePhone(p.phone) : null;
+    phone = p.phone ? normalizePhone(p.phone) : null;
     if (phone) contact.push(["phone", phone]);
-    const profile = p.profileUrl ? normalizeProfileUrl(p.profileUrl) : null;
+    profile = p.profileUrl ? normalizeProfileUrl(p.profileUrl) : null;
     if (profile) contact.push(["profileUrl", profile]);
+    personName = name ? normalizePersonName(name) : null;
   }
 
   // How the lead was acquired belongs to the person if there is one, else the company.
@@ -77,11 +82,33 @@ export function planClaims(c: NormalizedCandidate) {
     acquisition,
     domain,
     email,
+    profile,
+    phone,
+    personName,
     companyName: clean(co?.name),
     hasCompany: Boolean(co),
     hasPerson: Boolean(p),
   };
 }
+
+type Key = { scope: string; kind: "email" | "profile" | "phone" | "name"; value: string };
+
+/** Strongest first. Email identifies a person anywhere; the rest only within their company. */
+function contactKeysFor(plan: ReturnType<typeof planClaims>, accountId: Id<"accounts"> | null): Key[] {
+  const scope = accountId ?? "none";
+  const keys: Key[] = [];
+  if (plan.email) keys.push({ scope: "any", kind: "email", value: plan.email });
+  if (plan.profile) keys.push({ scope, kind: "profile", value: plan.profile });
+  if (plan.phone) keys.push({ scope, kind: "phone", value: plan.phone });
+  if (plan.personName) keys.push({ scope, kind: "name", value: plan.personName });
+  return keys;
+}
+
+const findKey = (ctx: MutationCtx, orgId: Id<"orgs">, k: Key) =>
+  ctx.db
+    .query("contactKeys")
+    .withIndex("by_key", (q) => q.eq("orgId", orgId).eq("scope", k.scope).eq("kind", k.kind).eq("value", k.value))
+    .first();
 
 async function reject(ctx: MutationCtx, row: Doc<"candidates">, reason: string): Promise<Outcome> {
   await ctx.db.patch(row._id, { status: "rejected", rejectionReason: reason });
@@ -146,16 +173,17 @@ export async function ingestCandidate(ctx: MutationCtx, candidateId: Id<"candida
     await rebuildProjection(ctx, { subjectType: "account", subjectId: accountId });
   }
 
-  // Contact: one per normalized email. Other identifiers cannot be looked up yet, so a contact seen
-  // only by name/phone/profile is created each time it is observed (see report: known limit).
+  // Contact: resolved by the strongest identifier first (email, profileUrl, phone, name), so a
+  // re-observation reuses the person instead of fragmenting into a new row per sighting.
   let contactId: Id<"contacts"> | null = null;
   if (plan.hasPerson) {
-    if (plan.email) {
-      const found = await ctx.db
-        .query("contacts")
-        .withIndex("by_org_and_email", (q) => q.eq("orgId", orgId).eq("display.email", plan.email!))
-        .first();
-      contactId = found?._id ?? null;
+    const keys = contactKeysFor(plan, accountId);
+    for (const k of keys) {
+      const hit = await findKey(ctx, orgId, k);
+      if (hit) {
+        contactId = hit.contactId;
+        break;
+      }
     }
     contactId ??= await ctx.db.insert("contacts", { orgId, fields: [], display: {} });
     await append("contact", contactId, [
@@ -164,59 +192,80 @@ export async function ingestCandidate(ctx: MutationCtx, candidateId: Id<"candida
       ...plan.acquisition,
     ]);
     await rebuildProjection(ctx, { subjectType: "contact", subjectId: contactId });
+    // Record every identifier this sighting carried (never re-pointing an existing key), so the
+    // next sighting can be found by any of them.
+    for (const k of keys) {
+      if (!(await findKey(ctx, orgId, k))) await ctx.db.insert("contactKeys", { orgId, ...k, contactId });
+    }
   }
 
   await ctx.db.patch(row._id, { status: "consumed" });
   return { outcome: "consumed" };
 }
 
-/** Isolation unit: called as a nested mutation so a failure rolls back only this candidate's writes. */
+/**
+ * Isolation unit: called as a nested mutation so a failure rolls back only this candidate's writes.
+ * Internal, so it takes the org explicitly from whichever authenticated function started the work.
+ */
 export const ingestOne = internalMutation({
-  args: { candidateId: v.id("candidates") },
-  handler: async (ctx, args): Promise<Outcome> => ingestCandidate(ctx, args.candidateId),
+  args: { orgId: v.id("orgs"), candidateId: v.id("candidates") },
+  handler: async (ctx, args): Promise<Outcome> => ingestCandidate(asOrg(ctx, args.orgId), args.candidateId),
 });
 
-/**
- * Consumes a batch of pending candidates. Called by the import action after each chunk (scheduled
- * functions carry no auth identity, so org-scoped writes must start from a client or action call).
- * A candidate that cannot be processed is rejected with a reason instead of aborting its neighbours.
- */
+/** Consumes up to INGEST_BATCH candidates; a candidate that cannot be processed is rejected with a reason instead of aborting its neighbours. */
+export async function ingestBatch(
+  ctx: MutationCtx,
+  orgId: Id<"orgs">,
+  candidateIds: Id<"candidates">[],
+): Promise<{ consumed: number; rejected: number }> {
+  if (candidateIds.length > INGEST_BATCH) throw new Error(`batch_too_large: at most ${INGEST_BATCH} candidates per call`);
+  const rows: Doc<"candidates">[] = [];
+  for (const id of candidateIds) {
+    const row = await ctx.db.get(id);
+    if (!row || row.orgId !== orgId) throw new Error("candidate not found");
+    rows.push(row);
+  }
+  let consumed = 0;
+  let rejected = 0;
+  const perRun = new Map<Id<"discoveryRuns">, Partial<Record<RunCounter, number>>>();
+  for (const row of rows) {
+    let result: Outcome;
+    try {
+      result = await ctx.runMutation(internal.sources.ingest.ingestOne, { orgId, candidateId: row._id });
+    } catch (e) {
+      result = await reject(ctx, row, e instanceof Error ? e.message : String(e));
+    }
+    if (result.outcome === "skipped") continue;
+    if (result.outcome === "consumed") consumed++;
+    else rejected++;
+    if (row.runId) {
+      const delta = perRun.get(row.runId) ?? {};
+      const key: RunCounter = result.outcome === "consumed" ? "candidatesConsumed" : "candidatesRejected";
+      delta[key] = (delta[key] ?? 0) + 1;
+      perRun.set(row.runId, delta);
+    }
+  }
+  for (const [runId, delta] of perRun) {
+    const run = await ctx.db.get(runId);
+    if (run) await bumpRun(ctx, run, delta);
+  }
+  return { consumed, rejected };
+}
+
+/** Public entry for callers that hold candidate ids (manual/producer flows). The org comes from identity. */
 export const ingestCandidates = mutation({
   args: { candidateIds: v.array(v.id("candidates")) },
   handler: async (ctx, args): Promise<{ consumed: number; rejected: number }> => {
     const { orgId } = await withOrg(ctx, args);
-    if (args.candidateIds.length > INGEST_BATCH) throw new Error(`batch_too_large: at most ${INGEST_BATCH} candidates per call`);
-    const rows: Doc<"candidates">[] = [];
-    for (const id of args.candidateIds) {
-      const row = await ctx.db.get(id);
-      if (!row || row.orgId !== orgId) throw new Error("candidate not found");
-      rows.push(row);
-    }
-    let consumed = 0;
-    let rejected = 0;
-    const perRun = new Map<Id<"discoveryRuns">, Partial<Record<RunCounter, number>>>();
-    for (const row of rows) {
-      let result: Outcome;
-      try {
-        result = await ctx.runMutation(internal.sources.ingest.ingestOne, { candidateId: row._id });
-      } catch (e) {
-        const reason = e instanceof Error ? e.message : String(e);
-        result = await reject(ctx, row, reason);
-      }
-      if (result.outcome === "skipped") continue;
-      if (result.outcome === "consumed") consumed++;
-      else rejected++;
-      if (row.runId) {
-        const delta = perRun.get(row.runId) ?? {};
-        const key: RunCounter = result.outcome === "consumed" ? "candidatesConsumed" : "candidatesRejected";
-        delta[key] = (delta[key] ?? 0) + 1;
-        perRun.set(row.runId, delta);
-      }
-    }
-    for (const [runId, delta] of perRun) {
-      const run = await ctx.db.get(runId);
-      if (run) await bumpRun(ctx, run, delta);
-    }
-    return { consumed, rejected };
+    return await ingestBatch(ctx, orgId, args.candidateIds);
+  },
+});
+
+/** Scheduled continuation: one ingest batch, as its own transaction, for an org established upstream. */
+export const ingestStep = internalMutation({
+  args: { orgId: v.id("orgs"), candidateIds: v.array(v.id("candidates")) },
+  handler: async (ctx, args): Promise<null> => {
+    await ingestBatch(asOrg(ctx, args.orgId), args.orgId, args.candidateIds);
+    return null;
   },
 });

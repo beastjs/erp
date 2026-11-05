@@ -42,8 +42,21 @@ export const contacts = defineTable({
     title: v.optional(v.string()),
   }),
 })
-  .index("by_org", ["orgId"])
-  .index("by_org_and_email", ["orgId", "display.email"]);
+  .index("by_org", ["orgId"]);
+
+/*
+ * Lookup keys that let ingest find an existing contact instead of minting a duplicate. `scope` is
+ * "any" for email (a mailbox identifies one person wherever they were seen) and the account id (or
+ * "none") for profileUrl/phone/name, which only identify someone within a company. `value` is always
+ * the output of the shared normalizers. Derived data: written only by ingest, rebuildable from claims.
+ */
+export const contactKeys = defineTable({
+  orgId: v.id("orgs"),
+  scope: v.string(),
+  kind: v.union(v.literal("email"), v.literal("profile"), v.literal("phone"), v.literal("name")),
+  value: v.string(),
+  contactId: v.id("contacts"),
+}).index("by_key", ["orgId", "scope", "kind", "value"]);
 
 /*
  * A reversible record that `mergedFromId` is the same entity as `subjectId`.

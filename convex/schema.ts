@@ -1,14 +1,15 @@
 import { defineSchema, defineTable } from "convex/server";
 import { v } from "convex/values";
 import { claims } from "./claims/schema";
-import { sources, candidates, columnMappings } from "./sources/schema";
+import { sources, candidates, columnMappings, importChunks, importRejections } from "./sources/schema";
 import { discoveryRuns } from "./runs/schema";
-import { accounts, contacts, identityLinks } from "./projections/schema";
+import { accounts, contacts, contactKeys, identityLinks } from "./projections/schema";
 
 export default defineSchema({
   claims,
   accounts,
   contacts,
+  contactKeys,
   identityLinks,
   orgs: defineTable({
     name: v.string(),
@@ -17,5 +18,7 @@ export default defineSchema({
   sources,
   candidates,
   columnMappings,
+  importChunks,
+  importRejections,
   discoveryRuns,
 });

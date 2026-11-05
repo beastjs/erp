@@ -4,6 +4,7 @@ import { beforeEach, expect, test } from "vitest";
 import { api } from "../_generated/api";
 import type { Id } from "../_generated/dataModel";
 import schema from "../schema";
+import { insertCandidate, registerSource } from "./mutations";
 import { CANDIDATE_CONTRACT_VERSION, computeDedupeHash, validateCandidate } from "./contract";
 
 const modules = import.meta.glob("/convex/**/*.ts");
@@ -87,44 +88,45 @@ test("the dedupe hash collides across spellings of the same lead and not across 
 test("insertCandidate returns null for a repeat dedupeHash", async () => {
   const sourceId = await register();
   const candidate = minimal();
-  const dedupeHash = computeDedupeHash(candidate);
-  const first = await t.mutation(api.sources.mutations.insertCandidate, { candidate, sourceId, dedupeHash });
+  const first = await t.run((ctx) => insertCandidate(ctx, { candidate, sourceId }));
   expect(first).not.toBeNull();
-  const second = await t.mutation(api.sources.mutations.insertCandidate, { candidate, sourceId, dedupeHash });
+  const second = await t.run((ctx) => insertCandidate(ctx, { candidate, sourceId }));
   expect(second).toBeNull();
   const rows = await raw.run((ctx) => ctx.db.query("candidates").collect());
   expect(rows).toHaveLength(1);
+  expect(rows[0]!.dedupeHash).toBe(computeDedupeHash(candidate)); // server-derived
   expect(rows[0]!.contractVersion).toBe(CANDIDATE_CONTRACT_VERSION);
 });
 
-test("insertCandidate fails closed on invalid candidates, mismatched hashes and foreign sources", async () => {
+test("insertCandidate fails closed on invalid candidates and foreign sources", async () => {
   const sourceId = await register();
   const candidate = minimal();
-  const dedupeHash = computeDedupeHash(candidate);
   await expect(
-    t.mutation(api.sources.mutations.insertCandidate, { candidate: { ...candidate, extra: 1 }, sourceId, dedupeHash }),
+    t.run((ctx) => insertCandidate(ctx, { candidate: { ...candidate, extra: 1 }, sourceId })),
   ).rejects.toThrow("invalid candidate");
-  await expect(
-    t.mutation(api.sources.mutations.insertCandidate, { candidate, sourceId, dedupeHash: "domain:other.com|name:" }),
-  ).rejects.toThrow("dedupeHash does not match");
   const otherOrg = await raw.run((ctx) => ctx.db.insert("orgs", { name: "Org 2", createdAt: 0 }));
   const other = raw.withIdentity({ subject: "u2", orgId: otherOrg });
   await expect(
-    other.mutation(api.sources.mutations.insertCandidate, { candidate, sourceId, dedupeHash }),
+    other.run((ctx) => insertCandidate(ctx, { candidate, sourceId })),
   ).rejects.toThrow("source not found");
 });
 
 test("the same hash in a different org is not a duplicate", async () => {
   const sourceId = await register();
   const candidate = minimal();
-  const dedupeHash = computeDedupeHash(candidate);
-  await t.mutation(api.sources.mutations.insertCandidate, { candidate, sourceId, dedupeHash });
+  await t.run((ctx) => insertCandidate(ctx, { candidate, sourceId }));
   const otherOrg = await raw.run((ctx) => ctx.db.insert("orgs", { name: "Org 2", createdAt: 0 }));
   const other = raw.withIdentity({ subject: "u2", orgId: otherOrg });
   const otherSource = await other.mutation(api.sources.mutations.registerSource, {
     key: "csv-1", kind: "csv", trustWeight: 0.5, lawfulBasis: "consent",
   });
-  expect(await other.mutation(api.sources.mutations.insertCandidate, { candidate, sourceId: otherSource, dedupeHash })).not.toBeNull();
+  expect(await other.run((ctx) => insertCandidate(ctx, { candidate, sourceId: otherSource }))).not.toBeNull();
+});
+
+test("insertCandidate is not a callable endpoint", () => {
+  // Registered Convex functions carry an isMutation marker; a plain helper does not.
+  expect((insertCandidate as unknown as { isMutation?: boolean }).isMutation).toBeUndefined();
+  expect((registerSource as unknown as { isMutation?: boolean }).isMutation).toBe(true);
 });
 
 test("registerSource requires a lawfulBasis", async () => {

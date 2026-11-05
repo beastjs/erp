@@ -1,5 +1,6 @@
 import { v } from "convex/values";
-import { mutation } from "../_generated/server";
+import type { Id } from "../_generated/dataModel";
+import { mutation, type MutationCtx } from "../_generated/server";
 import { withOrg } from "../_shared/org";
 import { CANDIDATE_CONTRACT_VERSION, computeDedupeHash, validateCandidate } from "./contract";
 import { lawfulBasis, sourceKind } from "./schema";
@@ -23,37 +24,37 @@ export const registerSource = mutation({
   },
 });
 
-/** Returns null when the dedupe hash already exists: overlapping sources make that routine, not a fault. */
-export const insertCandidate = mutation({
-  args: {
-    candidate: v.any(),
-    sourceId: v.id("sources"),
-    runId: v.optional(v.id("discoveryRuns")),
-    dedupeHash: v.string(),
-  },
-  handler: async (ctx, args) => {
-    const { orgId } = await withOrg(ctx, args);
-    const checked = validateCandidate(args.candidate);
-    if (!checked.ok) throw new Error(`invalid candidate: ${checked.errors.join("; ")}`);
-    if (computeDedupeHash(checked.value) !== args.dedupeHash) throw new Error("dedupeHash does not match candidate");
-    const source = await ctx.db.get(args.sourceId);
-    if (!source || source.orgId !== orgId) throw new Error("source not found");
-    if (args.runId) {
-      const run = await ctx.db.get(args.runId);
-      if (!run || run.orgId !== orgId) throw new Error("run not found");
-    }
-    const dup = await ctx.db
-      .query("candidates")
-      .withIndex("by_org_and_dedupe_hash", (q) => q.eq("orgId", orgId).eq("dedupeHash", args.dedupeHash))
-      .first();
-    if (dup) return null;
-    return await ctx.db.insert("candidates", {
-      orgId,
-      sourceId: args.sourceId,
-      runId: args.runId,
-      dedupeHash: args.dedupeHash,
-      contractVersion: CANDIDATE_CONTRACT_VERSION,
-      candidate: checked.value,
-    });
-  },
-});
+/**
+ * Plain helper, deliberately NOT a registered endpoint: public entry points (import, manual entry,
+ * the Collector HTTP endpoint) validate their own args and compose this. The server owns the dedupe
+ * hash, derived from the validated candidate. Returns null when it already exists: overlapping
+ * sources make that routine, not a fault.
+ */
+export async function insertCandidate(
+  ctx: MutationCtx,
+  args: { candidate: unknown; sourceId: Id<"sources">; runId?: Id<"discoveryRuns"> },
+): Promise<Id<"candidates"> | null> {
+  const { orgId } = await withOrg(ctx, args);
+  const checked = validateCandidate(args.candidate);
+  if (!checked.ok) throw new Error(`invalid candidate: ${checked.errors.join("; ")}`);
+  const dedupeHash = computeDedupeHash(checked.value);
+  const source = await ctx.db.get(args.sourceId);
+  if (!source || source.orgId !== orgId) throw new Error("source not found");
+  if (args.runId) {
+    const run = await ctx.db.get(args.runId);
+    if (!run || run.orgId !== orgId) throw new Error("run not found");
+  }
+  const dup = await ctx.db
+    .query("candidates")
+    .withIndex("by_org_and_dedupe_hash", (q) => q.eq("orgId", orgId).eq("dedupeHash", dedupeHash))
+    .first();
+  if (dup) return null;
+  return await ctx.db.insert("candidates", {
+    orgId,
+    sourceId: args.sourceId,
+    runId: args.runId,
+    dedupeHash,
+    contractVersion: CANDIDATE_CONTRACT_VERSION,
+    candidate: checked.value,
+  });
+}

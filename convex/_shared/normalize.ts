@@ -51,3 +51,23 @@ export function normalizeCompanyName(raw: string): string | null {
   const key = words.join(" ");
   return key.length > 0 ? key : null;
 }
+
+/** Person-name key: NFKC, lowercase, punctuation folded to spaces. Unlike company names, no suffix stripping. */
+export function normalizePersonName(raw: string): string | null {
+  const key = base(raw).replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+  return key.length > 0 ? key : null;
+}
+
+/** "https://www.LinkedIn.com/in/Jane/?x=1" -> "linkedin.com/in/jane". Null when no host and path remain. */
+export function normalizeProfileUrl(raw: string): string | null {
+  let s = base(raw).replace(/^[a-z][a-z0-9+.-]*:\/\//, "").replace(/^www\./, "");
+  s = s.split(/[?#]/)[0] ?? "";
+  s = s.replace(/\/+$/, "");
+  return s.includes(".") ? s : null;
+}
+
+/** Digits only (leading "+" dropped); null when fewer than 5 digits remain. */
+export function normalizePhone(raw: string): string | null {
+  const digits = raw.normalize("NFKC").replace(/\D+/g, "");
+  return digits.length >= 5 ? digits : null;
+}

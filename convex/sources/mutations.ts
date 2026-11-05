@@ -9,25 +9,26 @@ export const registerSource = mutation({
   args: { key: v.string(), kind: sourceKind, trustWeight: v.number(), lawfulBasis },
   handler: async (ctx, args) => {
     const { orgId } = await withOrg(ctx, args);
+    const key = args.key.trim();
     // Negated conjunction on purpose: every comparison with NaN is false, so NaN fails closed.
     // Claim resolution orders by trustWeight; a NaN would break its total order.
     if (!(args.trustWeight >= 0 && args.trustWeight <= 1)) {
       throw new Error("trustWeight must be a finite number between 0 and 1");
     }
-    if (args.key.trim().length === 0) throw new Error("key must not be empty");
+    if (key.length === 0) throw new Error("key must not be empty");
     const existing = await ctx.db
       .query("sources")
-      .withIndex("by_org_and_key", (q) => q.eq("orgId", orgId).eq("key", args.key))
+      .withIndex("by_org_and_key", (q) => q.eq("orgId", orgId).eq("key", key))
       .first();
     if (existing) throw new Error("source key already registered");
-    return await ctx.db.insert("sources", { ...args, orgId });
+    return await ctx.db.insert("sources", { ...args, key, orgId });
   },
 });
 
 /**
  * Plain helper, deliberately NOT a registered endpoint: public entry points (import, manual entry,
  * the Collector HTTP endpoint) validate their own args and compose this. The server owns the dedupe
- * hash, derived from the validated candidate. Returns null when it already exists: overlapping
+ * hash, derived from the validated candidate. Returns null when a PENDING candidate with that hash already exists: overlapping
  * sources make that routine, not a fault.
  */
 export async function insertCandidate(
@@ -46,7 +47,9 @@ export async function insertCandidate(
   }
   const dup = await ctx.db
     .query("candidates")
-    .withIndex("by_org_and_dedupe_hash", (q) => q.eq("orgId", orgId).eq("dedupeHash", dedupeHash))
+    .withIndex("by_org_and_dedupe_hash_and_status", (q) =>
+      q.eq("orgId", orgId).eq("dedupeHash", dedupeHash).eq("status", "pending"),
+    )
     .first();
   if (dup) return null;
   return await ctx.db.insert("candidates", {
@@ -54,6 +57,7 @@ export async function insertCandidate(
     sourceId: args.sourceId,
     runId: args.runId,
     dedupeHash,
+    status: "pending",
     contractVersion: CANDIDATE_CONTRACT_VERSION,
     candidate: checked.value,
   });

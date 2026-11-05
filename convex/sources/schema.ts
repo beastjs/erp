@@ -41,6 +41,8 @@ export const candidates = defineTable({
   sourceId: v.id("sources"),
   runId: v.optional(v.id("discoveryRuns")),
   dedupeHash: v.string(),
+  /** Dedupe applies to pending rows only: a re-observation after consumption must insert fresh. Ingest (Task 7) owns the transitions. */
+  status: v.union(v.literal("pending"), v.literal("consumed"), v.literal("rejected")),
   contractVersion: v.string(),
   candidate: v.any(), // validated by validateCandidate at the write boundary
-}).index("by_org_and_dedupe_hash", ["orgId", "dedupeHash"]);
+}).index("by_org_and_dedupe_hash_and_status", ["orgId", "dedupeHash", "status"]);

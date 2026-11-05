@@ -132,8 +132,8 @@ test("insertCandidate is not a callable endpoint", () => {
 test("registerSource requires a lawfulBasis", async () => {
   await expect(
     t.mutation(api.sources.mutations.registerSource, { key: "k", kind: "csv", trustWeight: 0.5 } as never),
-  ).rejects.toThrow();
-  await expect(register({ lawfulBasis: "because" })).rejects.toThrow();
+  ).rejects.toThrow(/lawfulBasis/);
+  await expect(register({ lawfulBasis: "because" })).rejects.toThrow(/Validator error.*because/);
   const id = await register();
   const row = await raw.run((ctx) => ctx.db.get(id));
   expect(row).toMatchObject({ orgId, key: "csv-1", lawfulBasis: "legitimate_interest", trustWeight: 0.5 });
@@ -153,4 +153,78 @@ test("registerSource rejects a duplicate key within an org and requires org cont
   await expect(
     raw.mutation(api.sources.mutations.registerSource, { key: "z", kind: "csv", trustWeight: 1, lawfulBasis: "consent" }),
   ).rejects.toThrow("no org context");
+});
+
+test("registerSource trims the key before storing and comparing", async () => {
+  const id = await register({ key: "  a  " });
+  expect((await raw.run((ctx) => ctx.db.get(id)))!.key).toBe("a");
+  await expect(register({ key: "a" })).rejects.toThrow("already registered");
+});
+
+const acq = { acquiredAt: 1 };
+
+test("a person block with no identifier is rejected", () => {
+  const r = validateCandidate({ company: { domain: "acme.com" }, person: { jobTitle: "VP Sales" }, acquisition: acq });
+  expect(r.ok).toBe(false);
+  if (!r.ok) expect(r.errors.join(" ")).toMatch(/person must carry/);
+});
+
+test("distinct nameless/emailless persons at one domain do not collide", () => {
+  const h = (person?: object) => computeDedupeHash({ company: { domain: "acme.com" }, ...(person ? { person } : {}), acquisition: acq });
+  const hashes = [
+    h(),
+    h({ profileUrl: "https://linkedin.com/in/x" }),
+    h({ profileUrl: "https://www.linkedin.com/in/y/" }),
+    h({ phone: "+1 (555) 010-2000" }),
+    h({ phone: "+1 555 010 3000" }),
+    h({ fullName: "Jane Doe" }),
+  ];
+  expect(new Set(hashes).size).toBe(hashes.length);
+  expect(h({ profileUrl: "HTTPS://www.linkedin.com/in/x/?utm=1" })).toBe(h({ profileUrl: "linkedin.com/in/x" }));
+  expect(h({ phone: "1-555-010-2000" })).toBe(h({ phone: "+1 (555) 010-2000" }));
+});
+
+test("person names are not mangled by company-suffix stripping", () => {
+  const h = (fullName: string) => computeDedupeHash({ company: { domain: "acme.com" }, person: { fullName }, acquisition: acq });
+  expect(h("Anna Co")).not.toBe(h("Anna"));
+  expect(h("Anna Co")).toBe("domain:acme.com|name:anna co");
+});
+
+test("a repeat while pending is deduped; a re-observation after consumption inserts fresh", async () => {
+  const sourceId = await register();
+  const candidate = minimal();
+  const first = await t.run((ctx) => insertCandidate(ctx, { candidate, sourceId }));
+  expect(first).not.toBeNull();
+  expect((await raw.run((ctx) => ctx.db.get(first!)))!.status).toBe("pending");
+  expect(await t.run((ctx) => insertCandidate(ctx, { candidate, sourceId }))).toBeNull();
+  await raw.run((ctx) => ctx.db.patch(first!, { status: "consumed" }));
+  const again = await t.run((ctx) => insertCandidate(ctx, { candidate, sourceId }));
+  expect(again).not.toBeNull();
+  expect(again).not.toBe(first);
+  // and the new pending row dedupes again
+  expect(await t.run((ctx) => insertCandidate(ctx, { candidate, sourceId }))).toBeNull();
+});
+
+test("cross-form duplicates insert twice by design", async () => {
+  // A lead seen with an email at one source and only domain+name at another hashes differently.
+  // Deliberately deferred: we cannot dedupe on an identifier we do not have. Company-level
+  // convergence happens at entity resolution; contact-level cross-form duplicates remain possible
+  // and are not yet owned by anything.
+  const sourceId = await register();
+  const withEmail = { person: { fullName: "Jane Doe", email: "jane@acme.com" }, company: { domain: "acme.com" }, acquisition: acq };
+  const withoutEmail = { person: { fullName: "Jane Doe" }, company: { domain: "acme.com" }, acquisition: acq };
+  expect(await t.run((ctx) => insertCandidate(ctx, { candidate: withEmail, sourceId }))).not.toBeNull();
+  expect(await t.run((ctx) => insertCandidate(ctx, { candidate: withoutEmail, sourceId }))).not.toBeNull();
+});
+
+test("insertCandidate rejects a run from another org", async () => {
+  const sourceId = await register();
+  const otherOrg = await raw.run((ctx) => ctx.db.insert("orgs", { name: "Org 2", createdAt: 0 }));
+  const foreignRun = await raw.run(async (ctx) => {
+    const src = await ctx.db.insert("sources", { orgId: otherOrg, key: "x", kind: "csv", trustWeight: 1, lawfulBasis: "consent" });
+    return ctx.db.insert("discoveryRuns", { orgId: otherOrg, sourceId: src, status: "running" });
+  });
+  await expect(
+    t.run((ctx) => insertCandidate(ctx, { candidate: minimal(), sourceId, runId: foreignRun })),
+  ).rejects.toThrow("run not found");
 });

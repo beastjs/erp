@@ -1,4 +1,10 @@
-import { normalizeCompanyName, normalizeDomain, normalizeEmail } from "../_shared/normalize";
+import {
+  normalizeDomain,
+  normalizeEmail,
+  normalizePersonName,
+  normalizePhone,
+  normalizeProfileUrl,
+} from "../_shared/normalize";
 
 /**
  * The normalized candidate contract. Every source (CSV, manual entry, CRM export and the
@@ -147,26 +153,50 @@ export function validateCandidate(
     errors.push("candidate needs company.domain or person.email");
   }
 
+  if (person && errors.length === 0 && !personKey(person as NormalizedCandidate["person"])) {
+    errors.push(
+      "person must carry at least one of email, profileUrl, phone or a name (fullName, firstName, lastName); send a company-only candidate otherwise",
+    );
+  }
+
   if (errors.length > 0) return { ok: false, errors };
   return { ok: true, value: input as unknown as NormalizedCandidate };
 }
 
+type Person = NonNullable<NormalizedCandidate["person"]>;
+
+/** Strongest normalized person identifier, as `kind:value`; null when the person has none. */
+function personKey(p: Person | undefined): string | null {
+  if (!p) return null;
+  const email = p.email ? normalizeEmail(p.email) : null;
+  if (email) return `email:${email}`;
+  const profile = p.profileUrl ? normalizeProfileUrl(p.profileUrl) : null;
+  if (profile) return `profile:${profile}`;
+  const phone = p.phone ? normalizePhone(p.phone) : null;
+  if (phone) return `phone:${phone}`;
+  const fullName = p.fullName ?? ([p.firstName, p.lastName].filter(Boolean).join(" ") || undefined);
+  const name = fullName ? normalizePersonName(fullName) : null;
+  return name ? `name:${name}` : null;
+}
+
 /**
  * Deterministic dedupe key from NORMALIZED identifiers, so the same lead from two sources collides.
- * - With an email: `email:<normalized email>` (the strongest person-level identifier; +tags stripped).
- * - Otherwise: `domain:<normalized domain>|name:<normalized person name or company name>`, so two
- *   different people found on the same company site do not collapse into one candidate.
- * Campaign, channel, title, phone etc. are deliberately excluded: they vary by source for the same lead.
+ * - A person with an email: `email:<normalized email>` (+tags stripped).
+ * - Otherwise `domain:<normalized company domain>|<person key>`, where the person key is the first
+ *   available of profileUrl, phone, person name (all normalized), or empty for a company-only candidate.
+ *   Validation guarantees a person block has at least one of these, so distinct people never share a key.
+ * Campaign, channel, title etc. are excluded: they vary by source for the same lead.
+ * Known limit, deliberate: a lead seen with an email at one source and without at another hashes
+ * differently and is inserted twice. Cross-form merging is deferred; company-level convergence
+ * happens at entity resolution (matchCandidate resolves accounts), but contact-level cross-form
+ * duplicates remain possible and are not yet owned by anything.
  * It is a canonical string rather than a digest: the default Convex runtime has no sync crypto, and a
  * lossy hash could silently drop a distinct lead on collision.
  */
 export function computeDedupeHash(candidate: NormalizedCandidate): string {
-  const email = candidate.person?.email ? normalizeEmail(candidate.person.email) : null;
-  if (email) return `email:${email}`;
+  const key = personKey(candidate.person);
+  if (key?.startsWith("email:")) return key;
   const domain = candidate.company?.domain ? normalizeDomain(candidate.company.domain) : null;
   if (!domain) throw new Error("candidate has no usable identifier");
-  const p = candidate.person;
-  const personName = p?.fullName ?? ([p?.firstName, p?.lastName].filter(Boolean).join(" ") || undefined);
-  const name = personName ? normalizeCompanyName(personName) : null;
-  return `domain:${domain}|name:${name ?? ""}`;
+  return `domain:${domain}|${key ?? ""}`;
 }

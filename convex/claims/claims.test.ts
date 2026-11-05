@@ -150,3 +150,23 @@ test("appendClaim rejects a subject id that is not valid for the declared subjec
   await expect(append({ subjectId: contactId })).rejects.toThrow("invalid subject id");
   await expect(append({ subjectType: "contact" })).rejects.toThrow("invalid subject id");
 });
+
+test("appendClaim rejects a well-formed subject id that names no row", async () => {
+  const gone = await raw.run(async (ctx) => {
+    const id = await ctx.db.insert("accounts", { orgId, fields: [], display: {} });
+    await ctx.db.delete(id);
+    return id;
+  });
+  await expect(
+    t.mutation(api.claims.mutations.appendClaim, { ...observedDomainClaim(), subjectId: gone }),
+  ).rejects.toThrow("subject not found");
+});
+
+test("appendClaim rejects a subject belonging to another org", async () => {
+  const foreign = await raw.run((ctx) =>
+    ctx.db.insert("accounts", { orgId: otherOrgId, fields: [], display: {} }),
+  );
+  await expect(
+    t.mutation(api.claims.mutations.appendClaim, { ...observedDomainClaim(), subjectId: foreign }),
+  ).rejects.toThrow("subject not found");
+});

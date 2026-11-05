@@ -32,6 +32,10 @@ export const appendClaim = mutation({
     // spelling would be invisible to its own subject's index reads and silently dropped.
     const subjectId = ctx.db.normalizeId(args.subjectType === "account" ? "accounts" : "contacts", args.subjectId);
     if (!subjectId) throw new Error("invalid subject id");
+    // The ledger is append-only and uncleanable, so refuse claims about rows that do not exist
+    // or belong to another org rather than leaving junk that can never project.
+    const subject = await ctx.db.get(subjectId);
+    if (!subject || subject.orgId !== orgId) throw new Error("subject not found");
     const source = await ctx.db.get(args.sourceId);
     if (!source || source.orgId !== orgId) throw new Error("source not found");
     if (args.runId) {

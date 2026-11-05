@@ -128,6 +128,19 @@ test("unlinkIdentity refuses another org's link", async () => {
   await expect(other.run((ctx) => unlinkIdentity(ctx, { linkId }))).rejects.toThrow(/link not found/);
 });
 
+test("linkIdentity refuses a second active link for the same pair, in either order, until reversed", async () => {
+  const a = await seedAccount({ domain: "acme.com" });
+  const b = await seedAccount({ domain: "acme.com" });
+  const link = (subjectId: Id<"accounts">, mergedFromId: Id<"accounts">) =>
+    t.run((ctx) => linkIdentity(ctx, { subjectType: "account", subjectId, mergedFromId, score: 1, signals: ["domain"] }));
+  const first = await link(a, b);
+  await expect(link(a, b)).rejects.toThrow(/already exists/);
+  await expect(link(b, a)).rejects.toThrow(/already exists/);
+  await t.run((ctx) => unlinkIdentity(ctx, { linkId: first }));
+  // once reversed, the pair may be linked again
+  await expect(link(b, a)).resolves.toBeDefined();
+});
+
 describe("normalize", () => {
   test("domain", () => {
     expect(normalizeDomain(" HTTP://WWW.Acme.com:8080/x?y#z ")).toBe("acme.com");

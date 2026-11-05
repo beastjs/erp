@@ -94,6 +94,20 @@ export async function linkIdentity(
     const row = normalized ? await ctx.db.get(normalized) : null;
     if (!row || row.orgId !== orgId) throw new Error("subject not found");
   }
+  // Unordered pair: A->B and B->A are the same decision. Throw rather than no-op so a caller
+  // never believes its own score/signals were recorded when an earlier link's were kept.
+  for (const [from, to] of [
+    [args.subjectId, args.mergedFromId],
+    [args.mergedFromId, args.subjectId],
+  ] as const) {
+    const links = await ctx.db
+      .query("identityLinks")
+      .withIndex("by_subject", (q) => q.eq("orgId", orgId).eq("subjectId", from))
+      .take(100);
+    if (links.some((l) => l.mergedFromId === to && l.reversedAt === undefined)) {
+      throw new Error("an active link already exists for this pair");
+    }
+  }
   return await ctx.db.insert("identityLinks", {
     orgId,
     subjectType: args.subjectType,

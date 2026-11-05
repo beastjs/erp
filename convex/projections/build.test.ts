@@ -35,7 +35,7 @@ beforeEach(async () => {
     const otherOrgId = await ctx.db.insert("orgs", { name: "Org 2", createdAt: 0 });
     const sources: Id<"sources">[] = [];
     for (const [key, trustWeight] of [["web", 0.9], ["directory", 0.5], ["scraper", 0.2], ["untrusted", 0]] as const) {
-      sources.push(await ctx.db.insert("sources", { orgId, key, trustWeight }));
+      sources.push(await ctx.db.insert("sources", { orgId, key, kind: "crawler", trustWeight, lawfulBasis: "legitimate_interest" }));
     }
     return { orgId, otherOrgId, sources };
   });

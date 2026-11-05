@@ -1,0 +1,59 @@
+import { v } from "convex/values";
+import { mutation } from "../_generated/server";
+import { withOrg } from "../_shared/org";
+import { CANDIDATE_CONTRACT_VERSION, computeDedupeHash, validateCandidate } from "./contract";
+import { lawfulBasis, sourceKind } from "./schema";
+
+export const registerSource = mutation({
+  args: { key: v.string(), kind: sourceKind, trustWeight: v.number(), lawfulBasis },
+  handler: async (ctx, args) => {
+    const { orgId } = await withOrg(ctx, args);
+    // Negated conjunction on purpose: every comparison with NaN is false, so NaN fails closed.
+    // Claim resolution orders by trustWeight; a NaN would break its total order.
+    if (!(args.trustWeight >= 0 && args.trustWeight <= 1)) {
+      throw new Error("trustWeight must be a finite number between 0 and 1");
+    }
+    if (args.key.trim().length === 0) throw new Error("key must not be empty");
+    const existing = await ctx.db
+      .query("sources")
+      .withIndex("by_org_and_key", (q) => q.eq("orgId", orgId).eq("key", args.key))
+      .first();
+    if (existing) throw new Error("source key already registered");
+    return await ctx.db.insert("sources", { ...args, orgId });
+  },
+});
+
+/** Returns null when the dedupe hash already exists: overlapping sources make that routine, not a fault. */
+export const insertCandidate = mutation({
+  args: {
+    candidate: v.any(),
+    sourceId: v.id("sources"),
+    runId: v.optional(v.id("discoveryRuns")),
+    dedupeHash: v.string(),
+  },
+  handler: async (ctx, args) => {
+    const { orgId } = await withOrg(ctx, args);
+    const checked = validateCandidate(args.candidate);
+    if (!checked.ok) throw new Error(`invalid candidate: ${checked.errors.join("; ")}`);
+    if (computeDedupeHash(checked.value) !== args.dedupeHash) throw new Error("dedupeHash does not match candidate");
+    const source = await ctx.db.get(args.sourceId);
+    if (!source || source.orgId !== orgId) throw new Error("source not found");
+    if (args.runId) {
+      const run = await ctx.db.get(args.runId);
+      if (!run || run.orgId !== orgId) throw new Error("run not found");
+    }
+    const dup = await ctx.db
+      .query("candidates")
+      .withIndex("by_org_and_dedupe_hash", (q) => q.eq("orgId", orgId).eq("dedupeHash", args.dedupeHash))
+      .first();
+    if (dup) return null;
+    return await ctx.db.insert("candidates", {
+      orgId,
+      sourceId: args.sourceId,
+      runId: args.runId,
+      dedupeHash: args.dedupeHash,
+      contractVersion: CANDIDATE_CONTRACT_VERSION,
+      candidate: checked.value,
+    });
+  },
+});

@@ -16,6 +16,8 @@ import type * as projections_build from "../projections/build.js";
 import type * as projections_identity from "../projections/identity.js";
 import type * as projections_queries from "../projections/queries.js";
 import type * as projections_resolve from "../projections/resolve.js";
+import type * as sources_contract from "../sources/contract.js";
+import type * as sources_mutations from "../sources/mutations.js";
 
 import type {
   ApiFromModules,
@@ -32,6 +34,8 @@ declare const fullApi: ApiFromModules<{
   "projections/identity": typeof projections_identity;
   "projections/queries": typeof projections_queries;
   "projections/resolve": typeof projections_resolve;
+  "sources/contract": typeof sources_contract;
+  "sources/mutations": typeof sources_mutations;
 }>;
 
 /**

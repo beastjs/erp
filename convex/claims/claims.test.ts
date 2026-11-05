@@ -22,7 +22,7 @@ beforeEach(async () => {
   const seeded = await raw.run(async (ctx) => {
     const orgId = await ctx.db.insert("orgs", { name: "Org 1", createdAt: 0 });
     const other = await ctx.db.insert("orgs", { name: "Org 2", createdAt: 0 });
-    const source = await ctx.db.insert("sources", { orgId, key: "web", trustWeight: 1 });
+    const source = await ctx.db.insert("sources", { orgId, key: "web", kind: "crawler", trustWeight: 1, lawfulBasis: "legitimate_interest" });
     const account = await ctx.db.insert("accounts", { orgId, fields: [], display: {} });
     const contact = await ctx.db.insert("contacts", { orgId, fields: [], display: {} });
     return { orgId, other, source, account, contact };
@@ -113,7 +113,7 @@ test("claims are isolated by org", async () => {
 
 test("appendClaim rejects a source from another org", async () => {
   const foreign = await raw.run(async (ctx) =>
-    ctx.db.insert("sources", { orgId: otherOrgId, key: "x", trustWeight: 1 }),
+    ctx.db.insert("sources", { orgId: otherOrgId, key: "x", kind: "crawler", trustWeight: 1, lawfulBasis: "legitimate_interest" }),
   );
   await expect(
     t.mutation(api.claims.mutations.appendClaim, { ...observedDomainClaim(), sourceId: foreign }),

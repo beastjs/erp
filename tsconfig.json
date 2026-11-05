@@ -28,6 +28,6 @@
     "rsbuild.config.ts"
   ],
   "tsrx": {
-    "compiler": "octane"
+    "compiler": "octane/compiler/volar"
   }
 }

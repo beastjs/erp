@@ -4,6 +4,7 @@ import { beforeEach, expect, test } from "vitest";
 import { api } from "../_generated/api";
 import type { Id } from "../_generated/dataModel";
 import schema from "../schema";
+import { MAX_CLAIMS } from "./queries";
 
 const modules = import.meta.glob("/convex/**/*.ts");
 
@@ -11,6 +12,7 @@ let t: ReturnType<ReturnType<typeof convexTest>["withIdentity"]>;
 let raw: ReturnType<typeof convexTest>;
 let sourceId: Id<"sources">;
 let otherOrgId: Id<"orgs">;
+let orgId: Id<"orgs">;
 
 const subject = { subjectType: "account" as const, subjectId: "acct-1" };
 
@@ -24,6 +26,7 @@ beforeEach(async () => {
   });
   sourceId = seeded.source;
   otherOrgId = seeded.other;
+  orgId = seeded.orgId;
   t = raw.withIdentity({ subject: "u1", orgId: seeded.orgId });
 });
 
@@ -44,7 +47,7 @@ test("appendClaim stores a claim with its orgId", async () => {
   const claims = await t.query(api.claims.queries.claimsForSubject, subject);
   expect(claims).toHaveLength(1);
   expect(claims[0]._id).toBe(id);
-  expect(claims[0].orgId).toBe((await getClaim(id))!.orgId);
+  expect(claims[0].orgId).toBe(orgId);
   expect(claims[0].value).toBe("acme.com");
 });
 
@@ -110,4 +113,26 @@ test("appendClaim rejects a source from another org", async () => {
   await expect(
     t.mutation(api.claims.mutations.appendClaim, { ...observedDomainClaim(), sourceId: foreign }),
   ).rejects.toThrow("source");
+});
+
+test("reads throw instead of truncating when a subject exceeds MAX_CLAIMS", async () => {
+  await raw.run(async (ctx) => {
+    for (let i = 0; i <= MAX_CLAIMS; i++) {
+      await ctx.db.insert("claims", {
+        orgId,
+        ...subject,
+        field: "domain",
+        value: `d${i}.com`,
+        sourceId,
+        method: "observed",
+        confidence: 0.9,
+        observedAt: i,
+      });
+    }
+  });
+  const limit = new RegExp(`limit ${MAX_CLAIMS}`);
+  await expect(t.query(api.claims.queries.claimsForSubject, subject)).rejects.toThrow(limit);
+  await expect(
+    t.query(api.claims.queries.claimsForField, { ...subject, field: "domain" }),
+  ).rejects.toThrow(limit);
 });

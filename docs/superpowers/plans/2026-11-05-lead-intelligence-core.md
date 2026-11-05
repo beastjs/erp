@@ -74,8 +74,8 @@ Expected: FAIL — module not found
 
 - [ ] **Step 5: Run test and typecheck**
 
-Run: `bun run test convex/_shared/org.test.ts && bun run typecheck`
-Expected: PASS, no type errors
+Run: `bun run check:core`
+Expected: PASS, no type errors (this replaces `bun run typecheck`, which is excluded by the Global Constraints)
 
 - [ ] **Step 6: Commit**
 

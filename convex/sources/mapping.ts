@@ -1,6 +1,13 @@
 import { ACQUISITION_STRING_FIELDS, COMPANY_STRING_FIELDS, PERSON_STRING_FIELDS, validateCandidate } from "./contract";
 import type { NormalizedCandidate } from "./contract";
 
+/**
+ * A parser that meets a cell it cannot turn into a trustworthy string (an impossible date, a formula
+ * with no cached value, an Excel error) emits this prefix plus the reason instead of a value. The
+ * row is then rejected with that reason, rather than the file failing or a wrong value slipping in.
+ */
+export const CELL_ERROR_PREFIX = "#cell_error: ";
+
 export type ColumnPair = { column: string; target: string };
 
 /** Every target a column may map to: `block.field` for each field the contract defines. */
@@ -55,6 +62,10 @@ export function rowToCandidate(
   for (const { column, target } of pairs) {
     const text = (row[column] ?? "").trim();
     if (text === "") continue;
+    if (text.startsWith(CELL_ERROR_PREFIX)) {
+      errors.push(`${target}: ${text.slice(CELL_ERROR_PREFIX.length)} (column "${column}")`);
+      continue;
+    }
     const [block, field] = target.split(".") as ["person" | "company" | "acquisition", string];
     if (target === "company.techStack") {
       blocks.company.techStack = text.split(/[,;|]/).map((s) => s.trim()).filter(Boolean);

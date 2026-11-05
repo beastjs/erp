@@ -1,11 +1,11 @@
 import { strToU8, zipSync } from "fflate";
 import { expect, test } from "vitest";
 import { parseCsv } from "./csv";
-import { rowToCandidate } from "./mapping";
+import { CELL_ERROR_PREFIX, rowToCandidate } from "./mapping";
 import { MAX_XLSX_COLUMNS, MAX_XLSX_INFLATED_BYTES, parseXlsx, sniffFormat } from "./xlsx";
 
 const b64 = (s: string) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
-const parse = (bytes: Uint8Array, extra: { sheet?: string; maxRows?: number; maxInflatedBytes?: number } = {}) =>
+const parse = (bytes: Uint8Array, extra: { sheet?: string; maxRows?: number; maxInflatedBytes?: number; columns?: string[] } = {}) =>
   parseXlsx(bytes, { maxRows: 1000, ...extra });
 const message = (fn: () => unknown): string => {
   try {
@@ -61,10 +61,12 @@ test("the 1904 date system is honoured", () => {
   expect(parse(b64(FX_B_1904))).toEqual({ headers: ["When"], rows: [["2024-03-05"]] });
 });
 
-test("a formula that was never calculated (openpyxl writes no cached value) is refused by name and cell", () => {
-  expect(message(() => parse(b64(FX_B_FORMULA)))).toBe(
-    "uncached_formula: cell B2 has a formula but no cached value; open and re-save the workbook in Excel, or export CSV",
-  );
+const UNCACHED = `${CELL_ERROR_PREFIX}uncached_formula: cell B2 has a formula but no cached value; open and re-save the workbook in Excel, or export CSV`;
+
+test("a formula that was never calculated (openpyxl writes no cached value) rejects that cell, not the file", () => {
+  expect(parse(b64(FX_B_FORMULA))).toEqual({ headers: ["A", "B"], rows: [["1", UNCACHED]] });
+  // ...and is not even looked at when its column is not one the caller reads.
+  expect(parse(b64(FX_B_FORMULA), { columns: ["A"] })).toEqual({ headers: ["A", "B"], rows: [["1"]] });
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -160,13 +162,12 @@ test("date detection is by number format, and conversion honours Excel's epoch r
   expect(cellOf("1.5", { id: 167, code: "[h]:mm:ss" })).toBe("36:00:00");
 });
 
-test("a date-formatted cell that is not a real date fails closed instead of emitting a bare number", () => {
-  // The mapper would read "60" as epoch milliseconds, so these must not reach it as plain digits.
-  const bad = "invalid_date: cell A2 holds ";
-  expect(message(() => cellOf("60", { id: 14 }))).toBe(`${bad}60, which is not a real calendar date (Excel serial 60 is its fictional 1900-02-29)`);
-  expect(message(() => cellOf("0", { id: 14 }))).toMatch(/^invalid_date: cell A2 holds 0,/);
-  expect(message(() => cellOf("-5", { id: 14 }))).toMatch(/^invalid_date: /);
-  expect(message(() => cellOf("2958466", { id: 14 }))).toMatch(/^invalid_date: /);
+test("a date-formatted cell that is not a real date becomes a row-rejecting marker, never a bare number", () => {
+  // The mapper would read "60" as epoch milliseconds, so the value must not reach it as plain digits.
+  expect(cellOf("60", { id: 14 })).toBe(
+    `${CELL_ERROR_PREFIX}invalid_date: cell A2 holds 60, which is not a real calendar date (Excel serial 60 is its fictional 1900-02-29)`,
+  );
+  for (const bad of ["0", "-5", "2958466"]) expect(cellOf(bad, { id: 14 })).toMatch(/^#cell_error: invalid_date: cell A2 holds /);
 });
 
 test("an Excel date reaches the candidate as the right epoch milliseconds", () => {
@@ -187,8 +188,8 @@ test("formulas yield the cached value; text formulas may cache an empty string",
   expect(cell('<c r="A2"><f>1+6</f><v>7</v></c>')).toEqual([["7"]]);
   expect(cell('<c r="A2" t="str"><f>"h"&amp;"i"</f><v>hi</v></c>')).toEqual([["hi"]]);
   expect(cell('<c r="A2" t="str"><f>""</f><v></v></c><c r="B2"><v>1</v></c>')).toEqual([["", "1"]]);
-  expect(message(() => cell('<c r="A2"><f>1+6</f></c>'))).toMatch(/^uncached_formula: cell A2 /);
-  expect(message(() => cell('<c r="A2"><f>1+6</f><v/></c>'))).toMatch(/^uncached_formula: cell A2 /);
+  expect(cell('<c r="A2"><f>1+6</f></c>')[0]![0]).toMatch(/^#cell_error: uncached_formula: cell A2 /);
+  expect(cell('<c r="A2"><f>1+6</f><v/></c>')[0]![0]).toMatch(/^#cell_error: uncached_formula: cell A2 /);
 });
 
 test("cell types: shared and inline strings, escapes, phonetic runs, booleans, errors, ISO dates", () => {
@@ -209,7 +210,7 @@ test("cell types: shared and inline strings, escapes, phonetic runs, booleans, e
       strings: ["H", "a &amp; b &#65; &#x42; &lt;x&gt; _x000D_ _x005F_x0041_", "kanji<rPh sb=\"0\" eb=\"1\"><t>ignored</t></rPh>", "  padded  ", "h1", "h2", "h3", "h4", "h5", "h6", "h7"],
     }),
   );
-  expect(out.rows).toEqual([["a & b A B <x> \r _x0041_", "kanji", "in line", "FALSE", "#N/A", "2024-03-05T10:00:00Z", "  padded  "]]);
+  expect(out.rows).toEqual([["a & b A B <x> \r _x0041_", "kanji", "in line", "FALSE", `${CELL_ERROR_PREFIX}error_value: cell E2 holds the Excel error #N/A`, "2024-03-05T10:00:00Z", "  padded  "]]);
   expect(message(() => parse(book({ sheet: row(1, s("A1", 0)) + row(2, s("A2", 9)), strings: ["H"] })))).toBe(
     "corrupt_workbook: cell A2 points at missing shared string 9",
   );
@@ -379,4 +380,61 @@ test("an entry whose inflated length disagrees with the directory is corrupt, no
   const z = book({ sheet: row(1, s("A1", 0)), strings: ["H"] });
   const wb = new TextEncoder().encode(`<workbook ${NS}><sheets><sheet name="S" sheetId="1" r:id="rId1"/></sheets></workbook>`).length;
   expect(message(() => parse(declareSize(z, "xl/workbook.xml", wb - 1)))).toBe(`corrupt_archive: xl/workbook.xml inflated to ${wb} bytes, directory says ${wb - 1}`);
+});
+
+// ------------------------------------------------------------------ a bad cell is data, not an exception
+
+/** Header Name | Email | Notes | When; row 2 has a good name and email, a typo'd date (serial 60) in When and an error value in Notes. */
+const badCells = () =>
+  book({
+    strings: ["Name", "Email", "Notes", "When", "Ann", "ann@x.com"],
+    styles: styles({ id: 14 }),
+    sheet:
+      row(1, s("A1", 0) + s("B1", 1) + s("C1", 2) + s("D1", 3)) +
+      row(2, s("A2", 4) + s("B2", 5) + '<c r="C2" t="e"><v>#N/A</v></c>' + n("D2", "60", 1)) +
+      row(3, s("A3", 4) + s("B3", 5) + '<c r="C3" t="str"><f>x</f><v>ok</v></c>' + n("D3", "45658", 1)),
+  });
+const D_ERR = `${CELL_ERROR_PREFIX}invalid_date: cell D2 holds 60, which is not a real calendar date (Excel serial 60 is its fictional 1900-02-29)`;
+
+test("only mapped columns are interpreted: bad cells elsewhere cannot touch the import", () => {
+  expect(parse(badCells(), { columns: ["Name", "Email"] })).toEqual({
+    headers: ["Name", "Email", "Notes", "When"],
+    rows: [["Ann", "ann@x.com"], ["Ann", "ann@x.com"]],
+  });
+  // Mapped, the same cells become markers (exact text), and the good row beside them is untouched.
+  expect(parse(badCells(), { columns: ["Name", "When"] }).rows).toEqual([["Ann", "", "", D_ERR], ["Ann", "", "", "2025-01-01"]]);
+});
+
+test("unmapped columns still count as data, so row numbers and blank-row handling match the CSV reading", () => {
+  const z = book({
+    strings: ["Name", "Notes", "Ann", "only a note"],
+    sheet: row(1, s("A1", 0) + s("B1", 1)) + row(2, s("A2", 2)) + row(3, s("B3", 3)) + row(4, ""),
+  });
+  expect(parse(z, { columns: ["Name"] }).rows).toEqual([["Ann"], []]); // row 3 has data only in an unmapped column: kept, as in CSV
+  expect(parse(z).rows).toEqual([["Ann"], ["", "only a note"]]);
+});
+
+test("data beyond the column cap in an unmapped column is still the file's problem", () => {
+  const z = book({ strings: ["Name"], sheet: row(1, s("A1", 0)) + row(2, '<c r="AMK2"><v>1</v></c>') });
+  expect(message(() => parse(z, { columns: ["Name"] }))).toBe(`too_many_columns: data beyond column ${MAX_XLSX_COLUMNS} (cell AMK2)`);
+});
+
+test("a marker rejects its row with a reason naming the cell, for any target, and never imports a value", () => {
+  const { headers, rows } = parse(badCells(), { columns: ["Name", "Email", "Notes", "When"] });
+  const rec = (r: string[]) => Object.fromEntries(headers.map((h, i) => [h, r[i] ?? ""]));
+  const pairs = [
+    { column: "Name", target: "person.fullName" },
+    { column: "Email", target: "person.email" },
+    { column: "Notes", target: "person.jobTitle" }, // a text target: "#N/A" as plain text would have been accepted
+    { column: "When", target: "acquisition.acquiredAt" },
+  ];
+  const bad = rowToCandidate(rec(rows[0]!), pairs, 0);
+  expect(bad).toEqual({
+    ok: false,
+    errors: [
+      `person.jobTitle: error_value: cell C2 holds the Excel error #N/A (column "Notes")`,
+      `acquisition.acquiredAt: invalid_date: cell D2 holds 60, which is not a real calendar date (Excel serial 60 is its fictional 1900-02-29) (column "When")`,
+    ],
+  });
+  expect(rowToCandidate(rec(rows[1]!), pairs, 0)).toMatchObject({ ok: true, candidate: { acquisition: { acquiredAt: Date.UTC(2025, 0, 1) } } });
 });

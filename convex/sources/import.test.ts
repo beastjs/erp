@@ -702,3 +702,27 @@ test("importCsv accepts a named sheet from a multi-sheet workbook", async () => 
   });
   expect(out).toEqual({ rows: 1, chunks: 1 });
 });
+
+test("a bad cell in a mapped column rejects that row only; a bad cell in an unmapped column is never read", () =>
+  withFakeTimers(async () => {
+    const withDate = await t.mutation(api.sources.import.saveMapping, { name: "dated2", columns: { ...COLUMNS, Acquired: "acquisition.acquiredAt" } });
+    // Row 0: serial 60 (Excel's fictional 1900-02-29) in the MAPPED date column. Row 1: fine. The Notes column is unmapped and holds an error value.
+    const table = [[...XLSX_HEAD, "Acquired"], ["a.com", "A", "a@a.com", "Ann", "Eng", "60"], ["b.com", "B", "b@b.com", "Bob", "Eng", "45658"]];
+    await t.action(api.sources.import.importCsv, { runId, mappingId: withDate, storageId: await storeBytes(xlsxOf(table, { dateCol: 5 })) });
+    await drain();
+    expect(await getRun()).toMatchObject({ status: "completed", rowsProcessed: 2, candidatesInserted: 1, rowsRejected: 1 });
+    const rejections = await t.query(api.runs.queries.rejectionsForRun, { runId });
+    expect(rejections).toHaveLength(1);
+    expect(rejections[0]!.row).toBe(0);
+    expect(rejections[0]!.errors).toEqual([
+      'acquisition.acquiredAt: invalid_date: cell F2 holds 60, which is not a real calendar date (Excel serial 60 is its fictional 1900-02-29) (column "Acquired")',
+    ]);
+  }));
+
+test("the same bad date in a column the mapping does not use imports cleanly", () =>
+  withFakeTimers(async () => {
+    const table = [[...XLSX_HEAD, "Acquired"], ["a.com", "A", "a@a.com", "Ann", "Eng", "60"]];
+    await t.action(api.sources.import.importCsv, { runId, mappingId, storageId: await storeBytes(xlsxOf(table, { dateCol: 5 })) });
+    await drain();
+    expect(await getRun()).toMatchObject({ status: "completed", candidatesInserted: 1, rowsRejected: 0 });
+  }));

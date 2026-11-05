@@ -1,4 +1,5 @@
 import { Inflate } from "fflate";
+import { CELL_ERROR_PREFIX } from "./mapping";
 
 /**
  * .xlsx reader for the import seam. Produces exactly what `parseCsv` produces (`{ headers, rows }` of
@@ -6,7 +7,12 @@ import { Inflate } from "fflate";
  * tested without a deployment, and every failure is a named error, never a truncated dataset:
  * `not_xlsx`, `corrupt_archive`, `archive_too_large`, `too_many_rows`, `too_many_columns`,
  * `element_too_large`, `corrupt_workbook`, `ambiguous_sheet`, `sheet_not_found`, `not_a_worksheet`,
- * `empty_file`, `duplicate_headers`, `invalid_date`, `uncached_formula`.
+ * `empty_file`, `duplicate_headers`. These are properties of the file and fail the whole import.
+ *
+ * A bad CELL is not a bad file. An impossible date, a formula with no cached value or an Excel error
+ * value becomes `CELL_ERROR_PREFIX + reason` in that cell, which the mapper turns into a rejection of
+ * that one row (the reason names the cell). With `opts.columns` only the mapped columns' cells are
+ * examined at all, so a typo in a column nobody imports cannot touch the import.
  *
  * DECOMPRESSION BOUND. An .xlsx is a zip, so the stored-size check on the upload says nothing about
  * what it inflates to. Every byte inflated for any part counts against one shared budget
@@ -22,7 +28,14 @@ import { Inflate } from "fflate";
  * mishandles data descriptors, and because we need the central directory's sizes up front.
  */
 
-/** Total bytes inflated across every part read (workbook, rels, styles, shared strings, the sheet). 64 MiB. */
+/**
+ * Total bytes inflated across every part read (workbook, rels, styles, shared strings, the sheet). 64 MiB.
+ *
+ * INTERACTION WITH THE ROW CAP: cell XML is ~30 bytes per cell, so 200,000 rows (MAX_IMPORT_ROWS)
+ * x ~20 columns is ~120 MB inflated. On anything but a narrow sheet (roughly 10 columns or fewer) this
+ * budget fires (`archive_too_large`) before the row cap does. Both errors are named and tell the
+ * caller to split the file or export CSV; 200,000 rows is only reachable for narrow sheets.
+ */
 export const MAX_XLSX_INFLATED_BYTES = 64 * 1024 * 1024;
 /** A sane workbook has tens of entries; a zip with more is hostile or not a workbook. */
 const MAX_ENTRIES = 5_000;
@@ -52,6 +65,8 @@ export function sniffFormat(head: Uint8Array): SniffedFormat {
 export type XlsxOptions = {
   /** Rows beyond this (data rows, header excluded) throw `too_many_rows` as soon as they are seen. */
   maxRows: number;
+  /** Header names the caller will read. When given, cells in other columns are never interpreted. */
+  columns?: readonly string[];
   /** Sheet to import. Required when the workbook has more than one visible sheet. */
   sheet?: string;
   /** Test seam; production uses MAX_XLSX_INFLATED_BYTES. */
@@ -373,6 +388,9 @@ function applyDigitMask(digits: string, code: string): string {
   return out.join("");
 }
 
+/** A problem with one cell's content (as opposed to the file's structure). Caught per cell and emitted as a row-rejecting marker. */
+class CellError extends Error {}
+
 const DAY_MS = 86_400_000;
 
 function toIso(serial: number, date1904: boolean, where: string): string {
@@ -389,7 +407,7 @@ function toIso(serial: number, date1904: boolean, where: string): string {
   } else if (days >= 61 && days <= 2958465) unixDays = days - 25569;
   else if (days >= 1 && days <= 59) unixDays = days - 25568;
   if (!Number.isFinite(serial) || Number.isNaN(unixDays)) {
-    throw new Error(`invalid_date: ${where} holds ${serial}, which is not a real calendar date (Excel serial 60 is its fictional 1900-02-29)`);
+    throw new CellError(`invalid_date: ${where} holds ${serial}, which is not a real calendar date (Excel serial 60 is its fictional 1900-02-29)`);
   }
   const d = new Date(unixDays * DAY_MS);
   const day = d.toISOString().slice(0, 10);
@@ -549,7 +567,7 @@ export function parseXlsx(bytes: Uint8Array, opts: XlsxOptions): { headers: stri
     // A numeric formula result is never empty, so no <v> (or an empty one, as openpyxl writes) means it was never calculated.
     // A text formula (t="str") may legitimately cache "".
     if (/<f[\s>/]/.test(inner) && (v === undefined || (t === "n" && v.trim() === ""))) {
-      throw new Error(`uncached_formula: ${where} has a formula but no cached value; open and re-save the workbook in Excel, or export CSV`);
+      throw new CellError(`uncached_formula: ${where} has a formula but no cached value; open and re-save the workbook in Excel, or export CSV`);
     }
     if (v === undefined) return "";
     if (t === "s") {
@@ -558,7 +576,7 @@ export function parseXlsx(bytes: Uint8Array, opts: XlsxOptions): { headers: stri
       return s;
     }
     if (t === "str") return unescapeXml(v);
-    if (t === "e") return unescapeXml(v);
+    if (t === "e") throw new CellError(`error_value: ${where} holds the Excel error ${unescapeXml(v)}`);
     if (t === "d") return unescapeXml(v).trim();
     if (t === "b") return v.trim() === "1" ? "TRUE" : "FALSE";
     if (v.trim() === "") return "";
@@ -569,21 +587,40 @@ export function parseXlsx(bytes: Uint8Array, opts: XlsxOptions): { headers: stri
     return fmt?.code !== undefined && !text.startsWith("-") ? applyDigitMask(text, fmt.code) : text;
   };
 
+  const wanted = opts.columns ? new Set(opts.columns) : null;
+  let mappedCols: Set<number> | null = null; // column positions to interpret; null = all (header row, or no `columns` given)
   const onRow = (rowXml: string) => {
     const cells: string[] = [];
+    let sawUnmappedData = false;
     let cursor = -1;
     for (const m of rowXml.slice(openTag(rowXml).length).matchAll(/<c\b([^>]*?)(?:\/>|>([\s\S]*?)<\/c>)/g)) {
       const a = attrs(`<c${m[1]!}>`);
       const col = a.r ? colIndex(a.r) : cursor + 1;
       cursor = col;
       if (m[2] === undefined) continue;
-      const value = cellValue(`<c${m[1]!}>${m[2]}`, a, `cell ${a.r ?? `#${col + 1}`}`);
+      if (mappedCols && !mappedCols.has(col)) {
+        // Not a column the caller reads: never interpreted, so it cannot fail anything. It still counts as
+        // data for blank-row detection, so row numbers agree with the CSV reading of the same table.
+        if (/<v(?:\s[^>]*)?>[^<]|<is[\s>]/.test(m[2])) {
+          if (col < 0 || col >= MAX_XLSX_COLUMNS) throw new Error(`too_many_columns: data beyond column ${MAX_XLSX_COLUMNS} (cell ${a.r ?? col + 1})`);
+          sawUnmappedData = true;
+        }
+        continue;
+      }
+      const where = `cell ${a.r ?? `#${col + 1}`}`;
+      let value: string;
+      try {
+        value = cellValue(`<c${m[1]!}>${m[2]}`, a, where);
+      } catch (err) {
+        if (!(err instanceof CellError)) throw err;
+        value = CELL_ERROR_PREFIX + err.message;
+      }
       if (value === "") continue;
       if (col < 0 || col >= MAX_XLSX_COLUMNS) throw new Error(`too_many_columns: data beyond column ${MAX_XLSX_COLUMNS} (cell ${a.r ?? col + 1})`);
       cells[col] = value;
     }
     const full = Array.from(cells, (c) => c ?? ""); // Array.from fills holes with undefined
-    if (full.every((c) => c.trim() === "")) return; // a blank row is not a record, as a blank line is not in CSV
+    if (!sawUnmappedData && full.every((c) => c.trim() === "")) return; // a blank row is not a record, as a blank line is not in CSV
     if (headers === null) {
       const h = full.map((c) => c.trim());
       while (h.length > 0 && h[h.length - 1] === "") h.pop();
@@ -596,6 +633,7 @@ export function parseXlsx(bytes: Uint8Array, opts: XlsxOptions): { headers: stri
       }
       if (dupes.size > 0) throw new Error(`duplicate_headers: ${[...dupes].join(", ")}`);
       headers = h;
+      if (wanted) mappedCols = new Set(h.flatMap((name, i) => (wanted.has(name) ? [i] : [])));
       return;
     }
     if (rows.length >= opts.maxRows) {

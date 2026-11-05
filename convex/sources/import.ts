@@ -278,6 +278,12 @@ export const importCsv = action({
     if (blob.size > MAX_IMPORT_BYTES) {
       throw new Error(`file_too_large: ${blob.size} bytes exceeds the ${MAX_IMPORT_BYTES} byte import limit; split the file`);
     }
+    // getMapping is authorized by the caller's identity, so its orgId is the identity-derived org that
+    // the internal staging functions below receive.
+    const mapping = await ctx.runQuery(api.sources.import.getMapping, { mappingId: args.mappingId });
+    const orgId = mapping.orgId;
+    const errors = validateMapping(mapping.columns);
+    if (errors.length > 0) throw new Error(`invalid mapping: ${errors.join("; ")}`);
     // The format comes from the bytes, not the file name. The size check above bounds the UPLOAD only:
     // an .xlsx is a zip, so parseXlsx bounds what it inflates and how many rows it builds as it goes.
     const format = sniffFormat(new Uint8Array(await blob.slice(0, 8).arrayBuffer()));
@@ -287,17 +293,11 @@ export const importCsv = action({
     if (format === "csv" && args.sheet !== undefined) throw new Error("sheet_not_applicable: a sheet name only applies to .xlsx files");
     const { headers, rows } =
       format === "xlsx"
-        ? parseXlsx(new Uint8Array(await blob.arrayBuffer()), { sheet: args.sheet, maxRows: MAX_IMPORT_ROWS })
+        ? parseXlsx(new Uint8Array(await blob.arrayBuffer()), { sheet: args.sheet, maxRows: MAX_IMPORT_ROWS, columns: mapping.columns.map((c) => c.column) })
         : parseCsv(await blob.text());
     if (rows.length > MAX_IMPORT_ROWS) {
       throw new Error(`too_many_rows: ${rows.length} rows exceeds the ${MAX_IMPORT_ROWS} row import limit; split the file`);
     }
-    // getMapping is authorized by the caller's identity, so its orgId is the identity-derived org that
-    // the internal staging functions below receive.
-    const mapping = await ctx.runQuery(api.sources.import.getMapping, { mappingId: args.mappingId });
-    const orgId = mapping.orgId;
-    const errors = validateMapping(mapping.columns);
-    if (errors.length > 0) throw new Error(`invalid mapping: ${errors.join("; ")}`);
     const absent = mapping.columns.filter((c) => !headers.includes(c.column)).map((c) => c.column);
     if (absent.length > 0) throw new Error(`missing_columns: ${absent.join(", ")}`);
 

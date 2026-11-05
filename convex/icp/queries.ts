@@ -36,7 +36,11 @@ export async function activeIcp(ctx: QueryCtx, args: object): Promise<IcpDefinit
   return row;
 }
 
-/** The org's current model, or the built-in v1 defaults when it has not created one. Never a partial config. */
-export async function activeScoringConfig(ctx: QueryCtx, args: object): Promise<ScoringConfig> {
+/**
+ * READ-ONLY convenience: the org's current model, or the built-in defaults when it has none. The
+ * defaults have no row and therefore no id, so NOTHING DERIVED FROM THIS MAY BACK A scoreRun. Scoring
+ * must use `ensureActiveScoringModel` (mutations.ts), which returns a real, citable row.
+ */
+export async function scoringConfigForRead(ctx: QueryCtx, args: object): Promise<ScoringConfig> {
   return (await latestScoringModel(ctx, args)) ?? DEFAULT_SCORING_MODEL;
 }

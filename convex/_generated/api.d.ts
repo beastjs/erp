@@ -15,6 +15,7 @@ import type * as claims_queries from "../claims/queries.js";
 import type * as icp_defaults from "../icp/defaults.js";
 import type * as icp_mutations from "../icp/mutations.js";
 import type * as icp_queries from "../icp/queries.js";
+import type * as icp_tier from "../icp/tier.js";
 import type * as icp_validate from "../icp/validate.js";
 import type * as projections_build from "../projections/build.js";
 import type * as projections_identity from "../projections/identity.js";
@@ -45,6 +46,7 @@ declare const fullApi: ApiFromModules<{
   "icp/defaults": typeof icp_defaults;
   "icp/mutations": typeof icp_mutations;
   "icp/queries": typeof icp_queries;
+  "icp/tier": typeof icp_tier;
   "icp/validate": typeof icp_validate;
   "projections/build": typeof projections_build;
   "projections/identity": typeof projections_identity;

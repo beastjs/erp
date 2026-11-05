@@ -1,8 +1,9 @@
 import type { Id } from "../_generated/dataModel";
 import type { MutationCtx } from "../_generated/server";
 import { withOrg } from "../_shared/org";
+import { DEFAULT_SCORING_MODEL } from "./defaults";
 import { latestIcp, latestScoringModel } from "./queries";
-import type { IcpCriteria, ScoringConfig } from "./schema";
+import type { IcpCriteria, ScoringConfig, ScoringModel } from "./schema";
 import { validateIcpCriteria, validateScoringConfig } from "./validate";
 
 async function creator(ctx: MutationCtx): Promise<string> {
@@ -70,4 +71,18 @@ export async function createScoringModel(
     createdBy: await creator(ctx),
     activeFrom: Date.now(),
   });
+}
+
+/**
+ * The only model source a score may use. Returns the org's newest model row, first creating version 1
+ * from DEFAULT_SCORING_MODEL if there is none, so a score always cites a real immutable row.
+ * Idempotent: it never creates a second version (the transaction serializes concurrent seeds via OCC).
+ */
+export async function ensureActiveScoringModel(ctx: MutationCtx): Promise<ScoringModel> {
+  const existing = await latestScoringModel(ctx, {});
+  if (existing) return existing;
+  const id = await createScoringModel(ctx, structuredClone(DEFAULT_SCORING_MODEL));
+  const row = await ctx.db.get(id);
+  if (!row) throw new Error("scoring model seed failed");
+  return row;
 }

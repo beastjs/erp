@@ -6,8 +6,9 @@ import type { MutationCtx } from "../_generated/server";
 import { decayedWeight } from "../signals/decay";
 import schema from "../schema";
 import { DEFAULT_SCORING_MODEL } from "./defaults";
-import { createIcpVersion, createScoringModel } from "./mutations";
-import { activeIcp, activeScoringConfig, getIcpVersion, getScoringModel } from "./queries";
+import { createIcpVersion, createScoringModel, ensureActiveScoringModel } from "./mutations";
+import { tierFor } from "./tier";
+import { activeIcp, scoringConfigForRead, getIcpVersion, getScoringModel } from "./queries";
 import type { IcpCriteria, ScoringConfig } from "./schema";
 import { validateScoringConfig } from "./validate";
 
@@ -130,7 +131,7 @@ test("an existing scoreRun still resolves its original model version after a new
   expect(resolved.version).toBe(1);
   expect(resolved.strengthWeights).toEqual(DEFAULT_SCORING_MODEL.strengthWeights);
   // While "active" has moved on, and the same signal decays differently under each.
-  const active = await run((ctx) => activeScoringConfig(ctx, {}));
+  const active = await run((ctx) => scoringConfigForRead(ctx, {}));
   expect(active.strengthWeights.high).toBe(0.5);
   const signal = { strength: "high" as const, observedAt: 0 };
   expect(decayedWeight(signal, 90 * DAY, resolved)).toBe(0.5);
@@ -138,7 +139,7 @@ test("an existing scoreRun still resolves its original model version after a new
 });
 
 test("with no model, the active config is the built-in default", async () => {
-  expect(await run((ctx) => activeScoringConfig(ctx, {}))).toStrictEqual(DEFAULT_SCORING_MODEL);
+  expect(await run((ctx) => scoringConfigForRead(ctx, {}))).toStrictEqual(DEFAULT_SCORING_MODEL);
 });
 
 test("versions form one chain: forks, stale bases and bogus supersedesId are refused", async () => {
@@ -193,4 +194,56 @@ test("no public function can write or delete these tables, and no orgId argument
     expect(src, path).not.toMatch(/db\.(patch|replace|delete)\(/);
     expect(src, path).not.toMatch(/\b(mutation|query|action)\(\{/);
   }
+});
+
+const D = DEFAULT_SCORING_MODEL;
+
+test("tierFor honours half-open band boundaries (confidence 1 so floors never interfere)", () => {
+  const at = (s: number) => tierFor(s, 1, D);
+  expect(at(100)).toBe("S");
+  expect(at(90)).toBe("S");
+  expect(at(89.99)).toBe("A");
+  expect(at(89)).toBe("A");
+  expect(at(80)).toBe("A");
+  expect(at(79.99)).toBe("B");
+  expect(at(70)).toBe("B");
+  expect(at(69.99)).toBe("C");
+  expect(at(60)).toBe("C");
+  expect(at(59.99)).toBe("Reject");
+  expect(at(0)).toBe("Reject");
+});
+
+test("tierFor drops a score that fails its band's confidence floor to the next tier it qualifies for", () => {
+  expect(tierFor(92, 0.8, D)).toBe("S"); // exactly at floor passes
+  expect(tierFor(92, 0.79, D)).toBe("A");
+  expect(tierFor(92, 0.65, D)).toBe("B"); // fails S (.8) and A (.7), meets B (.6)
+  expect(tierFor(92, 0.4, D)).toBe("Reject");
+  expect(tierFor(92, 0, D)).toBe("Reject");
+  expect(tierFor(65, 0.49, D)).toBe("Reject");
+  expect(tierFor(65, 0.5, D)).toBe("C");
+});
+
+test("tierFor fails closed on unusable input with exactly Reject", () => {
+  for (const [s, c] of [[NaN, 1], [90, NaN], [Infinity, 1], [-1, 1], [101, 1], [90, 1.01], [90, -0.1], [90, Infinity]] as const) {
+    expect(tierFor(s, c, D)).toBe("Reject");
+  }
+});
+
+test("ensureActiveScoringModel seeds v1 exactly once and then returns the existing row", async () => {
+  const first = await run((ctx) => ensureActiveScoringModel(ctx));
+  const second = await run((ctx) => ensureActiveScoringModel(ctx));
+  expect(first.version).toBe(1);
+  expect(first.supersedesId).toBeUndefined();
+  expect(second._id).toBe(first._id);
+  expect(first.weights).toEqual(D.weights);
+  expect(await raw.run((ctx) => ctx.db.query("scoringModels").collect())).toHaveLength(1);
+});
+
+test("ensureActiveScoringModel returns the newest existing row rather than creating a version", async () => {
+  const v1 = await run((ctx) => createScoringModel(ctx, model()));
+  const v2 = await run((ctx) => createScoringModel(ctx, { ...model({ weights: { companyFit: 30, contactFit: 20, intent: 50 } }), supersedesId: v1 }));
+  const got = await run((ctx) => ensureActiveScoringModel(ctx));
+  expect(got._id).toBe(v2);
+  expect(got.weights.intent).toBe(50);
+  expect(await raw.run((ctx) => ctx.db.query("scoringModels").collect())).toHaveLength(2);
 });

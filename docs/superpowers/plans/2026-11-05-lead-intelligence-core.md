@@ -20,8 +20,11 @@
 - Claim resolution order: method precedence → source trust weight → `observedAt` recency → confidence → claim id. (Spec §4.2)
 - `claims`, `signals`, `scoreRuns` and `leads` are append-only. No mutation in the codebase may update or delete a row in them, except the erasure redaction in Task 13. (Spec §3.1)
 - Convex actions cannot write; they hand results to mutations. (Spec §2, §4.4)
-- TypeScript `strict`. `bun run check` (typecheck + build) must pass before every commit.
-- Pin the existing toolchain: `octane@0.16.0`, Bun as the runner. Do not upgrade existing dependencies.
+- TypeScript `strict`. **The commit gate is `bun run check:core`** — `tsc --noEmit -p convex && vitest run && rsbuild build` — which must pass before every commit. Task 1 adds that script.
+- **Do not use `bun run check`, and do not try to fix what it reports.** `src/` carries 40 pre-existing type errors: `src/hooks/` imports seven `src/lib/` modules that do not exist (`iconify`, `svg-optimizer`, `image-converter`, `custom-icon-set`, `icon-favorites`, `svg-symbol`, `favorite-icon-import`), plus implicit-`any` fallout and a bad `IconName` import in `src/lib/navs.ts`. They predate this plan, the user has chosen to leave them, and they are out of scope for every task here. `convex/tsconfig.json` already sets `strict: true` and excludes `_generated`, so the new code is still fully checked.
+- Touch nothing under `src/` in any task. This plan adds `convex/` and `package.json` scripts only.
+- Pin the existing toolchain: `octane@0.16.0`, Bun as the runner. Do not upgrade existing dependencies. `convex@^1.49.0` and a scaffolded `convex/_generated/` are already present from a vendor install; Task 1 verifies and keeps them rather than reinstalling.
+- Read `convex/_generated/ai/guidelines.md` before writing any Convex code — the repo's `CLAUDE.md` requires it, and it overrides training-data assumptions about Convex APIs.
 
 ## Review Focus
 
@@ -37,7 +40,7 @@
 
 **Files:**
 - Create: `convex/schema.ts`, `convex/_shared/org.ts`, `vitest.config.ts`
-- Modify: `package.json` (add `convex`, `convex-test`, `vitest`, `@edge-runtime/vm`; add `test` and `test:watch` scripts)
+- Modify: `package.json` (`convex` is already present; add `convex-test`, `vitest`, `@edge-runtime/vm`; add `test`, `test:watch` and `check:core` scripts)
 - Test: `convex/_shared/org.test.ts`
 
 **Interfaces:**
@@ -61,9 +64,9 @@ test("withOrg returns the caller's orgId", async () => {
 Run: `bun run test convex/_shared/org.test.ts`
 Expected: FAIL — module not found
 
-- [ ] **Step 3: Add dependencies and `test` script, create `vitest.config.ts`**
+- [ ] **Step 3: Add dependencies and scripts, create `vitest.config.ts`**
 
-`vitest.config.ts` uses the `edge-runtime` environment, which `convex-test` requires. Add `"test": "vitest run"` and `"test:watch": "vitest"` to `package.json` scripts.
+`vitest.config.ts` uses the `edge-runtime` environment, which `convex-test` requires. Add to `package.json` scripts: `"test": "vitest run"`, `"test:watch": "vitest"`, and `"check:core": "tsc --noEmit -p convex && vitest run && rsbuild build"`. Keep the existing `convex` dependency and the scaffolded `convex/_generated/` as they are.
 
 - [ ] **Step 4: Implement `withOrg(ctx, args): Promise<{ orgId: Id<"orgs"> }>` in `convex/_shared/org.ts` and the `orgs` table in `convex/schema.ts`**
 
@@ -743,7 +746,7 @@ Role matrix per Spec §7.1: `operator` runs discovery and reviews leads; `analys
 
 - [ ] **Step 4: Run the whole suite and the project check**
 
-Run: `bun run test && bun run check`
+Run: `bun run check:core`
 Expected: PASS, no type errors
 
 - [ ] **Step 5: Commit**
@@ -847,7 +850,7 @@ All four are read-only queries over existing tables; add no new tables.
 
 - [ ] **Step 4: Run the whole suite and the project check**
 
-Run: `bun run test && bun run check`
+Run: `bun run check:core`
 Expected: PASS, no type errors
 
 - [ ] **Step 5: Commit**

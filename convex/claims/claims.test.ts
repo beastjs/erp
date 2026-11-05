@@ -3,6 +3,7 @@ import { convexTest } from "convex-test";
 import { beforeEach, expect, test } from "vitest";
 import { api } from "../_generated/api";
 import type { Id } from "../_generated/dataModel";
+import { DEFAULT_SCORING_MODEL } from "../icp/defaults";
 import schema from "../schema";
 import { MAX_CLAIMS } from "./queries";
 
@@ -69,6 +70,20 @@ test("appendClaim clamps confidence to the method ceiling", async () => {
     confidence: 0.9,
   });
   expect((await getClaim(ex))!.confidence).toBe(0.7);
+});
+
+test("appendClaim clamps to the ACTIVE scoring model's ceilings, not a constant", async () => {
+  await raw.run(async (ctx) => {
+    await ctx.db.insert("scoringModels", {
+      ...DEFAULT_SCORING_MODEL,
+      methodCeilings: { observed: 0.9, extracted: 0.4, inferred: 0.2 },
+      orgId, version: 1, createdBy: "u1", activeFrom: 0,
+    });
+  });
+  const inferred = await t.mutation(api.claims.mutations.appendClaim, { ...observedDomainClaim(), method: "inferred", confidence: 0.9 });
+  expect((await getClaim(inferred))!.confidence).toBe(0.2);
+  const observed = await t.mutation(api.claims.mutations.appendClaim, { ...observedDomainClaim(), method: "observed", confidence: 1 });
+  expect((await getClaim(observed))!.confidence).toBe(0.9);
 });
 
 test("appendClaim rejects confidence outside 0..1", async () => {

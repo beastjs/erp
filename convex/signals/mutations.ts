@@ -1,6 +1,7 @@
 import type { Id } from "../_generated/dataModel";
 import type { MutationCtx, QueryCtx } from "../_generated/server";
 import { withOrg } from "../_shared/org";
+import { activeScoringConfig, getScoringModel } from "../icp/queries";
 import type { SubjectType } from "../claims/schema";
 import { decayedWeight, signalContribution } from "./decay";
 import type { Signal, SignalStrength } from "./schema";
@@ -78,11 +79,13 @@ export async function appendSignal(ctx: MutationCtx, args: AppendSignalArgs): Pr
  */
 export async function activeSignals(
   ctx: QueryCtx,
-  args: { subjectType: SubjectType; subjectId: string; now: number },
+  args: { subjectType: SubjectType; subjectId: string; now: number; scoringModelId?: Id<"scoringModels"> },
 ): Promise<Array<Signal & { weight: number; contribution: number }>> {
   const { orgId } = await withOrg(ctx, args);
   const subjectId = canonicalSubject(ctx, args.subjectType, args.subjectId);
   if (!subjectId) return [];
+  // Decay runs under a model: the one a caller names (to reproduce a historical score), else the active one.
+  const params = args.scoringModelId ? await getScoringModel(ctx, { id: args.scoringModelId }) : await activeScoringConfig(ctx, args);
   const rows = await ctx.db
     .query("signals")
     .withIndex("by_subject_observed", (q) =>
@@ -98,6 +101,6 @@ export async function activeSignals(
     );
   }
   return rows
-    .map((s) => ({ ...s, weight: decayedWeight(s, args.now), contribution: signalContribution(s, args.now) }))
+    .map((s) => ({ ...s, weight: decayedWeight(s, args.now, params), contribution: signalContribution(s, args.now, params) }))
     .filter((s) => s.weight > 0);
 }

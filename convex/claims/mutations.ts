@@ -2,14 +2,8 @@ import { v } from "convex/values";
 import type { Id } from "../_generated/dataModel";
 import { mutation, type MutationCtx } from "../_generated/server";
 import { withOrg } from "../_shared/org";
+import { activeScoringConfig } from "../icp/queries";
 import { claimMethod, subjectType, type ClaimMethod, type SubjectType } from "./schema";
-
-/** Highest confidence a claim of each method may carry. Task 9 moves this to scoring-model config. */
-export const METHOD_CEILINGS: Record<ClaimMethod, number> = {
-  observed: 1.0,
-  extracted: 0.7,
-  inferred: 0.5,
-};
 
 export type AppendClaimArgs = {
   subjectType: SubjectType;
@@ -47,11 +41,15 @@ export async function appendClaimRecord(ctx: MutationCtx, args: AppendClaimArgs)
     const run = await ctx.db.get(args.runId);
     if (!run || run.orgId !== orgId) throw new Error("run not found");
   }
+  // Ceilings are scoring-model config (spec 5.3). The clamped value is what is stored, so a later model
+  // change never rewrites history; it only governs claims appended from then on.
+  const ceiling = (await activeScoringConfig(ctx, args)).methodCeilings[args.method];
+  if (!(ceiling > 0 && ceiling <= 1)) throw new Error("invalid method ceiling");
   return await ctx.db.insert("claims", {
     ...args,
     subjectId,
     orgId,
-    confidence: Math.min(args.confidence, METHOD_CEILINGS[args.method]),
+    confidence: Math.min(args.confidence, ceiling),
   });
 }
 

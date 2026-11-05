@@ -11,29 +11,41 @@ let raw: ReturnType<typeof convexTest>;
 let t: ReturnType<ReturnType<typeof convexTest>["withIdentity"]>;
 let orgId: Id<"orgs">;
 let sourceId: Id<"sources">;
+let icpVersionId: Id<"icpDefinitions">;
+const criteria = { industries: [], geographies: [], technologies: [], decisionMakerRoles: [] };
 
 beforeEach(async () => {
   raw = convexTest(schema, modules);
   const seeded = await raw.run(async (ctx) => {
     const orgId = await ctx.db.insert("orgs", { name: "Org 1", createdAt: 0 });
     const sourceId = await ctx.db.insert("sources", { orgId, key: "csv", kind: "csv", trustWeight: 0.8, lawfulBasis: "consent" });
-    return { orgId, sourceId };
+    const icpVersionId = await ctx.db.insert("icpDefinitions", { orgId, version: 1, name: "v1", criteria, createdBy: "u1", activeFrom: 0 });
+    return { orgId, sourceId, icpVersionId };
   });
   orgId = seeded.orgId;
   sourceId = seeded.sourceId;
+  icpVersionId = seeded.icpVersionId;
   t = raw.withIdentity({ subject: "u1", orgId });
 });
 
-const start = (creditBudget = 10) => t.mutation(api.runs.mutations.startRun, { sourceId, icpVersionId: "icp_v1", creditBudget });
+const start = (creditBudget = 10) => t.mutation(api.runs.mutations.startRun, { sourceId, icpVersionId, creditBudget });
 
 test("startRun opens a running run with zeroed accounting", async () => {
   const run = await t.query(api.runs.queries.getRun, { runId: await start(10) });
   expect(run).toMatchObject({
-    orgId, sourceId, status: "running", creditBudget: 10, creditsUsed: 0, icpVersionId: "icp_v1",
+    orgId, sourceId, status: "running", creditBudget: 10, creditsUsed: 0, icpVersionId,
     rowsProcessed: 0, candidatesInserted: 0, duplicates: 0, rowsRejected: 0, candidatesConsumed: 0, candidatesRejected: 0,
   });
   expect(run.startedAt).toBeGreaterThan(0);
   expect(run.finishedAt).toBeUndefined();
+});
+
+test("startRun refuses an ICP version from another org", async () => {
+  const foreign = await raw.run(async (ctx) => {
+    const other = await ctx.db.insert("orgs", { name: "Org 2", createdAt: 0 });
+    return await ctx.db.insert("icpDefinitions", { orgId: other, version: 1, name: "theirs", criteria, createdBy: "x", activeFrom: 0 });
+  });
+  await expect(t.mutation(api.runs.mutations.startRun, { sourceId, icpVersionId: foreign, creditBudget: 5 })).rejects.toThrow("icp version not found");
 });
 
 test("startRun refuses a bad budget and a source from another org", async () => {

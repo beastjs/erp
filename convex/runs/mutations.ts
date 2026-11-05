@@ -60,7 +60,7 @@ export async function settleRun(ctx: MutationCtx, runId: Id<"discoveryRuns">): P
 }
 
 export const startRun = mutation({
-  args: { sourceId: v.id("sources"), icpVersionId: v.optional(v.string()), creditBudget: v.number() },
+  args: { sourceId: v.id("sources"), icpVersionId: v.optional(v.id("icpDefinitions")), creditBudget: v.number() },
   handler: async (ctx, args) => {
     const { orgId } = await withOrg(ctx, args);
     // Negated conjunction: NaN fails every comparison, so it fails closed. An infinite budget is no budget.
@@ -69,6 +69,10 @@ export const startRun = mutation({
     }
     const source = await ctx.db.get(args.sourceId);
     if (!source || source.orgId !== orgId) throw new Error("source not found");
+    if (args.icpVersionId) {
+      const icp = await ctx.db.get(args.icpVersionId);
+      if (!icp || icp.orgId !== orgId) throw new Error("icp version not found");
+    }
     return await ctx.db.insert("discoveryRuns", {
       orgId,
       sourceId: args.sourceId,

@@ -14,8 +14,8 @@ import { v } from "convex/values";
 export const discoveryRuns = defineTable({
   orgId: v.id("orgs"),
   sourceId: v.id("sources"),
-  /** Opaque until the ICP tables exist (Task 9), which tightens this to an id. */
-  icpVersionId: v.optional(v.string()),
+  /** The exact ICP version the run was started under; versions are append-only, so this stays meaningful. */
+  icpVersionId: v.optional(v.id("icpDefinitions")),
   status: v.union(v.literal("running"), v.literal("completed")),
   /** Credits the run may spend; consumeCredits refuses to exceed it. */
   creditBudget: v.number(),

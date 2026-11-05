@@ -3,36 +3,40 @@ import { convexTest } from "convex-test";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import type { Id } from "../_generated/dataModel";
 import schema from "../schema";
-import { DEFAULT_STRENGTH_BY_KIND, HALF_LIFE_MS, STRENGTH_WEIGHTS, decayedWeight, signalContribution, type Signal } from "./decay";
+import { DEFAULT_SCORING_MODEL } from "../icp/defaults";
+import { DEFAULT_STRENGTH_BY_KIND, decayedWeight, signalContribution, type Signal } from "./decay";
 import { MAX_FUTURE_SKEW_MS, MAX_SIGNALS, activeSignals, appendSignal } from "./mutations";
 
 const modules = import.meta.glob("/convex/**/*.ts");
 const DAY = 24 * 60 * 60 * 1000;
 const NOW = 1_800_000_000_000;
+const P = DEFAULT_SCORING_MODEL;
+const STRENGTH_WEIGHTS = P.strengthWeights;
+const HALF_LIFE_MS = P.decayHalfLives;
 
 const sig = (over: Partial<Signal> = {}) =>
   ({ strength: "high", observedAt: NOW, ...over }) as Pick<Signal, "strength" | "observedAt" | "expiresAt">;
 
 test("a signal observed today keeps its full strength weight", () => {
   for (const s of ["high", "medium", "low"] as const) {
-    expect(decayedWeight(sig({ strength: s }), NOW)).toBe(STRENGTH_WEIGHTS[s]);
+    expect(decayedWeight(sig({ strength: s }), NOW, P)).toBe(STRENGTH_WEIGHTS[s]);
   }
 });
 
 test("weight halves after exactly one half-life", () => {
-  const w = decayedWeight(sig({ observedAt: NOW - HALF_LIFE_MS.high }), NOW);
+  const w = decayedWeight(sig({ observedAt: NOW - HALF_LIFE_MS.high }), NOW, P);
   expect(w).toBeCloseTo(STRENGTH_WEIGHTS.high / 2, 10);
 });
 
 test("a six-month-old high signal decays below a fresh medium signal", () => {
-  const old = decayedWeight(sig({ strength: "high", observedAt: NOW - 180 * DAY }), NOW);
-  expect(old).toBeLessThan(decayedWeight(sig({ strength: "medium" }), NOW));
+  const old = decayedWeight(sig({ strength: "high", observedAt: NOW - 180 * DAY }), NOW, P);
+  expect(old).toBeLessThan(decayedWeight(sig({ strength: "medium" }), NOW, P));
 });
 
 test("an expired signal has weight 0 even inside its half-life", () => {
   const s = sig({ observedAt: NOW - DAY, expiresAt: NOW - 1 });
-  expect(decayedWeight(s, NOW)).toBe(0);
-  expect(decayedWeight(sig({ observedAt: NOW - DAY, expiresAt: NOW + DAY }), NOW)).toBeGreaterThan(0);
+  expect(decayedWeight(s, NOW, P)).toBe(0);
+  expect(decayedWeight(sig({ observedAt: NOW - DAY, expiresAt: NOW + DAY }), NOW, P)).toBeGreaterThan(0);
 });
 
 test("decayedWeight never returns NaN, a negative number or Infinity", () => {
@@ -42,13 +46,13 @@ test("decayedWeight never returns NaN, a negative number or Infinity", () => {
     for (const now of nows)
       for (const observedAt of observed)
         for (const expiresAt of [undefined, NaN, Infinity, NOW - 1, NOW + DAY]) {
-          const w = decayedWeight({ strength, observedAt, expiresAt }, now);
+          const w = decayedWeight({ strength, observedAt, expiresAt }, now, P);
           expect(Number.isFinite(w)).toBe(true);
           expect(w).toBeGreaterThanOrEqual(0);
           expect(w).toBeLessThanOrEqual(STRENGTH_WEIGHTS[strength]);
         }
   // an unknown strength that slipped past validation must not leak NaN either
-  expect(decayedWeight({ strength: "bogus" as never, observedAt: NOW }, NOW)).toBe(0);
+  expect(decayedWeight({ strength: "bogus" as never, observedAt: NOW }, NOW, P)).toBe(0);
 });
 
 test("strength weights order high > medium > low, and so do half-lives", () => {
@@ -110,8 +114,33 @@ test("appendSignal stores a signal and activeSignals returns it annotated with w
   await t.run((ctx) => appendSignal(ctx, base()));
   const out = await t.run((ctx) => activeSignals(ctx, { subjectType: "account", subjectId: accountId, now: NOW }));
   expect(out).toHaveLength(1);
-  expect(out[0].weight).toBe(decayedWeight(out[0], NOW));
+  expect(out[0].weight).toBe(decayedWeight(out[0], NOW, P));
   expect(out[0].kind).toBe("funding_announcement");
+});
+
+test("activeSignals decays under the active model by default and under a named historical model on request", async () => {
+  const org = (await raw.run((ctx) => ctx.db.get(accountId)))!.orgId;
+  const v1 = await raw.run((ctx) => ctx.db.insert("scoringModels", { ...P, orgId: org, version: 1, createdBy: "u1", activeFrom: 0 }));
+  await raw.run((ctx) =>
+    ctx.db.insert("scoringModels", { ...P, strengthWeights: { high: 0.5, medium: 0.3, low: 0.1 }, orgId: org, version: 2, supersedesId: v1, createdBy: "u1", activeFrom: 1 }),
+  );
+  await t.run((ctx) => appendSignal(ctx, { ...base(), observedAt: NOW, confidence: 1 }));
+  const args = { subjectType: "account" as const, subjectId: accountId as string, now: NOW };
+  const active = await t.run((ctx) => activeSignals(ctx, args));
+  expect(active.map((x) => [x.weight, x.contribution])).toEqual([[0.5, 0.5]]);
+  const historical = await t.run((ctx) => activeSignals(ctx, { ...args, scoringModelId: v1 }));
+  expect(historical.map((x) => [x.weight, x.contribution])).toEqual([[1, 1]]);
+});
+
+test("decay fails closed on unusable params: exactly 0, never NaN", () => {
+  const sig2 = { strength: "high" as const, observedAt: NOW };
+  const hl = P.decayHalfLives;
+  const sw = P.strengthWeights;
+  for (const bad of [0, -1, NaN, Infinity, undefined as never]) {
+    expect(decayedWeight(sig2, NOW, { strengthWeights: sw, decayHalfLives: { ...hl, high: bad } })).toBe(0);
+    expect(decayedWeight(sig2, NOW, { strengthWeights: { ...sw, high: bad }, decayHalfLives: hl })).toBe(0);
+  }
+  expect(signalContribution({ ...sig2, confidence: 1 }, NOW, { strengthWeights: sw, decayHalfLives: { ...hl, high: 0 } })).toBe(0);
 });
 
 test("activeSignals drops expired signals and orders newest first", async () => {
@@ -156,8 +185,8 @@ test("appendSignal without an org identity fails closed", async () => {
 });
 
 test("a half-confidence signal contributes half as much as an identical full-confidence one", () => {
-  const full = signalContribution({ ...sig({ observedAt: NOW - 10 * DAY }), confidence: 1 }, NOW);
-  const half = signalContribution({ ...sig({ observedAt: NOW - 10 * DAY }), confidence: 0.5 }, NOW);
+  const full = signalContribution({ ...sig({ observedAt: NOW - 10 * DAY }), confidence: 1 }, NOW, P);
+  const half = signalContribution({ ...sig({ observedAt: NOW - 10 * DAY }), confidence: 0.5 }, NOW, P);
   expect(full).toBeGreaterThan(0);
   expect(half).toBeCloseTo(full / 2, 12);
 });
@@ -166,7 +195,7 @@ test("signalContribution is never NaN, negative or Infinity", () => {
   for (const confidence of [NaN, Infinity, -Infinity, -1, 0, 0.3, 1, 5])
     for (const now of [NOW, NaN, Infinity])
       for (const observedAt of [NOW, NaN, -Infinity, NOW + DAY]) {
-        const c = signalContribution({ strength: "high", observedAt, confidence }, now);
+        const c = signalContribution({ strength: "high", observedAt, confidence }, now, P);
         expect(Number.isFinite(c)).toBe(true);
         expect(c).toBeGreaterThanOrEqual(0);
         expect(c).toBeLessThanOrEqual(STRENGTH_WEIGHTS.high);
@@ -203,13 +232,13 @@ test("appendSignal rejects a source from another org", async () => {
 });
 
 test("fail-closed inputs are exactly 0, not merely in range", () => {
-  expect(decayedWeight({ strength: "high", observedAt: Infinity }, NOW)).toBe(0);
-  expect(decayedWeight({ strength: "high", observedAt: NaN }, NOW)).toBe(0);
-  expect(decayedWeight({ strength: "high", observedAt: NOW }, Infinity)).toBe(0);
+  expect(decayedWeight({ strength: "high", observedAt: Infinity }, NOW, P)).toBe(0);
+  expect(decayedWeight({ strength: "high", observedAt: NaN }, NOW, P)).toBe(0);
+  expect(decayedWeight({ strength: "high", observedAt: NOW }, Infinity, P)).toBe(0);
   for (const confidence of [Infinity, -Infinity, NaN, 5, 1.0000001, -0.1, 0]) {
-    expect(signalContribution({ strength: "high", observedAt: NOW, confidence }, NOW)).toBe(0);
+    expect(signalContribution({ strength: "high", observedAt: NOW, confidence }, NOW, P)).toBe(0);
   }
-  expect(signalContribution({ strength: "high", observedAt: NOW, confidence: 1 }, NOW)).toBe(STRENGTH_WEIGHTS.high);
+  expect(signalContribution({ strength: "high", observedAt: NOW, confidence: 1 }, NOW, P)).toBe(STRENGTH_WEIGHTS.high);
 });
 
 test("appendSignal rejects a future-dated observedAt beyond the skew but allows within it", async () => {

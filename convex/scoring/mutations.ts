@@ -10,11 +10,16 @@ import type { ScoreResult } from "./score";
 
 const finite = (n: unknown): n is number => typeof n === "number" && Number.isFinite(n);
 
-/** Tolerance for float drift between the stored total and the sum of its parts. */
-const SUM_EPSILON = 1e-6;
+/** Float tolerance for recomputed relationships (the result is snapped at 1e-9; sums accumulate a little more). */
+const EPS = 1e-6;
+const near = (a: number, b: number) => Math.abs(a - b) <= EPS;
 
-/** Fails closed on any result that could not have come from computeScore under this model. */
-function validateResult(r: ScoreResult, model: Parameters<typeof tierFor>[2]): void {
+/**
+ * Fails closed on any result that computeScore could not have produced under this model: ranges, tier,
+ * and every relationship between the parts (weights match the model, contributed = input x weight,
+ * score = sum, fit and intent follow from the contributions, priority = fit x intent / 100).
+ */
+function validateResult(r: ScoreResult, model: Parameters<typeof tierFor>[2] & { weights: { companyFit: number; contactFit: number; intent: number } }): void {
   for (const k of ["fit", "intent", "score", "priority"] as const) {
     if (!(finite(r[k]) && r[k] >= 0 && r[k] <= 100)) throw new Error(`result.${k} must be a finite number in [0, 100]`);
   }
@@ -22,15 +27,45 @@ function validateResult(r: ScoreResult, model: Parameters<typeof tierFor>[2]): v
   if (!TIERS.includes(r.tier)) throw new Error("result.tier is not a tier");
   if (!Array.isArray(r.contributions) || r.contributions.length === 0) throw new Error("result.contributions must be a non-empty array");
   let total = 0;
+  let companyWeight = 0;
+  let contactWeight = 0;
+  let intentWeight = 0;
+  let intentInput = 0;
+  let intents = 0;
+  let fitPoints = 0;
+  let fitWeight = 0;
   for (const c of r.contributions) {
     if (typeof c.factor !== "string" || c.factor === "") throw new Error("contribution.factor is required");
     if (/data.?quality/i.test(c.factor)) throw new Error("data quality is not a scoring factor");
     if (!(finite(c.input) && c.input >= 0 && c.input <= 1)) throw new Error(`contribution ${c.factor}: input must be in [0, 1]`);
     if (!(finite(c.weight) && c.weight >= 0)) throw new Error(`contribution ${c.factor}: weight must be finite and >= 0`);
     if (!(finite(c.contributed) && c.contributed >= 0)) throw new Error(`contribution ${c.factor}: contributed must be finite and >= 0`);
+    if (!near(c.contributed, c.input * c.weight)) throw new Error(`contribution ${c.factor}: contributed must equal input x weight`);
     total += c.contributed;
+    if (c.factor === "intent") {
+      intents++;
+      intentWeight += c.weight;
+      intentInput = c.input;
+    } else {
+      fitPoints += c.contributed;
+      fitWeight += c.weight;
+      if (c.factor.startsWith("company.")) companyWeight += c.weight;
+      else if (c.factor === "contact.role") contactWeight += c.weight;
+      else throw new Error(`unknown scoring factor ${c.factor}`);
+    }
   }
-  if (Math.abs(total - r.score) > SUM_EPSILON) throw new Error("result.score must equal the sum of its contributions");
+  if (intents !== 1) throw new Error("result.contributions must contain exactly one intent factor");
+  // Weights must be the model's, normalised only when the contact factor was omitted (as computeScore does).
+  const w = model.weights;
+  const hasContact = r.contributions.some((c) => c.factor === "contact.role");
+  const scale = hasContact || w.companyFit + w.intent <= 0 ? 1 : 100 / (w.companyFit + w.intent);
+  if (!near(companyWeight, w.companyFit * scale) || !near(intentWeight, w.intent * scale) || !near(contactWeight, hasContact ? w.contactFit : 0)) {
+    throw new Error("contribution weights do not match the cited scoring model");
+  }
+  if (!near(total, r.score)) throw new Error("result.score must equal the sum of its contributions");
+  if (!near(r.intent, intentInput * 100)) throw new Error("result.intent must equal the intent factor input x 100");
+  if (!near(r.fit, fitWeight > 0 ? (fitPoints / fitWeight) * 100 : 0)) throw new Error("result.fit does not follow from the contributions");
+  if (!near(r.priority, (r.fit * r.intent) / 100)) throw new Error("result.priority must equal fit x intent / 100");
   if (tierFor(r.score, r.confidence, model) !== r.tier) throw new Error("result.tier does not match score and confidence under the cited model");
 }
 

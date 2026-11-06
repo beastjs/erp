@@ -75,7 +75,7 @@ test("inferred-only claims cap confidence at 0.5", () => {
   expect(extracted.confidence).toBe(0.7);
 });
 
-test("a 92 score below the tier S confidence floor does not tier S", () => {
+test("a score in the S band below the S confidence floor does not tier S", () => {
   // Score 100 sits in the S band; confidence 0.7 is under the S floor (0.8) and meets A's (0.7).
   const r = computeScore(input({ account: { fields: fields(perfectAccount, "observed", 0.7) }, contact: { fields: fields(perfectContact, "observed", 0.7) } }));
   expect(r.score).toBe(100);
@@ -152,6 +152,95 @@ test("contributions list every weighted factor and its input value", () => {
   expect(partial.contributions.find((c) => c.factor === "company.technologies")?.input).toBe(0.5);
 });
 
+test("each factor carries its own input (distinguishable values, two scenarios)", () => {
+  const rich = { ...criteria, technologies: ["convex", "rust", "go"] };
+  const byFactor = (r: ScoreResult) => Object.fromEntries(r.contributions.map((c) => [c.factor, c.input]));
+  const a = computeScore(
+    input({
+      icp: { criteria: rich },
+      model: { ...model, sizeOverlapCredit: 0.25 },
+      account: { fields: fields({ industry: "software", country: "DE", techStack: ["Convex"], size: "201-1,000" }) },
+      contact: { fields: fields({ title: "Cook" }) },
+      signals: [signal({ confidence: 0.75 })],
+    }),
+  );
+  expect(byFactor(a)).toEqual({ "company.industry": 1, "company.geography": 0, "company.technologies": 1 / 3, "company.size": 0.25, "contact.role": 0, intent: 0.75 });
+  const b = computeScore(input({ icp: { criteria: rich }, account: { fields: fields({ industry: "mining", country: "US", techStack: [], size: "10" }) }, signals: [] }));
+  expect(byFactor(b)).toEqual({ "company.industry": 0, "company.geography": 1, "company.technologies": 0, "company.size": 0, "contact.role": 1, intent: 0 });
+});
+
+test("confidence drift: three fields at the extracted ceiling sit exactly on A's floor and tier A", () => {
+  // 0.7 + 0.7 + 0.7 = 2.0999999999999996; / 3 = 0.6999999999999998, one ULP under A's 0.7 floor, unless snapped.
+  const small = { ...criteria, technologies: [], employeeMin: undefined, employeeMax: undefined };
+  const r = computeScore(
+    input({ icp: { criteria: small }, account: { fields: fields({ industry: "software", country: "US" }, "extracted", 0.99) }, contact: { fields: fields(perfectContact, "extracted", 0.99) } }),
+  );
+  expect(r.score).toBe(100);
+  expect(r.confidence).toBe(0.7);
+  expect(r.tier).toBe("A");
+});
+
+test("more evidence never makes a lead look worse: fields no criterion reads do not move confidence or tier", () => {
+  const base = computeScore(input());
+  const extra = computeScore(
+    input({
+      account: { fields: fields({ ...perfectAccount }) .concat(fields({ description: "x", revenueRange: "y" }, "inferred", 0.05)) },
+      contact: { fields: fields(perfectContact).concat(fields({ phone: "+1", notes: "n" }, "inferred", 0.05)) },
+    }),
+  );
+  expect(extra.confidence).toBe(base.confidence);
+  expect(extra.tier).toBe(base.tier);
+  expect(extra.score).toBe(base.score);
+  // No relevant evidence at all (fields exist, none read): nothing backs the score.
+  const none = computeScore(input({ account: { fields: fields({ description: "x" }) }, contact: { fields: fields({ phone: "+1" }) } }));
+  expect(none.confidence).toBe(0);
+  expect(none.tier).toBe("Reject");
+});
+
+test("an ICP without decision-maker roles omits the contact factor and normalises: it can reach 100 and tier S", () => {
+  const r = computeScore(input({ icp: { criteria: { ...criteria, decisionMakerRoles: [] } }, contact: { fields: [] } }));
+  expect(r.contributions.some((c) => c.factor === "contact.role")).toBe(false);
+  expect(r.contributions.reduce((sum, c) => sum + c.weight, 0)).toBeCloseTo(100, 9);
+  expect(r.contributions.map((c) => c.weight)).toEqual([35 / 4 * (100 / 80), 35 / 4 * (100 / 80), 35 / 4 * (100 / 80), 35 / 4 * (100 / 80), 45 * (100 / 80)]);
+  expect(r.score).toBe(100);
+  expect(r.fit).toBe(100);
+  expect(r.tier).toBe("S");
+  // Confidence reads company fields only; and a contact title does not matter.
+  expect(r.confidence).toBe(1);
+});
+
+test("parseSize accepts only whole-string number, range or open range, and reads k suffixes", () => {
+  expect(parseSize("250")).toEqual({ lo: 250, hi: 250 });
+  expect(parseSize("51-200")).toEqual({ lo: 51, hi: 200 });
+  expect(parseSize(" 201 - 1,000 ")).toEqual({ lo: 201, hi: 1000 });
+  expect(parseSize("1,000+")).toEqual({ lo: 1000, hi: Infinity });
+  expect(parseSize("5k-10k")).toEqual({ lo: 5000, hi: 10000 });
+  expect(parseSize("10k+")).toEqual({ lo: 10000, hi: Infinity });
+  for (const bad of ["51-200 (2023)", "Founded 2015, 51-200", "up to 50", "under 10", "200-51", "many", "", "1-2-3", "about 100"]) {
+    expect(parseSize(bad), bad).toBeNull();
+  }
+  // And a null parse scores exactly 0 rather than a confident wrong match.
+  const size = (t: string) => computeScore(input({ account: { fields: fields({ ...perfectAccount, size: t }) } })).contributions.find((c) => c.factor === "company.size")?.input;
+  expect(size("51-200 (2023)")).toBe(0);
+  expect(size("up to 50")).toBe(0);
+  expect(size("Founded 2015, 51-200")).toBe(0);
+  expect(size("5k-10k")).toBe(0); // 5000-10000 employees is outside 50-500, not "5-10"
+});
+
+test("a future-dated claim cannot boost freshness: age runs from min(observedAt, recordedAt)", () => {
+  const future = NOW + 30 * DAY;
+  const old = NOW - 365 * DAY;
+  const conf = (observedAt: number, recorded?: number) => {
+    const af = fields(perfectAccount, "observed", 1, observedAt);
+    const cf = fields(perfectContact, "observed", 1, observedAt);
+    const rec = recorded === undefined ? undefined : Object.fromEntries([...af, ...cf].map((f) => [f.claimId, recorded]));
+    return computeScore(input({ account: { fields: af }, contact: { fields: cf }, claimRecordedAt: rec })).confidence;
+  };
+  expect(conf(future)).toBe(0.5); // no record: no credit
+  expect(conf(future, old)).toBe(0.75); // claim says the future, we recorded it a year ago: a year old
+  expect(conf(old, NOW)).toBe(0.75); // recorded later than observed: observedAt stands
+});
+
 test("data quality is absent from contributions", () => {
   const r = computeScore(input());
   expect(r.contributions.some((c) => /data.?quality|confidence/i.test(c.factor))).toBe(false);
@@ -185,8 +274,8 @@ test("an empty verifications array scores the same as before Task 15", () => {
 test("two model versions with different freshness half-lives give different confidence for the same claim", () => {
   const old = (m: typeof model) => computeScore(input({ model: m, account: { fields: fields(perfectAccount, "observed", 1, NOW - 365 * DAY) }, contact: { fields: fields(perfectContact, "observed", 1, NOW - 365 * DAY) } })).confidence;
   expect(old(model)).toBe(0.75);
-  expect(old({ ...model, claimHalfLifeMs: 730 * DAY })).toBeCloseTo(0.5 + 0.5 * Math.SQRT1_2, 12);
-  expect(old({ ...model, claimHalfLifeMs: 30 * DAY })).toBeCloseTo(0.5 + 0.5 * Math.pow(0.5, 365 / 30), 12);
+  expect(old({ ...model, claimHalfLifeMs: 730 * DAY })).toBeCloseTo(0.5 + 0.5 * Math.SQRT1_2, 8);
+  expect(old({ ...model, claimHalfLifeMs: 30 * DAY })).toBeCloseTo(0.5 + 0.5 * Math.pow(0.5, 365 / 30), 8);
   // An unusable half-life fails closed to fully aged instead of dividing by it.
   expect(old({ ...model, claimHalfLifeMs: 0 })).toBe(0.5);
   expect(old({ ...model, claimHalfLifeMs: NaN })).toBe(0.5);
@@ -229,7 +318,8 @@ test("claim age lowers confidence by at most half", () => {
   expect(aged(0)).toBe(1);
   expect(aged(year)).toBe(0.75);
   expect(aged(1000 * year)).toBeCloseTo(0.5, 12);
-  expect(aged(-5 * DAY)).toBe(1); // future-dated: no penalty
+  // Future-dated with no record of when we saw it earns no freshness credit: the floor, not a free boost.
+  expect(aged(-5 * DAY)).toBe(0.5);
 });
 
 test("intent uses confidence-weighted contribution: an unverified rumour counts for less", () => {
@@ -272,7 +362,7 @@ test("fail-closed on hostile numbers: never NaN, negative or Infinity", () => {
   // An ICP that asks for nothing matches nothing.
   const empty = computeScore(input({ icp: { criteria: { industries: [], geographies: [], technologies: [], decisionMakerRoles: [] } } }));
   expect(empty.fit).toBe(0);
-  expect(empty.contributions[0]).toEqual({ factor: "company.criteria", input: 0, weight: 35, contributed: 0 });
+  expect(empty.contributions[0]).toEqual({ factor: "company.criteria", input: 0, weight: 43.75, contributed: 0 }); // contact omitted, so 35 is normalised over 35 + 45
 });
 
 test("fit matching: role is whole-word, size handles ranges, geography reads country or location", () => {
@@ -339,11 +429,25 @@ test("recordScoreRun refuses results that could not have come from computeScore,
   await expect(call({ ...good, score: 99 })).rejects.toThrow(/sum of its contributions/);
   await expect(call({ ...good, contributions: [...good.contributions, { factor: "dataQuality", input: 0, weight: 0, contributed: 0 }] })).rejects.toThrow(/data quality/);
   await expect(call({ ...good, contributions: [] })).rejects.toThrow(/contributions/);
+  // Every relationship, not just the ranges: a tampered or other-model result must not persist.
+  await expect(call({ ...good, priority: 10 })).rejects.toThrow(/result\.priority must equal/);
+  await expect(call({ ...good, fit: 50, priority: 50 })).rejects.toThrow(/fit does not follow/); // priority kept consistent so only fit is wrong
+  await expect(call({ ...good, intent: 50, priority: 50 })).rejects.toThrow(/result\.intent must equal/);
+  const bump = (i: number, patch: object) => good.contributions.map((c, k) => (k === i ? { ...c, ...patch } : c));
+  await expect(call({ ...good, contributions: bump(0, { contributed: 1 }) })).rejects.toThrow(/input x weight/);
+  // Computed under a different model (35/20/45 -> 30/25/45) yet internally consistent and tiering the same.
+  const otherModel = computeScore(input({ model: { ...model, weights: { companyFit: 30, contactFit: 25, intent: 45 } } }));
+  expect(otherModel.tier).toBe(good.tier);
+  await expect(call(otherModel)).rejects.toThrow(/do not match the cited scoring model/);
+  await expect(call({ ...good, contributions: [...good.contributions, { factor: "mystery", input: 0, weight: 0, contributed: 0 }] })).rejects.toThrow(/unknown scoring factor/);
   await expect(call(good, { subjectId: "nope" })).rejects.toThrow(/invalid subject id/);
   const other = await raw.run((ctx) => ctx.db.insert("orgs", { name: "Org 2", createdAt: 0 }));
   const foreign = await raw.run((ctx) => ctx.db.insert("accounts", { orgId: other, fields: [], display: {} }));
   await expect(call(good, { subjectId: foreign })).rejects.toThrow(/subject not found/);
   expect(await raw.run((ctx) => ctx.db.query("scoreRuns").collect())).toEqual([]);
+  // A normalised result (contact omitted) is accepted under the same model.
+  const noContact = computeScore(input({ icp: { criteria: { ...criteria, decisionMakerRoles: [] } } }));
+  await expect(call(noContact)).resolves.toBeDefined();
 });
 
 test("scoring code never patches or deletes a score run, and no function declares an orgId argument", async () => {

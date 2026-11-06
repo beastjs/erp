@@ -37,13 +37,20 @@ export type ScoreInput = {
     ScoringModel,
     "weights" | "tierBands" | "confidenceFloors" | "methodCeilings" | "strengthWeights" | "decayHalfLives" | "claimHalfLifeMs" | "failedVerificationFactor" | "claimFreshnessFloor" | "sizeOverlapCredit"
   >;
+  /**
+   * claimId -> the claim's `_creationTime`. A source cannot have observed something after we recorded it, so a
+   * claim's age runs from min(observedAt, recordedAt), the same clamp Task 4 applies to claim resolution.
+   * A claim with no entry whose observedAt is in the future (after `now`) gets no freshness credit at all.
+   */
+  claimRecordedAt?: Record<string, number>;
   /** Epoch ms. Explicit so the function stays pure: decay and claim age are measured against it. */
   now: number;
 };
 
 /*
  * CONFIDENCE (a proposal of this task; the spec fixes the inputs, not the formula).
- *   evidence  = mean over every projected field of  min(claim.confidence, methodCeiling) x freshness
+ *   evidence  = mean over the fields the scored factors READ (not every field that exists: more evidence must
+ *               never make a lead look worse) of  min(claim.confidence, methodCeiling) x freshness
  *   freshness = floor + (1 - floor) x 0.5^(age / model.claimHalfLifeMs), floor = model.claimFreshnessFloor.
  *   verified  = evidence x model.failedVerificationFactor per failed verification kind (latest result per kind); pass/unknown are neutral.
  * No verifications means no factor, so populating the list later only ever lowers confidence for subjects
@@ -53,6 +60,8 @@ export type ScoreInput = {
 const finite = (n: unknown): n is number => typeof n === "number" && Number.isFinite(n);
 /** Total clamp into [lo, hi]: anything unusable (NaN, Infinity) becomes lo. */
 const clamp = (n: number, lo: number, hi: number) => (Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : lo);
+/** Round away float drift at 1e-9 so a value that is mathematically on a boundary compares as on it. */
+const snap = (n: number) => Math.round(n * 1e9) / 1e9;
 const norm = (s: string) => s.trim().toLowerCase();
 const tokens = (s: string) => s.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
 
@@ -61,13 +70,31 @@ function fieldValue(p: Fielded, name: string): unknown {
 }
 const str = (v: unknown) => (typeof v === "string" && v.trim() !== "" ? v : undefined);
 
-/** Employee count range from free text such as "51-200", "1,000+" or "250". Null when no number is readable. */
+/**
+ * Employee count range from free text. Accepts ONLY a whole-string single number ("250"), a range ("51-200",
+ * "201 - 1,000") or an open range ("1,000+"), each number optionally with a k suffix ("5k-10k"). Anything else
+ * ("51-200 (2023)", "up to 50", "Founded 2015, 51-200") is null and scores 0: a wrong match is
+ * indistinguishable from a real one downstream, so an unreadable size must not be guessed at.
+ */
+const NUM = String.raw`(\d+(?:,\d{3})*(?:\.\d+)?)(k?)`;
+const SINGLE = new RegExp(`^${NUM}(\\+?)$`);
+const RANGE = new RegExp(`^${NUM}\\s*[-\u2013]\\s*${NUM}$`);
+const toCount = (digits: string, k: string) => Number(digits.replace(/,/g, "")) * (k === "k" ? 1000 : 1);
 export function parseSize(text: string): { lo: number; hi: number } | null {
-  const nums = (text.replace(/,/g, "").match(/\d+(\.\d+)?/g) ?? []).map(Number).filter(Number.isFinite);
-  if (nums.length === 0) return null;
-  const lo = Math.min(nums[0], nums[nums.length - 1]);
-  const hi = nums.length === 1 ? (/\+|more|over|above/i.test(text) ? Infinity : nums[0]) : Math.max(nums[0], nums[nums.length - 1]);
-  return { lo, hi };
+  const t = text.trim().toLowerCase();
+  const range = RANGE.exec(t);
+  if (range) {
+    const lo = toCount(range[1], range[2]);
+    const hi = toCount(range[3], range[4]);
+    return Number.isFinite(lo) && Number.isFinite(hi) && lo <= hi ? { lo, hi } : null;
+  }
+  const one = SINGLE.exec(t);
+  if (one) {
+    const n = toCount(one[1], one[2]);
+    if (!Number.isFinite(n)) return null;
+    return { lo: n, hi: one[3] === "+" ? Infinity : n };
+  }
+  return null;
 }
 
 function sizeMatch(text: string | undefined, min: number | undefined, max: number | undefined, overlapCredit: number): number {
@@ -99,8 +126,20 @@ function roleMatch(title: string | undefined, roles: string[]): number {
     : 0;
 }
 
+/** The projected fields a scored factor reads, per the ICP. Confidence is confidence in THIS evidence. */
+function evidenceFields(input: ScoreInput): Doc<"accounts">["fields"] {
+  const c = input.icp.criteria;
+  const account = new Set<string>();
+  if (c.industries.length > 0) account.add("industry");
+  if (c.geographies.length > 0) ["country", "location"].forEach((f) => account.add(f));
+  if (c.technologies.length > 0) account.add("techStack");
+  if (c.employeeMin !== undefined || c.employeeMax !== undefined) account.add("size");
+  const contact = new Set<string>(c.decisionMakerRoles.length > 0 ? ["title"] : []);
+  return [...input.account.fields.filter((f) => account.has(f.field)), ...input.contact.fields.filter((f) => contact.has(f.field))];
+}
+
 function evidenceConfidence(input: ScoreInput): number {
-  const fields = [...input.account.fields, ...input.contact.fields];
+  const fields = evidenceFields(input);
   if (fields.length === 0) return 0;
   const ceilings = input.model.methodCeilings;
   const halfLife = input.model.claimHalfLifeMs;
@@ -114,11 +153,16 @@ function evidenceConfidence(input: ScoreInput): number {
   for (const f of fields) {
     const ceiling = clamp(ceilings[f.method as ClaimMethod], 0, 1);
     const claimed = finite(f.confidence) && f.confidence > 0 && f.confidence <= 1 ? f.confidence : 0;
-    const age = finite(f.observedAt) ? Math.max(0, input.now - f.observedAt) : Infinity;
+    const recorded = input.claimRecordedAt?.[f.claimId];
+    const observed = finite(f.observedAt) ? (finite(recorded) ? Math.min(f.observedAt, recorded) : f.observedAt) : NaN;
+    // Future-dated with no record of when we saw it: no freshness credit (Infinity age = the floor).
+    const age = finite(observed) && observed <= input.now ? input.now - observed : Infinity;
     const freshness = floorUsable && usable && Number.isFinite(age) ? freshFloor + (1 - freshFloor) * Math.pow(0.5, age / halfLife) : freshFloor;
     sum += Math.min(claimed, ceiling) * freshness;
   }
-  return clamp(sum / fields.length, 0, 1);
+  // Snap: a mean that is mathematically exactly a tier floor (ceilings equal floors by default) must not land
+  // one ULP under it and silently demote the lead.
+  return snap(clamp(sum / fields.length, 0, 1));
 }
 
 function verificationFactor(verifications: VerificationResult[], failed: number): number {
@@ -142,10 +186,9 @@ export function computeScore(input: ScoreInput): ScoreResult {
   const wContact = clamp(w.contactFit, 0, 100);
   const wIntent = clamp(w.intent, 0, 100);
 
-  const contributions: Contribution[] = [];
+  const factors: Array<{ factor: string; input: number; weight: number }> = [];
   const add = (factor: string, rawInput: number, weight: number) => {
-    const inp = clamp(rawInput, 0, 1);
-    contributions.push({ factor, input: inp, weight, contributed: inp * weight });
+    factors.push({ factor, input: clamp(rawInput, 0, 1), weight });
   };
 
   // Company fit: each dimension the ICP actually specifies shares the company weight equally.
@@ -173,7 +216,10 @@ export function computeScore(input: ScoreInput): ScoreResult {
   if (dims.length === 0) add("company.criteria", 0, wCompany);
   else for (const [factor, value] of dims) add(factor, value, wCompany / dims.length);
 
-  add("contact.role", roleMatch(str(fieldValue(input.contact, "title")), c.decisionMakerRoles), wContact);
+  // Same rule as the company side: a criterion the ICP does not specify is omitted and the weights are normalised
+  // (below), not scored as a miss that caps the ICP at 80.
+  const contactSpecified = c.decisionMakerRoles.length > 0;
+  if (contactSpecified) add("contact.role", roleMatch(str(fieldValue(input.contact, "title")), c.decisionMakerRoles), wContact);
 
   // Intent: noisy-or, 1 - prod(1 - c_i): parameter-free (nothing to version), but a modelling decision: many weak
   // signals approach 1 (ten at 0.2 give ~0.89), i.e. "lots of activity is high intent".
@@ -183,6 +229,14 @@ export function computeScore(input: ScoreInput): ScoreResult {
   for (const s of input.signals) miss *= 1 - clamp(signalContribution(s, input.now, model), 0, 1);
   const intentInput = clamp(1 - miss, 0, 1);
   add("intent", intentInput, wIntent);
+
+  // Normalise when the contact factor is omitted so the weights still total 100. Untouched otherwise.
+  const available = wCompany + wIntent;
+  const scale = !contactSpecified && available > 0 ? 100 / available : 1;
+  const contributions: Contribution[] = factors.map((f) => {
+    const weight = f.weight * scale;
+    return { factor: f.factor, input: f.input, weight, contributed: f.input * weight };
+  });
 
   const evidence = evidenceConfidence(input);
   const confidence = clamp(evidence * verificationFactor(input.verifications ?? [], model.failedVerificationFactor), 0, 1);
@@ -201,10 +255,10 @@ export function computeScore(input: ScoreInput): ScoreResult {
   }
 
   const fitPoints = contributions.filter((x) => x.factor !== "intent").reduce((s, x) => s + x.contributed, 0);
-  const fitDen = wCompany + wContact;
+  const fitDen = contributions.filter((x) => x.factor !== "intent").reduce((s, x) => s + x.weight, 0);
   const fit = fitDen > 0 ? clamp((fitPoints / fitDen) * 100, 0, 100) : 0;
   const intent = intentInput * 100;
-  const score = clamp(contributions.reduce((s, x) => s + x.contributed, 0), 0, 100);
+  const score = snap(clamp(contributions.reduce((s, x) => s + x.contributed, 0), 0, 100));
   const priority = clamp((fit * intent) / 100, 0, 100);
   return { fit, intent, score, confidence, priority, tier: tierFor(score, confidence, model), contributions };
 }

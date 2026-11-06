@@ -53,6 +53,9 @@ export type ScoreInput = {
  *               never make a lead look worse) of  min(claim.confidence, methodCeiling) x freshness
  *   freshness = floor + (1 - floor) x 0.5^(age / model.claimHalfLifeMs), floor = model.claimFreshnessFloor.
  *   verified  = evidence x model.failedVerificationFactor per failed verification kind (latest result per kind); pass/unknown are neutral.
+ * Two consequences that surprise: a lead with one present field out of five read fields keeps HIGH confidence
+ * (it is confidence in the evidence that exists; the missing fields already cost points in the score), and once
+ * the contact criterion is omitted a zero-scoring company factor costs 43.75 points (35 normalised over 35 + 45).
  * No verifications means no factor, so populating the list later only ever lowers confidence for subjects
  * that actually fail a check. No fields at all is confidence 0.
  */
@@ -239,7 +242,8 @@ export function computeScore(input: ScoreInput): ScoreResult {
   });
 
   const evidence = evidenceConfidence(input);
-  const confidence = clamp(evidence * verificationFactor(input.verifications ?? [], model.failedVerificationFactor), 0, 1);
+  // Snapped like its factors: the product can sit one ULP under a tier floor too (dormant until verifications exist).
+  const confidence = snap(clamp(evidence * verificationFactor(input.verifications ?? [], model.failedVerificationFactor), 0, 1));
 
   // No claims at all means nothing is known, whatever signals say: score 0, confidence 0, Reject.
   if (input.account.fields.length + input.contact.fields.length === 0) {

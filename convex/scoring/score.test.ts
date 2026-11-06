@@ -79,9 +79,9 @@ test("a score in the S band below the S confidence floor does not tier S", () =>
   // Score 100 sits in the S band; confidence 0.7 is under the S floor (0.8) and meets A's (0.7).
   const r = computeScore(input({ account: { fields: fields(perfectAccount, "observed", 0.7) }, contact: { fields: fields(perfectContact, "observed", 0.7) } }));
   expect(r.score).toBe(100);
-  expect(r.confidence).toBeCloseTo(0.7, 12);
+  expect(r.confidence).toBe(0.7);
   expect(r.tier).toBe("A");
-  // And a 92 proper: intent 0.8 -> 100 - 45*0.2 = 91.
+  // And a score of 91 (intent 0.8 -> 100 - 45*0.2) at confidence 0.5.
   const low = computeScore(
     input({
       signals: [signal({ confidence: 0.8 })],
@@ -195,6 +195,18 @@ test("more evidence never makes a lead look worse: fields no criterion reads do 
   const none = computeScore(input({ account: { fields: fields({ description: "x" }) }, contact: { fields: fields({ phone: "+1" }) } }));
   expect(none.confidence).toBe(0);
   expect(none.tier).toBe("Reject");
+});
+
+test("confidence counts a specified criterion whose field is present but scored 0, and does not count an absent field", () => {
+  // Present and mismatched: industry is read, scores 0, and its 1.0-confidence claim is still evidence.
+  const mismatch = computeScore(input({ account: { fields: fields({ ...perfectAccount, industry: "mining" }, "observed", 1).map((f) => (f.field === "industry" ? { ...f, confidence: 0.5 } : f)) } }));
+  expect(mismatch.contributions.find((c) => c.factor === "company.industry")?.input).toBe(0);
+  // 5 read fields: four at 1.0 and the mismatched industry at 0.5 -> mean 0.9.
+  expect(mismatch.confidence).toBe(0.9);
+  // Absent: only the title is present; the four missing account fields are not counted as zeros.
+  const sparse = computeScore(input({ account: { fields: [] }, contact: { fields: fields(perfectContact) } }));
+  expect(sparse.confidence).toBe(1);
+  expect(sparse.score).toBeLessThan(100); // the absence costs score, not confidence
 });
 
 test("an ICP without decision-maker roles omits the contact factor and normalises: it can reach 100 and tier S", () => {

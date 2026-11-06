@@ -3,7 +3,7 @@ import { convexTest } from "convex-test";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { api, internal } from "../_generated/api";
 import type { Doc, Id } from "../_generated/dataModel";
-import { createIcpVersion } from "../icp/mutations";
+import { SYSTEM_ACTOR_DEFAULT_MODEL_SEED, createIcpVersion } from "../icp/mutations";
 import { latestIcp } from "../icp/queries";
 import { appendClaimRecord } from "../claims/mutations";
 import { setInventoryState } from "../leads/mutations";
@@ -153,6 +153,20 @@ describe("end to end", () => {
     await drain();
     expect(await state(contactId)).toMatchObject({ status: "done", stage: "package" });
     expect(await all("leads")).toHaveLength(1);
+  });
+
+  // Finding from the resolveOrg refactor: the score stage seeds the default scoring model from a scheduled function. That
+  // used to record the fabricated identity "internal|<orgId>" as the row's author. No person made it, and no person is claimed.
+  test("a scoring model seeded by a scheduled stage is attributed to the system label, not a fabricated actor", async () => {
+    const { contactId, accountId, sourceId } = await ingestLead();
+    await makeIcp();
+    await funding(accountId, sourceId);
+    await start(contactId);
+    await drain();
+    const models = await raw.run((ctx) => ctx.db.query("scoringModels").collect());
+    expect(models).toHaveLength(1);
+    expect(models[0]!.createdBy).toBe(SYSTEM_ACTOR_DEFAULT_MODEL_SEED);
+    expect(models[0]!.createdBy).not.toContain("internal");
   });
 });
 

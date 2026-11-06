@@ -1,7 +1,7 @@
 import { v } from "convex/values";
 import type { Id } from "../_generated/dataModel";
 import { mutation, type MutationCtx, type QueryCtx } from "../_generated/server";
-import { withOrg } from "../_shared/org";
+import { resolveOrg, withOrg } from "../_shared/org";
 import { scoringConfigForRead, getScoringModel } from "../icp/queries";
 import { subjectType, type SubjectType } from "../claims/schema";
 import { markScoreStale } from "../pipeline/stages";
@@ -45,7 +45,7 @@ function canonicalSubject(ctx: Pick<QueryCtx, "db">, type: SubjectType, id: stri
  * there is no bound a duplicate could hide behind. A new signal makes any score of the subject stale.
  */
 export async function appendSignal(ctx: MutationCtx, args: AppendSignalArgs): Promise<{ id: Id<"signals">; created: boolean }> {
-  const { orgId } = await withOrg(ctx, args);
+  const { orgId } = await resolveOrg(ctx);
   if (!(Number.isFinite(args.confidence) && args.confidence >= 0 && args.confidence <= 1)) {
     throw new Error("confidence must be between 0 and 1");
   }
@@ -112,7 +112,7 @@ export async function activeSignals(
   ctx: QueryCtx,
   args: { subjectType: SubjectType; subjectId: string; now: number; scoringModelId?: Id<"scoringModels"> },
 ): Promise<Array<Signal & { weight: number; contribution: number }>> {
-  const { orgId } = await withOrg(ctx, args);
+  const { orgId } = await resolveOrg(ctx);
   const subjectId = canonicalSubject(ctx, args.subjectType, args.subjectId);
   if (!subjectId) return [];
   // Decay runs under a model: the one a caller names (to reproduce a historical score), else the active one.

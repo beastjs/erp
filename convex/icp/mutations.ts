@@ -1,10 +1,13 @@
 import type { Id } from "../_generated/dataModel";
 import type { MutationCtx } from "../_generated/server";
-import { withOrg } from "../_shared/org";
+import { resolveOrg } from "../_shared/org";
 import { DEFAULT_SCORING_MODEL } from "./defaults";
 import { latestIcp, latestScoringModel } from "./queries";
 import type { IcpCriteria, ScoringConfig, ScoringModel } from "./schema";
 import { validateIcpCriteria, validateScoringConfig } from "./validate";
+
+/** Attribution for the default scoring model when seeded with no authenticated caller. Not a person; nothing may treat it as one. */
+export const SYSTEM_ACTOR_DEFAULT_MODEL_SEED = "system:default-scoring-model-seed";
 
 async function creator(ctx: MutationCtx): Promise<string> {
   const identity = await ctx.auth.getUserIdentity();
@@ -31,7 +34,7 @@ export async function createIcpVersion(
   ctx: MutationCtx,
   args: { name: string; criteria: IcpCriteria; supersedesId?: Id<"icpDefinitions"> },
 ): Promise<Id<"icpDefinitions">> {
-  const { orgId } = await withOrg(ctx, args);
+  const { orgId } = await resolveOrg(ctx);
   if (typeof args.name !== "string" || args.name.trim() === "") throw new Error("name is required");
   validateIcpCriteria(args.criteria);
   const version = checkChain(await latestIcp(ctx, {}), args.supersedesId);
@@ -49,8 +52,10 @@ export async function createIcpVersion(
 export async function createScoringModel(
   ctx: MutationCtx,
   args: ScoringConfig & { supersedesId?: Id<"scoringModels"> },
+  /** Who the row is attributed to. Omitted means "the caller", which must be authenticated: no identity throws. */
+  actor?: string,
 ): Promise<Id<"scoringModels">> {
-  const { orgId } = await withOrg(ctx, args);
+  const { orgId } = await resolveOrg(ctx);
   // Pick fields explicitly: never spread caller-shaped input into an insert that also carries orgId.
   const { supersedesId } = args;
   const config: ScoringConfig = {
@@ -72,7 +77,7 @@ export async function createScoringModel(
     version,
     ...config,
     supersedesId,
-    createdBy: await creator(ctx),
+    createdBy: actor ?? (await creator(ctx)),
     activeFrom: Date.now(),
   });
 }
@@ -85,7 +90,11 @@ export async function createScoringModel(
 export async function ensureActiveScoringModel(ctx: MutationCtx): Promise<ScoringModel> {
   const existing = await latestScoringModel(ctx, {});
   if (existing) return existing;
-  const id = await createScoringModel(ctx, structuredClone(DEFAULT_SCORING_MODEL));
+  // The seed can happen inside a scheduled pipeline stage, which has NO identity. It used to be attributed to a
+  // fabricated "internal|<orgId>" actor. Now a real caller is still recorded, and the absence of one is recorded
+  // as an explicitly NON-PERSON system label instead of a counterfeit identity.
+  const identity = await ctx.auth.getUserIdentity();
+  const id = await createScoringModel(ctx, structuredClone(DEFAULT_SCORING_MODEL), identity?.tokenIdentifier ?? SYSTEM_ACTOR_DEFAULT_MODEL_SEED);
   const row = await ctx.db.get(id);
   if (!row) throw new Error("scoring model seed failed");
   return row;

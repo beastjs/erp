@@ -2,7 +2,7 @@ import { paginationOptsValidator, type PaginationResult } from "convex/server";
 import { v } from "convex/values";
 import type { Doc, Id } from "../_generated/dataModel";
 import { mutation, query, type MutationCtx, type QueryCtx } from "../_generated/server";
-import { withOrg } from "../_shared/org";
+import { resolveOrg, withOrg } from "../_shared/org";
 import { subjectType as subjectTypeValidator, type SubjectType } from "../claims/schema";
 import { advance, findState } from "./stages";
 import { STAGES, reasonCode as reasonCodeValidator, stage as stageValidator, stageIndex, type ReasonCode, type Stage } from "./schema";
@@ -49,7 +49,7 @@ const deadLetters = (ctx: QueryCtx, orgId: Id<"orgs">, code?: ReasonCode) =>
 
 /** Every dead-lettered subject in the org, optionally of one reason. Throws past MAX_DEAD_LETTERS instead of truncating. */
 export async function deadLetterQueue(ctx: QueryCtx, args: { reasonCode?: ReasonCode } = {}): Promise<DeadLetterRow[]> {
-  const { orgId } = await withOrg(ctx, args);
+  const { orgId } = await resolveOrg(ctx);
   const rows = await deadLetters(ctx, orgId, args.reasonCode).take(MAX_DEAD_LETTERS + 1);
   if (rows.length > MAX_DEAD_LETTERS) {
     throw new Error(`more than ${MAX_DEAD_LETTERS} dead letters; use the paginated deadLetters query`);
@@ -84,7 +84,7 @@ export const listDeadLetters = query({
  * scheduler whether a continuation exists.)
  */
 export async function resumeDeadLettered(ctx: MutationCtx, args: { subjectType: SubjectType; subjectId: string; fromStage?: Stage }): Promise<void> {
-  const { orgId } = await withOrg(ctx, args);
+  const { orgId } = await resolveOrg(ctx);
   const state = await findState(ctx, orgId, args.subjectType, args.subjectId);
   if (!state) throw new Error("pipeline not started for this subject");
   if (args.fromStage !== undefined && !STAGES.includes(args.fromStage)) throw new Error("not a pipeline stage");

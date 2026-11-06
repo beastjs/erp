@@ -1,6 +1,6 @@
 import type { Id } from "../_generated/dataModel";
 import type { MutationCtx } from "../_generated/server";
-import { withOrg } from "../_shared/org";
+import { resolveOrg } from "../_shared/org";
 import { activeIcp, getIcpVersion } from "../icp/queries";
 import { ensureActiveScoringModel } from "../icp/mutations";
 import { activeSignals } from "../signals/mutations";
@@ -25,7 +25,7 @@ export async function scoreLead(
   ctx: MutationCtx,
   args: { accountId: Id<"accounts">; contactId: Id<"contacts">; icpVersionId?: Id<"icpDefinitions"> },
 ): Promise<Id<"scoreRuns">> {
-  const { orgId } = await withOrg(ctx, args);
+  const { orgId } = await resolveOrg(ctx);
   const account = await ctx.db.get(args.accountId);
   if (!account || account.orgId !== orgId) throw new Error("account not found");
   const contact = await ctx.db.get(args.contactId);

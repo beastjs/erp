@@ -1,6 +1,6 @@
 import type { Id } from "../_generated/dataModel";
 import type { MutationCtx, QueryCtx } from "../_generated/server";
-import { withOrg } from "../_shared/org";
+import { resolveOrg } from "../_shared/org";
 import {
   emailDomain,
   normalizeCompanyName,
@@ -86,7 +86,7 @@ export async function linkIdentity(
     signals: string[];
   },
 ): Promise<Id<"identityLinks">> {
-  const { orgId } = await withOrg(ctx, args);
+  const { orgId } = await resolveOrg(ctx);
   if (!(args.score >= 0 && args.score <= 1)) throw new Error("score must be between 0 and 1");
   if (args.subjectId === args.mergedFromId) throw new Error("cannot link a subject to itself");
   const tbl = table(args.subjectType);
@@ -127,7 +127,7 @@ export async function unlinkIdentity(
   ctx: MutationCtx,
   args: { linkId: Id<"identityLinks"> },
 ): Promise<void> {
-  const { orgId } = await withOrg(ctx, args);
+  const { orgId } = await resolveOrg(ctx);
   const link = await ctx.db.get(args.linkId);
   if (!link || link.orgId !== orgId) throw new Error("link not found");
   if (link.reversedAt !== undefined) return;

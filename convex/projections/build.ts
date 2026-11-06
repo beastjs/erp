@@ -1,6 +1,6 @@
 import type { Id } from "../_generated/dataModel";
 import type { MutationCtx } from "../_generated/server";
-import { withOrg } from "../_shared/org";
+import { resolveOrg } from "../_shared/org";
 import { loadClaimsForField, loadClaimsForSubject } from "../claims/queries";
 import type { Claim, SubjectType } from "../claims/schema";
 import { resolveField, type SourceTrust } from "./resolve";
@@ -87,7 +87,7 @@ export async function applyClaimToProjection(
   ctx: MutationCtx,
   args: SubjectArgs & { claimId: Id<"claims"> },
 ): Promise<void> {
-  const { orgId } = await withOrg(ctx, args);
+  const { orgId } = await resolveOrg(ctx);
   const subject = await loadSubject(ctx, orgId, args);
   const claim = await ctx.db.get(args.claimId);
   if (
@@ -111,7 +111,7 @@ export async function applyClaimToProjection(
 
 /** Full recompute: every field re-resolved from the whole ledger for the subject. */
 export async function rebuildProjection(ctx: MutationCtx, args: SubjectArgs): Promise<void> {
-  const { orgId } = await withOrg(ctx, args);
+  const { orgId } = await resolveOrg(ctx);
   const subject = await loadSubject(ctx, orgId, args);
   // Deliberately not caught: claimsForSubject throws past MAX_CLAIMS rather than truncate.
   const claims: Claim[] = await loadClaimsForSubject(ctx, orgId, {

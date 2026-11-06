@@ -1,6 +1,6 @@
 import type { Doc, Id } from "../_generated/dataModel";
 import type { MutationCtx, QueryCtx } from "../_generated/server";
-import { withOrg } from "../_shared/org";
+import { resolveOrg } from "../_shared/org";
 import { normalizeEmail, normalizeDomain } from "../_shared/normalize";
 import { getScoringModel, latestIcp, latestScoringModel } from "../icp/queries";
 import { decayedWeight } from "../signals/decay";
@@ -127,7 +127,7 @@ export async function packageLead(
   ctx: MutationCtx,
   args: { accountId: Id<"accounts">; contactId: Id<"contacts">; scoreRunId: Id<"scoreRuns">; suppressed: boolean; freshnessWindowDays?: number },
 ): Promise<Id<"leads">> {
-  const { orgId } = await withOrg(ctx, args);
+  const { orgId } = await resolveOrg(ctx);
   const windowDays = args.freshnessWindowDays ?? DEFAULT_FRESHNESS_WINDOW_DAYS;
   if (!(Number.isFinite(windowDays) && windowDays > 0)) throw new Error("freshnessWindowDays must be a finite number > 0");
   if (typeof args.suppressed !== "boolean") throw new Error("suppressed must be a boolean");
@@ -209,7 +209,7 @@ const hasBeenDelivered = (lead: Doc<"leads">) =>
   lead.inventoryState === "Delivered" || lead.disposition === "Delivered" || lead.disposition === "Accepted" || lead.disposition === "Converted";
 
 async function loadLead(ctx: MutationCtx, leadId: Id<"leads">): Promise<Doc<"leads">> {
-  const { orgId } = await withOrg(ctx, { leadId });
+  const { orgId } = await resolveOrg(ctx);
   const lead = await ctx.db.get(leadId);
   if (!lead || lead.orgId !== orgId) throw new Error("lead not found");
   return lead;

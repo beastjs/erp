@@ -1,7 +1,7 @@
 import { v } from "convex/values";
 import type { Id } from "../_generated/dataModel";
 import { mutation, type MutationCtx } from "../_generated/server";
-import { withOrg } from "../_shared/org";
+import { resolveOrg } from "../_shared/org";
 import { scoringConfigForRead } from "../icp/queries";
 import { markScoreStale } from "../pipeline/stages";
 import { claimMethod, subjectType, type ClaimMethod, type SubjectType } from "./schema";
@@ -24,7 +24,7 @@ export type AppendClaimArgs = {
  * without a nested function call per claim. Every check lives here; the endpoint below adds nothing.
  */
 export async function appendClaimRecord(ctx: MutationCtx, args: AppendClaimArgs): Promise<Id<"claims">> {
-  const { orgId } = await withOrg(ctx, args);
+  const { orgId } = await resolveOrg(ctx);
   if (!(args.confidence >= 0 && args.confidence <= 1)) {
     throw new Error("confidence must be between 0 and 1");
   }

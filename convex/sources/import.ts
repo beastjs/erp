@@ -2,7 +2,7 @@ import { v } from "convex/values";
 import { api, internal } from "../_generated/api";
 import type { Doc, Id } from "../_generated/dataModel";
 import { action, internalMutation, mutation, query, type MutationCtx } from "../_generated/server";
-import { unsafeCtxAsOrgForInternalOnly, withOrg } from "../_shared/org";
+import { withOrg, withTrustedOrgForInternalOnly } from "../_shared/org";
 import { bumpRun, failRun, loadRun, settleRun } from "../runs/mutations";
 import { checkContractVersion, validateCandidate } from "./contract";
 import { parseCsv } from "./csv";
@@ -229,7 +229,7 @@ export const resumeImport = mutation({
 export const processStagedChunk = internalMutation({
   args: { orgId: v.id("orgs"), runId: v.id("discoveryRuns"), seq: v.number() },
   handler: async (rawCtx, args): Promise<null> => {
-    const ctx = unsafeCtxAsOrgForInternalOnly(rawCtx, args.orgId);
+    const ctx = withTrustedOrgForInternalOnly(rawCtx, args.orgId);
     const run = await ctx.db.get(args.runId);
     if (!run || run.orgId !== args.orgId || run.status !== "running") return null;
     const chunk = await ctx.db.query("importChunks").withIndex("by_run_and_seq", (q) => q.eq("runId", args.runId).eq("seq", args.seq)).first();
@@ -382,7 +382,7 @@ export const addManualLead = mutation({
       (await ctx.db.insert("sources", { orgId, key, kind: "manual", trustWeight: 1, lawfulBasis: "legitimate_interest" }));
     const id = await insertCandidate(ctx, { candidate: args.candidate, sourceId });
     if (!id) throw new Error("duplicate_candidate: an identical lead is already waiting to be processed");
-    const result = await ingestCandidate(ctx, id);
+    const result = await ingestCandidate(ctx, orgId, id);
     if (result.outcome !== "consumed") throw new Error(result.reason ?? "lead could not be ingested");
     return id;
   },

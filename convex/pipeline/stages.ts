@@ -2,7 +2,7 @@ import { ConvexError, v } from "convex/values";
 import { internal } from "../_generated/api";
 import type { Doc, Id } from "../_generated/dataModel";
 import { internalMutation, mutation, query, type MutationCtx, type QueryCtx } from "../_generated/server";
-import { unsafeCtxAsOrgForInternalOnly, withOrg } from "../_shared/org";
+import { resolveOrg, withOrg, withTrustedOrgForInternalOnly } from "../_shared/org";
 import { loadClaimsForSubject } from "../claims/queries";
 import { subjectType as subjectTypeValidator, type SubjectType } from "../claims/schema";
 import { ensureActiveScoringModel } from "../icp/mutations";
@@ -128,7 +128,7 @@ function outputOf(state: Doc<"pipelineState">): StageOutput {
 
 /** Schedules the subject's CURRENT stage. The only thing that moves the chain; the stage then re-checks that it is still current. */
 export async function advance(ctx: MutationCtx, args: { subjectId: string; subjectType: SubjectType }): Promise<void> {
-  const { orgId } = await withOrg(ctx, args);
+  const { orgId } = await resolveOrg(ctx);
   const state = await requireState(ctx, orgId, args.subjectType, args.subjectId);
   if (state.status !== "active") return;
   await ctx.scheduler.runAfter(0, internal.pipeline.stages.step, { orgId, subjectType: state.subjectType, subjectId: state.subjectId, stage: state.stage });
@@ -220,7 +220,7 @@ async function recordFailure(ctx: MutationCtx, state: Doc<"pipelineState">, stag
  * Only the subject's current stage executes; any other stage is skipped (a stale or duplicate scheduled call).
  */
 export async function runStage(ctx: MutationCtx, args: { subjectId: string; subjectType: SubjectType; stage: Stage }): Promise<StageRunResult> {
-  const { orgId } = await withOrg(ctx, args);
+  const { orgId } = await resolveOrg(ctx);
   if (!STAGES.includes(args.stage)) throw new Error("not a pipeline stage");
   const state = await requireState(ctx, orgId, args.subjectType, args.subjectId);
   if (state.status === "deadlettered") return { status: "deadlettered", reasonCode: state.deadReasonCode };
@@ -322,7 +322,7 @@ async function completeStage(ctx: MutationCtx, before: Doc<"pipelineState">, sta
 export const executeStage = internalMutation({
   args: { orgId: v.id("orgs"), subjectType: subjectTypeValidator, subjectId: v.string(), stage: stageValidator },
   handler: async (rawCtx, args): Promise<StageResult> => {
-    const ctx = unsafeCtxAsOrgForInternalOnly(rawCtx, args.orgId);
+    const ctx = withTrustedOrgForInternalOnly(rawCtx, args.orgId);
     const state = await findState(ctx, args.orgId, args.subjectType, args.subjectId);
     if (!state) throw stageFailure("no_such_record", "pipelineState");
     return await stageHandlers[args.stage](ctx, { orgId: args.orgId, state });
@@ -333,7 +333,7 @@ export const executeStage = internalMutation({
 export const step = internalMutation({
   args: { orgId: v.id("orgs"), subjectType: subjectTypeValidator, subjectId: v.string(), stage: stageValidator },
   handler: async (rawCtx, args): Promise<null> => {
-    const ctx = unsafeCtxAsOrgForInternalOnly(rawCtx, args.orgId);
+    const ctx = withTrustedOrgForInternalOnly(rawCtx, args.orgId);
     const state = await findState(ctx, args.orgId, args.subjectType, args.subjectId);
     if (!state || state.status !== "active" || state.stage !== args.stage) return null;
     await runStage(ctx, { subjectType: args.subjectType, subjectId: args.subjectId, stage: args.stage });
@@ -448,7 +448,7 @@ export async function enqueueSubject(
   ctx: MutationCtx,
   args: { subjectType: SubjectType; subjectId: string; runId?: Id<"discoveryRuns"> },
 ): Promise<{ stateId: Id<"pipelineState">; created: boolean } | { refused: "budget_exhausted" }> {
-  const { orgId } = await withOrg(ctx, args);
+  const { orgId } = await resolveOrg(ctx);
   const id = ctx.db.normalizeId(tableFor(args.subjectType), args.subjectId);
   const row = id && (await ctx.db.get(id));
   if (!id || !row || row.orgId !== orgId) throw new Error("subject not found");
@@ -518,7 +518,7 @@ async function rewindToResolve(ctx: MutationCtx, state: Doc<"pipelineState">): P
  * to make sure a rescore HAPPENS. Idempotent: rewinding a subject already rewound changes nothing.
  */
 export async function markScoreStale(ctx: MutationCtx, args: { subjectType: SubjectType; subjectId: string }): Promise<void> {
-  const { orgId } = await withOrg(ctx, args);
+  const { orgId } = await resolveOrg(ctx);
   if (args.subjectType === "contact") {
     const state = await findState(ctx, orgId, "contact", args.subjectId);
     if (state) await rewindToResolve(ctx, state);
@@ -541,7 +541,7 @@ export async function markScoreStale(ctx: MutationCtx, args: { subjectType: Subj
 export const markAccountStale = internalMutation({
   args: { orgId: v.id("orgs"), accountId: v.id("accounts"), cursor: v.union(v.string(), v.null()) },
   handler: async (rawCtx, args): Promise<null> => {
-    const ctx = unsafeCtxAsOrgForInternalOnly(rawCtx, args.orgId);
+    const ctx = withTrustedOrgForInternalOnly(rawCtx, args.orgId);
     const page = await ctx.db
       .query("pipelineState")
       .withIndex("by_org_and_account", (q) => q.eq("orgId", args.orgId).eq("accountId", args.accountId))

@@ -1,6 +1,6 @@
 import type { Id } from "../_generated/dataModel";
 import type { MutationCtx } from "../_generated/server";
-import { withOrg } from "../_shared/org";
+import { resolveOrg } from "../_shared/org";
 import type { SubjectType } from "../claims/schema";
 import { hasActiveInboundLink } from "../projections/identity";
 import { ensureActiveScoringModel } from "../icp/mutations";
@@ -90,7 +90,7 @@ export async function recordScoreRun(
     alsoSignalSubjects?: Array<{ subjectType: SubjectType; subjectId: string }>;
   },
 ): Promise<Id<"scoreRuns">> {
-  const { orgId } = await withOrg(ctx, args);
+  const { orgId } = await resolveOrg(ctx);
   const subjectId = ctx.db.normalizeId(args.subjectType === "account" ? "accounts" : "contacts", args.subjectId);
   if (!subjectId) throw new Error("invalid subject id");
   const subject = await ctx.db.get(subjectId);

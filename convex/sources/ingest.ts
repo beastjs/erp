@@ -15,7 +15,7 @@ import type { SubjectType } from "../claims/schema";
 import { rebuildProjection } from "../projections/build";
 import { matchCandidate } from "../projections/identity";
 import { bumpRun, type RunCounter } from "../runs/mutations";
-import { unsafeCtxAsOrgForInternalOnly, withOrg } from "../_shared/org";
+import { withOrg, withTrustedOrgForInternalOnly } from "../_shared/org";
 import { checkContractVersion, validateCandidate, type NormalizedCandidate } from "./contract";
 
 /** Per-mutation cap: each candidate costs ~30 document writes, and a mutation may write 16k. */
@@ -134,8 +134,7 @@ async function reject(ctx: MutationCtx, row: Doc<"candidates">, reason: string):
  * Marking the candidate `consumed` is what lets a later re-observation insert fresh: candidate dedupe
  * is scoped to pending rows, so a candidate left pending would block that lead forever.
  */
-export async function ingestCandidate(ctx: MutationCtx, candidateId: Id<"candidates">): Promise<Outcome> {
-  const { orgId } = await withOrg(ctx, {});
+export async function ingestCandidate(ctx: MutationCtx, orgId: Id<"orgs">, candidateId: Id<"candidates">): Promise<Outcome> {
   const row = await ctx.db.get(candidateId);
   if (!row || row.orgId !== orgId) throw new Error("candidate not found");
   if (row.status !== "pending") return { outcome: "skipped" };
@@ -217,7 +216,8 @@ export async function ingestCandidate(ctx: MutationCtx, candidateId: Id<"candida
  */
 export const ingestOne = internalMutation({
   args: { orgId: v.id("orgs"), candidateId: v.id("candidates") },
-  handler: async (ctx, args): Promise<Outcome> => ingestCandidate(unsafeCtxAsOrgForInternalOnly(ctx, args.orgId), args.candidateId),
+  // ingestCandidate hands ctx to shared helpers (claims, projections) that resolve the org themselves.
+  handler: async (ctx, args): Promise<Outcome> => ingestCandidate(withTrustedOrgForInternalOnly(ctx, args.orgId), args.orgId, args.candidateId),
 });
 
 /** Consumes up to INGEST_BATCH candidates; a candidate that cannot be processed is rejected with a reason instead of aborting its neighbours. */
@@ -278,7 +278,7 @@ export const ingestCandidates = mutation({
 export const ingestStep = internalMutation({
   args: { orgId: v.id("orgs"), candidateIds: v.array(v.id("candidates")) },
   handler: async (ctx, args): Promise<null> => {
-    await ingestBatch(unsafeCtxAsOrgForInternalOnly(ctx, args.orgId), args.orgId, args.candidateIds, false);
+    await ingestBatch(ctx, args.orgId, args.candidateIds, false);
     return null;
   },
 });

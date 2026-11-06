@@ -1,7 +1,7 @@
 import { v } from "convex/values";
 import type { Id } from "../_generated/dataModel";
 import { mutation, type MutationCtx } from "../_generated/server";
-import { withOrg } from "../_shared/org";
+import { resolveOrg, withOrg } from "../_shared/org";
 import { CANDIDATE_CONTRACT_VERSION, checkContractVersion, computeDedupeHash, validateCandidate } from "./contract";
 import { lawfulBasis, sourceKind } from "./schema";
 
@@ -41,7 +41,7 @@ export async function insertCandidate(
     contractVersion?: string;
   },
 ): Promise<Id<"candidates"> | null> {
-  const { orgId } = await withOrg(ctx, args);
+  const { orgId } = await resolveOrg(ctx);
   const contractVersion = args.contractVersion ?? CANDIDATE_CONTRACT_VERSION;
   const version = checkContractVersion(contractVersion);
   if (!version.ok) throw new Error(version.error);

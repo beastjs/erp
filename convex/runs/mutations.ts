@@ -83,6 +83,23 @@ export async function spendCredits(ctx: MutationCtx, orgId: Id<"orgs">, runId: I
   return { remaining: remaining - credits };
 }
 
+/**
+ * `spendCredits` for a caller that can act on a refusal. An exhausted budget marks the run `failed` /
+ * `budget_exhausted` (spec 9) and returns null instead of throwing: a throw would roll the mark back with the rest
+ * of the transaction. Nothing is spent when it refuses. The caller MUST return normally for the mark to persist.
+ */
+export async function trySpendCredits(ctx: MutationCtx, orgId: Id<"orgs">, runId: Id<"discoveryRuns">, credits: number): Promise<{ remaining: number } | null> {
+  if (!(Number.isFinite(credits) && credits >= 0)) throw new Error("credits must be a finite number >= 0");
+  const run = await loadRun(ctx, orgId, runId, { active: true });
+  const remaining = run.creditBudget - run.creditsUsed;
+  if (credits > remaining) {
+    await failRun(ctx, run._id, "budget_exhausted");
+    return null;
+  }
+  await ctx.db.patch(run._id, { creditsUsed: run.creditsUsed + credits });
+  return { remaining: remaining - credits };
+}
+
 export const startRun = mutation({
   args: { sourceId: v.id("sources"), icpVersionId: v.optional(v.id("icpDefinitions")), creditBudget: v.number() },
   handler: async (ctx, args) => {

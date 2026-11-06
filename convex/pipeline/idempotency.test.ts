@@ -50,7 +50,12 @@ async function seed(): Promise<Seed> {
   });
 }
 
-const start = async (s: Seed) => (await t.mutation(api.pipeline.stages.startPipeline, { subjectType: "contact", subjectId: s.contactId })).stateId;
+const started = async (s: Seed) => {
+  const out = await t.mutation(api.pipeline.stages.startPipeline, { subjectType: "contact", subjectId: s.contactId });
+  if ("refused" in out) throw new Error(`refused: ${out.refused}`);
+  return out;
+};
+const start = async (s: Seed) => (await started(s)).stateId;
 const state = (id: Id<"pipelineState">) => raw.run((ctx) => ctx.db.get(id)) as Promise<Doc<"pipelineState">>;
 const run = (s: Seed, stage: Stage) => t.run((ctx) => runStage(ctx, { subjectType: "contact", subjectId: s.contactId, stage }));
 const scheduled = () => raw.run((ctx) => ctx.db.system.query("_scheduled_functions").collect());
@@ -365,7 +370,10 @@ describe("the dead-letter queue", () => {
     expect((await pendingSteps()).length).toBe(stepsBefore + 1);
     expect(await run(s, "enrich")).toMatchObject({ status: "done" });
     expect(await t.run((ctx) => deadLetterQueue(ctx))).toEqual([]);
-    await expect(t.mutation(api.pipeline.deadletter.resumeSubject, { subjectType: "contact", subjectId: s.contactId })).rejects.toThrow("nothing to resume");
+    // Resuming an active subject is allowed (it re-schedules the current stage) and changes nothing else; see chain.test.ts.
+    const hashes = (await state(id)).inputHashes;
+    await t.mutation(api.pipeline.deadletter.resumeSubject, { subjectType: "contact", subjectId: s.contactId });
+    expect((await state(id)).inputHashes).toEqual(hashes);
   });
 
   test("resuming from an earlier stage forgets that stage's recorded work and everything after it", async () => {
@@ -387,9 +395,9 @@ describe("the dead-letter queue", () => {
 describe("enqueue", () => {
   test("is idempotent: a second enqueue (a webhook retry) adds nothing", async () => {
     const s = await seed();
-    const first = await t.mutation(api.pipeline.stages.startPipeline, { subjectType: "contact", subjectId: s.contactId });
+    const first = await started(s);
     const steps = (await pendingSteps()).length;
-    const second = await t.mutation(api.pipeline.stages.startPipeline, { subjectType: "contact", subjectId: s.contactId });
+    const second = await started(s);
     expect(first.created).toBe(true);
     expect(second).toEqual({ stateId: first.stateId, created: false });
     expect((await pendingSteps()).length).toBe(steps);
@@ -403,14 +411,13 @@ describe("enqueue", () => {
     await t.mutation(api.pipeline.stages.startPipeline, { subjectType: "contact", subjectId: subjects[0]!.contactId, runId });
     await t.mutation(api.pipeline.stages.startPipeline, { subjectType: "contact", subjectId: subjects[1]!.contactId, runId });
     const steps = (await pendingSteps()).length;
-    await expect(t.mutation(api.pipeline.stages.startPipeline, { subjectType: "contact", subjectId: subjects[2]!.contactId, runId })).rejects.toThrow("budget_exhausted");
+    expect(await t.mutation(api.pipeline.stages.startPipeline, { subjectType: "contact", subjectId: subjects[2]!.contactId, runId })).toEqual({ refused: "budget_exhausted" });
     // Nothing was queued and nothing was spent.
     expect((await pendingSteps()).length).toBe(steps);
     expect(await raw.run((ctx) => ctx.db.query("pipelineState").collect())).toHaveLength(2);
     expect((await t.query(api.runs.queries.getRun, { runId })).creditsUsed).toBe(2);
-    // A retry of an already-enqueued subject is free.
-    await t.mutation(api.pipeline.stages.startPipeline, { subjectType: "contact", subjectId: subjects[0]!.contactId, runId });
-    expect((await t.query(api.runs.queries.getRun, { runId })).creditsUsed).toBe(2);
+    // The run says why it stopped, instead of staying "running" forever.
+    expect(await t.query(api.runs.queries.getRun, { runId })).toMatchObject({ status: "failed", failureReason: "budget_exhausted" });
   });
 
   test("refuses a subject that does not exist or belongs to another org", async () => {

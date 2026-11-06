@@ -28,6 +28,8 @@ export const signals = defineTable({
    * it IS the event's identity: a retry of the same event is a no-op however its observedAt was reported, and two
    * genuinely distinct events on one day are told apart. Absent, identity falls back to the exact
    * (subject, kind, observedAt, sourceId) tuple.
+   * ACCEPTED LIMITATION: a reporter that starts sending an externalId for events it earlier sent without one is a new
+   * identity, so those events count twice; the two identities are never reconciled.
    */
   externalId: v.optional(v.string()),
 })

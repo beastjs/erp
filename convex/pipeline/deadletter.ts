@@ -4,7 +4,7 @@ import type { Doc, Id } from "../_generated/dataModel";
 import { mutation, query, type MutationCtx, type QueryCtx } from "../_generated/server";
 import { withOrg } from "../_shared/org";
 import { subjectType as subjectTypeValidator, type SubjectType } from "../claims/schema";
-import { advance } from "./stages";
+import { advance, findState } from "./stages";
 import { STAGES, reasonCode as reasonCodeValidator, stage as stageValidator, stageIndex, type ReasonCode, type Stage } from "./schema";
 
 /**
@@ -71,17 +71,27 @@ export const listDeadLetters = query({
  * budget, corrects the record, ships the resolver fix), then calls this. It re-runs the failed stage with a fresh
  * attempt count; if the cause is not fixed it fails and dead-letters again, loudly. `fromStage` goes further back:
  * it forgets the recorded hashes of that stage and every later one, so they re-execute even over unchanged inputs
- * (a replay after a logic fix, a manual re-run). Also restarts a finished subject. An active one is refused.
+ * (a replay after a logic fix, a manual re-run). Also restarts a finished subject.
+ *
+ * AN ACTIVE SUBJECT is re-advanced, which is the recovery for one the platform forgot: a scheduled mutation that
+ * throws is not retried, and the chain can fail outside its try blocks (OCC exhaustion, a transaction limit), leaving
+ * `active` with nothing scheduled and no dead letter to find. Re-advancing is idempotent by construction, so it is
+ * safe on a subject that IS correctly scheduled: it only schedules the current stage again, `step` runs a stage only
+ * while it is still current and the stage hash skips recorded work, so a redundant continuation finds the stage
+ * moved on (or its work recorded) and does nothing. Without `fromStage` it touches no recorded hash and no counter.
+ * (A subject in retry backoff will run its stage now instead of at the backoff time; the backoff's own
+ * continuation then finds the stage moved on, or retries it once more. That is the cost of not being able to ask the
+ * scheduler whether a continuation exists.)
  */
 export async function resumeDeadLettered(ctx: MutationCtx, args: { subjectType: SubjectType; subjectId: string; fromStage?: Stage }): Promise<void> {
   const { orgId } = await withOrg(ctx, args);
-  const state = await ctx.db
-    .query("pipelineState")
-    .withIndex("by_org_and_subject", (q) => q.eq("orgId", orgId).eq("subjectType", args.subjectType).eq("subjectId", args.subjectId))
-    .first();
+  const state = await findState(ctx, orgId, args.subjectType, args.subjectId);
   if (!state) throw new Error("pipeline not started for this subject");
-  if (state.status === "active") throw new Error("pipeline is active; nothing to resume");
   if (args.fromStage !== undefined && !STAGES.includes(args.fromStage)) throw new Error("not a pipeline stage");
+  if (state.status === "active" && args.fromStage === undefined) {
+    await advance(ctx, { subjectType: args.subjectType, subjectId: args.subjectId });
+    return;
+  }
   const from: Stage = args.fromStage ?? state.lastError?.stage ?? state.stage;
   const hashes = Object.fromEntries(Object.entries(state.inputHashes).filter(([s]) => stageIndex(s as Stage) < stageIndex(from)));
   await ctx.db.patch(state._id, {

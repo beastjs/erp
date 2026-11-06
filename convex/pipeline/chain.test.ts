@@ -5,6 +5,7 @@ import { api, internal } from "../_generated/api";
 import type { Doc, Id } from "../_generated/dataModel";
 import { createIcpVersion } from "../icp/mutations";
 import { latestIcp } from "../icp/queries";
+import { appendClaimRecord } from "../claims/mutations";
 import { setInventoryState } from "../leads/mutations";
 import schema from "../schema";
 import { deadLetterQueue } from "./deadletter";
@@ -353,5 +354,161 @@ describe("failure and recovery through the real chain", () => {
     expect(st.lastError?.message).toBe(`score still stale after ${MAX_REWINDS} rescores: always stale`);
     // Nothing changed between rewinds, so every stage skipped on its hash: the loop cost reads, not scores.
     expect(await all("scoreRuns")).toHaveLength(1);
+  });
+});
+
+/** A subject the platform forgot: `active`, with no continuation scheduled. A scheduled mutation that throws is not retried. */
+async function wedge(contactId: Id<"contacts">, stage: (typeof STAGES)[number]) {
+  await raw.run(async (ctx) => {
+    for (const f of await ctx.db.system.query("_scheduled_functions").collect()) if (f.state.kind === "pending") await ctx.scheduler.cancel(f._id);
+    const row = (await ctx.db.query("pipelineState").collect()).find((r) => r.subjectId === contactId)!;
+    await ctx.db.patch(row._id, { stage, status: "active", attempt: 0 });
+  });
+}
+const pendingSteps = async () => (await raw.run((ctx) => ctx.db.system.query("_scheduled_functions").collect())).filter((f: { name: string; state: { kind: string } }) => f.state.kind === "pending" && f.name.endsWith(":step"));
+
+describe("an active subject with nothing scheduled", () => {
+  test.each(["ingest", "resolve"] as const)("wedged at %s it is revived by resumeSubject and runs to the end", async (stage) => {
+    const { contactId, accountId, sourceId } = await ingestLead();
+    await makeIcp();
+    await funding(accountId, sourceId);
+    await start(contactId);
+    await wedge(contactId, stage);
+    await drain();
+    expect(await state(contactId)).toMatchObject({ status: "active", stage }); // nothing moves it
+    expect(await all("leads")).toHaveLength(0);
+
+    await t.mutation(api.pipeline.deadletter.resumeSubject, { subjectType: "contact", subjectId: contactId });
+    await drain();
+    expect(await state(contactId)).toMatchObject({ status: "done", stage: "package" });
+    expect(await all("leads")).toHaveLength(1);
+  });
+
+  test("resuming a subject that IS scheduled does not run a stage twice or score twice", async () => {
+    const { contactId, accountId, sourceId } = await ingestLead();
+    await makeIcp();
+    await funding(accountId, sourceId);
+    const calls: Record<string, number> = {};
+    for (const stage of STAGES) {
+      const body = stageHandlers[stage];
+      stageHandlers[stage] = async (ctx, subject) => ((calls[stage] = (calls[stage] ?? 0) + 1), body(ctx, subject));
+    }
+    await start(contactId);
+    await t.mutation(api.pipeline.deadletter.resumeSubject, { subjectType: "contact", subjectId: contactId });
+    await t.mutation(api.pipeline.deadletter.resumeSubject, { subjectType: "contact", subjectId: contactId });
+    expect(await pendingSteps()).toHaveLength(3); // the redundant continuations are real
+    await drain();
+    expect(await state(contactId)).toMatchObject({ status: "done", stage: "package" });
+    expect(calls).toEqual(Object.fromEntries(STAGES.map((s) => [s, 1])));
+    expect(await all("scoreRuns")).toHaveLength(1);
+    expect(await all("leads")).toHaveLength(1);
+  });
+
+  test("resuming mid-chain keeps recorded work: it does not re-run completed stages", async () => {
+    const { contactId, accountId, sourceId } = await ingestLead();
+    await makeIcp();
+    await funding(accountId, sourceId);
+    await start(contactId);
+    await drain();
+    await t.mutation(api.pipeline.stages.startPipeline, { subjectType: "contact", subjectId: contactId }); // restarts at ingest
+    await wedge(contactId, "score");
+    const before = await all("scoreRuns");
+    await t.mutation(api.pipeline.deadletter.resumeSubject, { subjectType: "contact", subjectId: contactId });
+    await drain();
+    expect(await all("scoreRuns")).toHaveLength(before.length); // score's hash matched, so it skipped
+    expect(await state(contactId)).toMatchObject({ status: "done" });
+  });
+});
+
+describe("budget exhaustion", () => {
+  test("marks the run failed with budget_exhausted, and refuses the subject without queueing it", async () => {
+    const { contactId, sourceId } = await ingestLead();
+    const runId = await t.mutation(api.runs.mutations.startRun, { sourceId, creditBudget: 0 });
+    const out = await t.mutation(api.pipeline.stages.startPipeline, { subjectType: "contact", subjectId: contactId, runId });
+    expect(out).toEqual({ refused: "budget_exhausted" });
+    expect(await t.query(api.runs.queries.getRun, { runId })).toMatchObject({ status: "failed", failureReason: "budget_exhausted", creditsUsed: 0 });
+    expect(await all("pipelineState")).toHaveLength(0);
+    expect(await pendingSteps()).toHaveLength(0);
+  });
+});
+
+describe("score staleness from expiry", () => {
+  const WEEK = 7 * DAY;
+  async function expiring() {
+    const s = await ingestLead();
+    await makeIcp();
+    await funding(s.accountId, s.sourceId, { expiresAt: Date.now() + 30 * DAY });
+    await start(s.contactId);
+    await drain();
+    expect(await state(s.contactId)).toMatchObject({ status: "done" });
+    return s;
+  }
+
+  test("re-enqueueing after a counted signal expired rescores, though no input row changed", async () => {
+    const s = await expiring();
+    const first = (await all("scoreRuns"))[0]!;
+    const hash = (await state(s.contactId)).inputHashes.score;
+    vi.setSystemTime(Date.now() + 5 * WEEK);
+    await t.mutation(api.pipeline.stages.startPipeline, { subjectType: "contact", subjectId: s.contactId });
+    await drain();
+    const runs = await all("scoreRuns");
+    expect(runs).toHaveLength(2);
+    expect(runs[1]!.intent).toBeLessThan(first.intent);
+    // The recorded hash is still a pure function of stored data: the clock was not folded into it.
+    expect((await state(s.contactId)).inputHashes.score).toBe(hash);
+    // Without the funding intent the lead is a Reject: the pipeline stops there instead of packaging a stale Tier S.
+    expect(await state(s.contactId)).toMatchObject({ status: "done", finishedReason: "rejected_tier" });
+  });
+
+  test("before the expiry nothing is rescored", async () => {
+    const s = await expiring();
+    vi.setSystemTime(Date.now() + WEEK);
+    await t.mutation(api.pipeline.stages.startPipeline, { subjectType: "contact", subjectId: s.contactId });
+    await drain();
+    expect(await all("scoreRuns")).toHaveLength(1);
+  });
+
+  test("qualify finding the expiry rescores instead of rewinding into a dead letter", async () => {
+    const s = await expiring();
+    vi.setSystemTime(Date.now() + 5 * WEEK);
+    // A replay from qualify forgets qualify's and package's recorded work, so qualify really evaluates the old score.
+    await t.mutation(api.pipeline.deadletter.resumeSubject, { subjectType: "contact", subjectId: s.contactId, fromStage: "qualify" });
+    await drain();
+    expect(await state(s.contactId)).toMatchObject({ status: "done", finishedReason: "rejected_tier", rewinds: 0 });
+    expect(await all("scoreRuns")).toHaveLength(2);
+  });
+});
+
+describe("account fan-out", () => {
+  test("N account claims in one transaction schedule one fan-out chain, not N", async () => {
+    const s = await ingestLead();
+    await makeIcp();
+    await start(s.contactId);
+    await drain(); // the contact's pipeline now names the account
+    const fanouts = async () => (await raw.run((ctx) => ctx.db.system.query("_scheduled_functions").collect())).filter((f: { name: string; state: { kind: string } }) => f.state.kind === "pending" && f.name.endsWith(":markAccountStale"));
+    expect(await fanouts()).toHaveLength(0);
+    await t.run(async (ctx) => {
+      for (let i = 0; i < 5; i++) await appendClaimRecord(ctx, { subjectType: "account", subjectId: s.accountId, field: `f${i}`, value: i, sourceId: s.sourceId, method: "observed", confidence: 1, observedAt: Date.now() });
+    });
+    expect(await fanouts()).toHaveLength(1);
+    // A second transaction is a second chain: coalescing is per transaction, never across them.
+    await t.run((ctx) => appendClaimRecord(ctx, { subjectType: "account", subjectId: s.accountId, field: "g", value: 1, sourceId: s.sourceId, method: "observed", confidence: 1, observedAt: Date.now() }));
+    expect(await fanouts()).toHaveLength(2);
+    await drain();
+    expect(await state(s.contactId)).toMatchObject({ status: "done" });
+  });
+});
+
+describe("pipelineState uniqueness", () => {
+  test("two rows for one subject are a loud error, not a silently orphaned row", async () => {
+    const { contactId } = await ingestLead();
+    await start(contactId);
+    await raw.run(async (ctx) => {
+      const row = (await ctx.db.query("pipelineState").collect())[0]!;
+      const { _id, _creationTime, ...rest } = row;
+      await ctx.db.insert("pipelineState", rest);
+    });
+    await expect(t.query(api.pipeline.stages.pipelineStatus, { subjectType: "contact", subjectId: contactId })).rejects.toThrow();
+    await expect(start(contactId)).rejects.toThrow();
   });
 });

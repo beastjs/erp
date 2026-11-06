@@ -9,7 +9,7 @@ import { ensureActiveScoringModel } from "../icp/mutations";
 import { latestIcp } from "../icp/queries";
 import { packageLead, setInventoryState, staleReason } from "../leads/mutations";
 import { rebuildProjection } from "../projections/build";
-import { spendCredits } from "../runs/mutations";
+import { trySpendCredits } from "../runs/mutations";
 import { scoreLead } from "../scoring/assemble";
 import { MAX_SIGNALS, activeSignals } from "../signals/mutations";
 import { stageInputHash } from "./hash";
@@ -103,11 +103,17 @@ function classify(e: unknown): Classified {
 
 const tableFor = (t: SubjectType) => (t === "account" ? ("accounts" as const) : ("contacts" as const));
 
-async function findState(ctx: Pick<QueryCtx, "db">, orgId: Id<"orgs">, subjectType: SubjectType, subjectId: string): Promise<Doc<"pipelineState"> | null> {
+/**
+ * THE row for a subject. `.unique()` rather than `.first()`: nothing in the schema can enforce one row per subject,
+ * and `.first()` would silently pick one of two and orphan the other, invisible to every read. Concurrent enqueues
+ * cannot create two under Convex's serializable transactions (the second one's read of this exact key conflicts
+ * with the first one's insert and retries), so a second row means something wrote around the helper; it fails loudly.
+ */
+export async function findState(ctx: Pick<QueryCtx, "db">, orgId: Id<"orgs">, subjectType: SubjectType, subjectId: string): Promise<Doc<"pipelineState"> | null> {
   return await ctx.db
     .query("pipelineState")
     .withIndex("by_org_and_subject", (q) => q.eq("orgId", orgId).eq("subjectType", subjectType).eq("subjectId", subjectId))
-    .first();
+    .unique();
 }
 
 async function requireState(ctx: Pick<QueryCtx, "db">, orgId: Id<"orgs">, subjectType: SubjectType, subjectId: string): Promise<Doc<"pipelineState">> {
@@ -228,7 +234,7 @@ export async function runStage(ctx: MutationCtx, args: { subjectId: string; subj
     return await recordFailure(ctx, state, stage, classify(e));
   }
 
-  if (state.inputHashes[stage] === hash) {
+  if (state.inputHashes[stage] === hash && !(await scoreExpiredUnderneath(ctx, orgId, state, stage))) {
     if (state.status === "active" && state.stage === stage) await completeStage(ctx, state, stage, hash, { kind: "done" });
     return { status: "skipped", output: outputOf(state) };
   }
@@ -243,6 +249,22 @@ export async function runStage(ctx: MutationCtx, args: { subjectId: string; subj
     return await recordFailure(ctx, state, stage, classify(e));
   }
   return await completeStage(ctx, state, stage, hash, result);
+}
+
+/**
+ * The recorded `score` is the current one, its inputs are unchanged, and yet it no longer describes the world: a
+ * signal it counted has expired. Nothing was written, so the input hash cannot see it, and the hash must not be
+ * made to (it is a pure function of stored data, not of the clock). So the SKIP decision, not the hash, asks
+ * `staleReason`. The answer is advisory and is never persisted; what is persisted is the new scoreRun, which is
+ * timestamped as scoreRuns always are. Only the subject's current `score` stage is affected, and a rescore is a
+ * fresh scoreRun, so this cannot loop: the new run postdates the expiry.
+ */
+async function scoreExpiredUnderneath(ctx: MutationCtx, orgId: Id<"orgs">, state: Doc<"pipelineState">, stage: Stage): Promise<boolean> {
+  if (stage !== "score" || state.status !== "active" || state.stage !== "score") return false;
+  if (state.subjectType !== "contact" || !state.scoreRunId || !state.accountId) return false;
+  const scoreRun = await ctx.db.get(state.scoreRunId);
+  if (!scoreRun || scoreRun.orgId !== orgId) return false;
+  return (await staleReason(ctx, orgId, scoreRun, { accountId: state.accountId, contactId: state.subjectId as Id<"contacts"> }, Date.now())) !== null;
 }
 
 /** Records a stage's success and chains. Re-reads the state: the stage may have been rewound by an event it caused or raced with. */
@@ -384,7 +406,7 @@ export const stageHandlers: Record<Stage, StageHandler> = {
   async qualify(ctx, { orgId, state }) {
     const scoreRun = state.scoreRunId ? await ctx.db.get(state.scoreRunId) : null;
     if (!scoreRun || scoreRun.orgId !== orgId || !state.accountId) throw stageFailure("no_such_record", "scoreRun");
-    const stale = await staleReason(ctx, orgId, scoreRun, { accountId: state.accountId, contactId: state.subjectId as Id<"contacts"> });
+    const stale = await staleReason(ctx, orgId, scoreRun, { accountId: state.accountId, contactId: state.subjectId as Id<"contacts"> }, Date.now());
     if (stale) return { kind: "rewind", reason: stale };
     if (scoreRun.tier === "Reject") return { kind: "stop", reason: "rejected_tier" };
     return { kind: "done" };
@@ -397,7 +419,7 @@ export const stageHandlers: Record<Stage, StageHandler> = {
     // Idempotent per scoreRun: packaging is append-only, so a replay finds the lead it already made.
     const existing = await ctx.db.query("leads").withIndex("by_org_and_score_run", (q) => q.eq("orgId", orgId).eq("scoreRunId", scoreRun._id)).first();
     if (existing) return { kind: "done", output: { leadId: existing._id } };
-    const stale = await staleReason(ctx, orgId, scoreRun, { accountId: state.accountId, contactId });
+    const stale = await staleReason(ctx, orgId, scoreRun, { accountId: state.accountId, contactId }, Date.now());
     if (stale) return { kind: "rewind", reason: stale };
     // TASK 13 replaces `suppressed: false` with a live isSuppressed(...) lookup. Until then nothing is ever suppressed here.
     const leadId = await packageLead(ctx, { accountId: state.accountId, contactId, scoreRunId: scoreRun._id, suppressed: false });
@@ -417,12 +439,15 @@ export const stageHandlers: Record<Stage, StageHandler> = {
  * Puts a subject in the pipeline. Idempotent: a second enqueue (a webhook retry) finds the row and adds nothing; a
  * finished one is restarted from `ingest`, where every unchanged stage skips on its hash; a dead-lettered one stays
  * dead until `resumeSubject`. BACKPRESSURE: when the subject belongs to a run, the run is charged
- * `CREDITS_PER_SUBJECT` here, and an exhausted budget REFUSES (throws `budget_exhausted`, queues nothing).
+ * `CREDITS_PER_SUBJECT` here, and an exhausted budget REFUSES: queues nothing, marks the run `failed` with
+ * reason `budget_exhausted` (spec 9), and RETURNS `{ refused }` rather than throwing. It cannot throw: a throw
+ * rolls the whole transaction back, including the mark, which would leave the run `running` forever, the exact wedge
+ * the terminal `failed` state exists to close.
  */
 export async function enqueueSubject(
   ctx: MutationCtx,
   args: { subjectType: SubjectType; subjectId: string; runId?: Id<"discoveryRuns"> },
-): Promise<{ stateId: Id<"pipelineState">; created: boolean }> {
+): Promise<{ stateId: Id<"pipelineState">; created: boolean } | { refused: "budget_exhausted" }> {
   const { orgId } = await withOrg(ctx, args);
   const id = ctx.db.normalizeId(tableFor(args.subjectType), args.subjectId);
   const row = id && (await ctx.db.get(id));
@@ -435,7 +460,7 @@ export async function enqueueSubject(
     }
     return { stateId: existing._id, created: false };
   }
-  if (args.runId) await spendCredits(ctx, orgId, args.runId, CREDITS_PER_SUBJECT);
+  if (args.runId && !(await trySpendCredits(ctx, orgId, args.runId, CREDITS_PER_SUBJECT))) return { refused: "budget_exhausted" };
   const stateId = await ctx.db.insert("pipelineState", {
     orgId,
     subjectType: args.subjectType,
@@ -469,6 +494,9 @@ export const pipelineStatus = query({
   },
 });
 
+/** Accounts already fanned out to in a transaction; see markScoreStale. */
+const accountFanouts = new WeakMap<object, Set<string>>();
+
 /** Contacts rewound per continuation, so no single mutation walks an unbounded account. */
 const REWIND_PAGE = 50;
 
@@ -498,7 +526,14 @@ export async function markScoreStale(ctx: MutationCtx, args: { subjectType: Subj
   }
   const own = await findState(ctx, orgId, "account", args.subjectId);
   if (own) await rewindToResolve(ctx, own);
+  // One fan-out chain per account per transaction: N claims about one account in one mutation (an import chunk)
+  // need one chain, which reads everything they wrote. Keyed by the transaction's db handle; a different
+  // transaction (or a nested one, which can roll back on its own) has a different handle and schedules its own.
+  const fanned = accountFanouts.get(ctx.db) ?? new Set<string>();
+  accountFanouts.set(ctx.db, fanned);
+  if (fanned.has(args.subjectId)) return;
   const any = await ctx.db.query("pipelineState").withIndex("by_org_and_account", (q) => q.eq("orgId", orgId).eq("accountId", args.subjectId as Id<"accounts">)).first();
+  if (any) fanned.add(args.subjectId);
   if (any) await ctx.scheduler.runAfter(0, internal.pipeline.stages.markAccountStale, { orgId, accountId: args.subjectId as Id<"accounts">, cursor: null });
 }
 

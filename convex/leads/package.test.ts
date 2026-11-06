@@ -455,3 +455,70 @@ describe("the gate is re-checked when a lead is released", () => {
     expect((await lead(id)).disposition).toBe("Converted");
   });
 });
+
+describe("Accepted and Converted follow delivery", () => {
+  const release = (id: Id<"leads">, disposition: "Accepted" | "Converted", over: { suppressed?: boolean } = {}) =>
+    t.run((ctx) => setDisposition(ctx, { leadId: id, disposition, suppressed: false, ...over }));
+
+  test("a lead that was never delivered cannot be Accepted or Converted, however the caller labels it", async () => {
+    const s = await seed();
+    const id = await pkg(s, await score(s));
+    for (const disposition of ["Accepted", "Converted"] as const) {
+      await expect(release(id, disposition)).rejects.toThrow("has not been delivered");
+      await expect(release(id, disposition, { suppressed: true })).rejects.toThrow("has not been delivered");
+    }
+    // Reserved and Sold are on the way to a buyer, not in their hands.
+    await t.run((ctx) => setInventoryState(ctx, { leadId: id, state: "Reserved", suppressed: false }));
+    await expect(release(id, "Accepted")).rejects.toThrow("has not been delivered");
+    expect((await lead(id)).disposition).toBe("ReadyForDistribution");
+  });
+
+  test("a Held lead cannot be Accepted either (it fails the persisted verdict before delivery is even asked)", async () => {
+    const s = await seed();
+    const held = await pkg(s, await score(s), { suppressed: true });
+    await expect(release(held, "Converted")).rejects.toThrow();
+    expect((await lead(held)).disposition).toBe("Held");
+  });
+
+  test("delivery by either record unlocks the buyer outcomes, and they stay reachable afterwards", async () => {
+    const byInventory = await seed();
+    const a = await pkg(byInventory, await score(byInventory));
+    await t.run((ctx) => setInventoryState(ctx, { leadId: a, state: "Delivered", suppressed: false }));
+    await release(a, "Accepted");
+    await release(a, "Converted"); // Accepted is itself proof of delivery
+    expect((await lead(a)).disposition).toBe("Converted");
+
+    const byDisposition = await seed();
+    const b = await pkg(byDisposition, await score(byDisposition));
+    await t.run((ctx) => setDisposition(ctx, { leadId: b, disposition: "Delivered", suppressed: false }));
+    await release(b, "Accepted");
+    expect((await lead(b)).disposition).toBe("Accepted");
+  });
+});
+
+describe("a score goes stale when a signal it counted expires", () => {
+  afterEach(() => vi.useRealTimers());
+  const ageBy = (days: number) => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.now() + days * DAY);
+  };
+
+  test("a signal that expired after the score makes it stale; one that expires later, or never, does not", async () => {
+    const s = await seed();
+    await t.run((ctx) =>
+      appendSignal(ctx, { subjectType: "account", subjectId: s.accountId, kind: "hiring_push", strength: "high", confidence: 1, observedAt: Date.now() - DAY, expiresAt: Date.now() + 10 * DAY, externalId: "hp" }),
+    );
+    const run = await score(s); // counts the expiring signal
+    ageBy(5);
+    await expect(pkg(s, run)).resolves.toBeTruthy(); // still inside its life
+    const s2 = await seed();
+    await t.run((ctx) =>
+      appendSignal(ctx, { subjectType: "account", subjectId: s2.accountId, kind: "hiring_push", strength: "high", confidence: 1, observedAt: Date.now() - DAY, expiresAt: Date.now() + 10 * DAY, externalId: "hp" }),
+    );
+    const run2 = await score(s2);
+    ageBy(11);
+    await expect(pkg(s2, run2)).rejects.toThrow("stale scoreRun: a signal about the account expired after the score");
+    // A rescore after the expiry is current again, and so is a score that never counted it.
+    await expect(pkg(s2, await score(s2))).resolves.toBeTruthy();
+  });
+});

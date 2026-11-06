@@ -2,7 +2,9 @@ import type { Doc, Id } from "../_generated/dataModel";
 import type { MutationCtx, QueryCtx } from "../_generated/server";
 import { withOrg } from "../_shared/org";
 import { normalizeEmail, normalizeDomain } from "../_shared/normalize";
-import { latestIcp, latestScoringModel } from "../icp/queries";
+import { getScoringModel, latestIcp, latestScoringModel } from "../icp/queries";
+import { decayedWeight } from "../signals/decay";
+import { MAX_SIGNALS } from "../signals/mutations";
 import { MAX_PROJECTED_FIELDS } from "../scoring/assemble";
 import { checkDistributability, dispositionFor, DEFAULT_FRESHNESS_WINDOW_DAYS } from "../qualify/distributability";
 import { DISPOSITIONS, INVENTORY_STATES, type Disposition, type InventoryState } from "./schema";
@@ -15,14 +17,24 @@ import { DISPOSITIONS, INVENTORY_STATES, type Disposition, type InventoryState }
  *  - the org has since activated a newer ICP or scoring model (it was scored under superseded rules).
  *  - a signal about the account or the contact was recorded after it (intent is weighted 45 of 100, so a
  *    new funding signal must not be scored around). `by_subject_created` orders signals by recorded-at.
+ *  - a signal the score COUNTED has since lost all weight (it passed its `expiresAt`): the world moved on
+ *    without any write, so no event could mark it. Spec 4.6: scores drift visibly, they do not age silently.
  * The pipeline's markScoreStale is the event-driven side of this; this is the check at the point of use.
+ *
+ * `now` is an argument, not a clock read here, and the answer is ADVISORY: it is never persisted and never
+ * feeds an inputHash. (The pipeline uses it to decide whether a recorded score stage may be skipped; the hash
+ * itself stays a pure function of stored data.) Continuous half-life decay is not flagged: it never reaches zero
+ * at a defined moment, so "stale" would need a policy threshold that does not exist yet. An expiry is a stored,
+ * discrete boundary.
  */
 export async function staleReason(
   ctx: QueryCtx,
   orgId: Id<"orgs">,
   scoreRun: Doc<"scoreRuns">,
   subjects: { accountId: Id<"accounts">; contactId: Id<"contacts"> },
+  now: number,
 ): Promise<string | null> {
+  if (!Number.isFinite(now)) throw new Error("now must be a finite number");
   const latest = await ctx.db
     .query("scoreRuns")
     .withIndex("by_subject", (q) => q.eq("orgId", orgId).eq("subjectType", scoreRun.subjectType).eq("subjectId", scoreRun.subjectId))
@@ -44,6 +56,19 @@ export async function staleReason(
       .withIndex("by_subject_created", (q) => q.eq("orgId", orgId).eq("subjectType", subjectType).eq("subjectId", subjectId).gt("_creationTime", scoreRun._creationTime))
       .first();
     if (newer) return `a signal about the ${subjectType} was recorded after the score`;
+  }
+
+  // A signal that carried weight when the score was taken and has none now. Scored under the score's own model.
+  const params = await getScoringModel(ctx, { id: scoreRun.scoringModelId });
+  for (const [subjectType, subjectId] of [["account", subjects.accountId], ["contact", subjects.contactId]] as const) {
+    const rows = await ctx.db
+      .query("signals")
+      .withIndex("by_subject_observed", (q) => q.eq("orgId", orgId).eq("subjectType", subjectType).eq("subjectId", subjectId))
+      .take(MAX_SIGNALS + 1);
+    if (rows.length > MAX_SIGNALS) throw new Error(`subject ${subjectType}:${subjectId} has more than ${MAX_SIGNALS} signals; refusing a partial read`);
+    if (rows.some((s) => s.expiresAt !== undefined && decayedWeight(s, scoreRun.scoredAt, params) > 0 && decayedWeight(s, now, params) === 0)) {
+      return `a signal about the ${subjectType} expired after the score`;
+    }
   }
 
   const icp = await latestIcp(ctx, {});
@@ -121,7 +146,7 @@ export async function packageLead(
     throw new Error(`projection has more than ${MAX_PROJECTED_FIELDS} fields; refusing to package a partial read`);
   }
 
-  const stale = await staleReason(ctx, orgId, scoreRun, { accountId: account._id, contactId: contact._id });
+  const stale = await staleReason(ctx, orgId, scoreRun, { accountId: account._id, contactId: contact._id }, Date.now());
   if (stale) throw new Error(`stale scoreRun: ${stale}`);
   if (scoreRun.tier === "Reject") throw new Error("a Reject-tier score is not packaged");
   const already = await ctx.db.query("leads").withIndex("by_org_and_score_run", (q) => q.eq("orgId", orgId).eq("scoreRunId", scoreRun._id)).first();
@@ -172,6 +197,16 @@ const SHIPPING_DISPOSITIONS: readonly Disposition[] = ["ReadyForDistribution", "
  */
 const RECHECKED_INVENTORY: readonly InventoryState[] = SHIPPING_INVENTORY;
 const RECHECKED_DISPOSITIONS: readonly Disposition[] = ["ReadyForDistribution", "Delivered"];
+
+/**
+ * What a buyer does with a lead already in their hands. These skip the gate re-check on purpose (see above), which
+ * is only safe if they cannot be the FIRST shipping act: otherwise they would release a lead that was never
+ * re-checked at all. So they require proof of delivery. This is one precondition, not a transition graph.
+ */
+const BUYER_OUTCOMES: readonly Disposition[] = ["Accepted", "Converted"];
+/** Delivery is recorded in either field; Accepted and Converted are themselves reachable only after it, so they count as proof. */
+const hasBeenDelivered = (lead: Doc<"leads">) =>
+  lead.inventoryState === "Delivered" || lead.disposition === "Delivered" || lead.disposition === "Accepted" || lead.disposition === "Converted";
 
 async function loadLead(ctx: MutationCtx, leadId: Id<"leads">): Promise<Doc<"leads">> {
   const { orgId } = await withOrg(ctx, { leadId });
@@ -228,5 +263,8 @@ export async function setDisposition(ctx: MutationCtx, args: { leadId: Id<"leads
     throw new Error("a lead that failed distributability cannot be released");
   }
   if (RECHECKED_DISPOSITIONS.includes(args.disposition)) await assertStillDistributable(ctx, lead, args.suppressed, "released");
+  if (BUYER_OUTCOMES.includes(args.disposition) && !hasBeenDelivered(lead)) {
+    throw new Error(`a lead that has not been delivered cannot be ${args.disposition}`);
+  }
   await ctx.db.patch(lead._id, { disposition: args.disposition });
 }

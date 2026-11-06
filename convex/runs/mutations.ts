@@ -59,6 +59,30 @@ export async function settleRun(ctx: MutationCtx, runId: Id<"discoveryRuns">): P
   }
 }
 
+/**
+ * Terminal failure: the run announces that it is dead and why, instead of staying `running` forever.
+ * Idempotent (a finished run keeps its outcome), and it stops the run from accepting more work because
+ * every writer loads it with `active: true`. Counters of work already in flight may still land.
+ */
+export async function failRun(ctx: MutationCtx, runId: Id<"discoveryRuns">, reason: string): Promise<void> {
+  const run = await ctx.db.get(runId);
+  if (!run || run.status !== "running") return;
+  await ctx.db.patch(runId, { status: "failed", failureReason: reason, finishedAt: Date.now() });
+}
+
+/**
+ * Spends credits from a run's budget, refusing (not clamping) past it. Shared by `consumeCredits` and the
+ * pipeline's enqueue gate so there is exactly one place where "the budget is the backpressure" is decided.
+ */
+export async function spendCredits(ctx: MutationCtx, orgId: Id<"orgs">, runId: Id<"discoveryRuns">, credits: number): Promise<{ remaining: number }> {
+  if (!(Number.isFinite(credits) && credits >= 0)) throw new Error("credits must be a finite number >= 0");
+  const run = await loadRun(ctx, orgId, runId, { active: true });
+  const remaining = run.creditBudget - run.creditsUsed;
+  if (credits > remaining) throw new Error("budget_exhausted");
+  await ctx.db.patch(run._id, { creditsUsed: run.creditsUsed + credits });
+  return { remaining: remaining - credits };
+}
+
 export const startRun = mutation({
   args: { sourceId: v.id("sources"), icpVersionId: v.optional(v.id("icpDefinitions")), creditBudget: v.number() },
   handler: async (ctx, args) => {
@@ -100,14 +124,7 @@ export const consumeCredits = mutation({
   args: { runId: v.id("discoveryRuns"), credits: v.number() },
   handler: async (ctx, args) => {
     const { orgId } = await withOrg(ctx, args);
-    if (!(Number.isFinite(args.credits) && args.credits >= 0)) {
-      throw new Error("credits must be a finite number >= 0");
-    }
-    const run = await loadRun(ctx, orgId, args.runId, { active: true });
-    const remaining = run.creditBudget - run.creditsUsed;
-    if (args.credits > remaining) throw new Error("budget_exhausted");
-    await ctx.db.patch(run._id, { creditsUsed: run.creditsUsed + args.credits });
-    return { remaining: remaining - args.credits };
+    return await spendCredits(ctx, orgId, args.runId, args.credits);
   },
 });
 
@@ -117,7 +134,8 @@ export const finishRun = mutation({
   handler: async (ctx, args) => {
     const { orgId } = await withOrg(ctx, args);
     const run = await loadRun(ctx, orgId, args.runId);
-    if (run.status === "completed") return null;
+    // A failed run stays failed: completing it would erase the only signal that it died.
+    if (run.status !== "running") return null;
     await ctx.db.patch(run._id, { status: "completed", finishedAt: Date.now() });
     return null;
   },

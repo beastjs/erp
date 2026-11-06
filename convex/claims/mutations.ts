@@ -3,6 +3,7 @@ import type { Id } from "../_generated/dataModel";
 import { mutation, type MutationCtx } from "../_generated/server";
 import { withOrg } from "../_shared/org";
 import { scoringConfigForRead } from "../icp/queries";
+import { markScoreStale } from "../pipeline/stages";
 import { claimMethod, subjectType, type ClaimMethod, type SubjectType } from "./schema";
 
 export type AppendClaimArgs = {
@@ -45,12 +46,15 @@ export async function appendClaimRecord(ctx: MutationCtx, args: AppendClaimArgs)
   // change never rewrites history; it only governs claims appended from then on.
   const ceiling = (await scoringConfigForRead(ctx, args)).methodCeilings[args.method];
   if (!(ceiling > 0 && ceiling <= 1)) throw new Error("invalid method ceiling");
-  return await ctx.db.insert("claims", {
+  const id = await ctx.db.insert("claims", {
     ...args,
     subjectId,
     orgId,
     confidence: Math.min(args.confidence, ceiling),
   });
+  // New evidence makes any score of this subject stale; a subject in the pipeline is sent back to rescore.
+  await markScoreStale(ctx, { subjectType: args.subjectType, subjectId });
+  return id;
 }
 
 export const appendClaim = mutation({

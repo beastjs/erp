@@ -16,7 +16,9 @@ export const discoveryRuns = defineTable({
   sourceId: v.id("sources"),
   /** The exact ICP version the run was started under; versions are append-only, so this stays meaningful. */
   icpVersionId: v.optional(v.id("icpDefinitions")),
-  status: v.union(v.literal("running"), v.literal("completed")),
+  status: v.union(v.literal("running"), v.literal("completed"), v.literal("failed")),
+  /** Set with status "failed": the named reason the run can never settle (see failRun). A failed run is terminal and does not resume. */
+  failureReason: v.optional(v.string()),
   /** Credits the run may spend; consumeCredits refuses to exceed it. */
   creditBudget: v.number(),
   creditsUsed: v.number(),

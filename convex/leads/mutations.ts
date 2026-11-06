@@ -13,8 +13,9 @@ import { DISPOSITIONS, INVENTORY_STATES, type Disposition, type InventoryState }
  *  - a newer scoreRun exists for its subject (it was superseded);
  *  - a claim about the account or the contact was recorded after it (the evidence changed);
  *  - the org has since activated a newer ICP or scoring model (it was scored under superseded rules).
- * NOT covered, deliberately: a signal appended after scoring. Signals carry no recorded-at index, and the
- * pipeline's markScoreStale (Task 12) is the owner of event-driven invalidation.
+ *  - a signal about the account or the contact was recorded after it (intent is weighted 45 of 100, so a
+ *    new funding signal must not be scored around). `by_subject_created` orders signals by recorded-at.
+ * The pipeline's markScoreStale is the event-driven side of this; this is the check at the point of use.
  */
 export async function staleReason(
   ctx: QueryCtx,
@@ -37,6 +38,14 @@ export async function staleReason(
     if (newer) return `a claim about the ${subjectType} was recorded after the score`;
   }
 
+  for (const [subjectType, subjectId] of [["account", subjects.accountId], ["contact", subjects.contactId]] as const) {
+    const newer = await ctx.db
+      .query("signals")
+      .withIndex("by_subject_created", (q) => q.eq("orgId", orgId).eq("subjectType", subjectType).eq("subjectId", subjectId).gt("_creationTime", scoreRun._creationTime))
+      .first();
+    if (newer) return `a signal about the ${subjectType} was recorded after the score`;
+  }
+
   const icp = await latestIcp(ctx, {});
   const model = await latestScoringModel(ctx, {});
   if (!icp || icp._id !== scoreRun.icpVersionId) return "a newer ICP version is active";
@@ -45,7 +54,12 @@ export async function staleReason(
 }
 
 /** The email resolves, through the dedupe keys ingest records, to exactly this contact; the domain to exactly this account. */
-async function duplicatesChecked(ctx: QueryCtx, orgId: Id<"orgs">, account: Doc<"accounts">, contact: Doc<"contacts">): Promise<boolean> {
+async function duplicatesChecked(
+  ctx: QueryCtx,
+  orgId: Id<"orgs">,
+  account: Pick<Doc<"accounts">, "_id" | "display">,
+  contact: Pick<Doc<"contacts">, "_id" | "display">,
+): Promise<boolean> {
   const email = contact.display.email === undefined ? null : normalizeEmail(contact.display.email);
   const domain = account.display.domain === undefined ? null : normalizeDomain(account.display.domain);
   if (!email || !domain) return false;
@@ -151,6 +165,13 @@ export async function packageLead(
 /** States that put a lead in a buyer's hands or on the way there. A lead that failed the gate may not enter them. */
 const SHIPPING_INVENTORY: readonly InventoryState[] = ["Reserved", "Sold", "Delivered"];
 const SHIPPING_DISPOSITIONS: readonly Disposition[] = ["ReadyForDistribution", "Delivered", "Accepted", "Converted"];
+/**
+ * The transitions that RELEASE a lead and so re-run the gate. Accepted and Converted are what a buyer does
+ * with a lead already delivered; ageing past the freshness window afterwards must not block a customer from
+ * accepting what they were given, so those read only the persisted verdict.
+ */
+const RECHECKED_INVENTORY: readonly InventoryState[] = SHIPPING_INVENTORY;
+const RECHECKED_DISPOSITIONS: readonly Disposition[] = ["ReadyForDistribution", "Delivered"];
 
 async function loadLead(ctx: MutationCtx, leadId: Id<"leads">): Promise<Doc<"leads">> {
   const { orgId } = await withOrg(ctx, { leadId });
@@ -159,22 +180,53 @@ async function loadLead(ctx: MutationCtx, leadId: Id<"leads">): Promise<Doc<"lea
   return lead;
 }
 
+/**
+ * Re-evaluates the gate NOW for a lead about to be released. The verdict persisted at packaging is a
+ * point-in-time fact: a lead packaged clean can be suppressed, age out of its window, or lose a source's
+ * lawful basis before it ships. The gate is re-run over the lead's FROZEN snapshot (what the customer would
+ * receive) with the current clock, the current suppression answer and the live duplicate/permission lookups.
+ * Re-check was chosen over invalidating the row because ageing is a function of the clock and suppression is
+ * an external event; only the transition itself observes both with no window, and nothing has to sweep.
+ * A failure throws and writes nothing; the persisted verdict is left as the record of packaging.
+ * `suppressed` is required, not defaulted: Task 13 replaces the argument with a live `isSuppressed` lookup.
+ */
+async function assertStillDistributable(ctx: MutationCtx, lead: Doc<"leads">, suppressed: boolean, what: string): Promise<void> {
+  if (typeof suppressed !== "boolean") throw new Error("suppressed must be a boolean");
+  if (!lead.distributability.ok) throw new Error(`a lead that failed distributability cannot be ${what}`);
+  const scoreRun = await ctx.db.get(lead.scoreRunId);
+  if (!scoreRun || scoreRun.orgId !== lead.orgId) throw new Error("scoreRun not found");
+  const { account, contact } = lead.snapshot;
+  const gate = checkDistributability({
+    account,
+    contact,
+    scoreRun,
+    now: Date.now(),
+    freshnessWindowDays: lead.distributability.freshnessWindowDays,
+    suppressed,
+    duplicateChecked: await duplicatesChecked(ctx, lead.orgId, { _id: lead.accountId, display: account.display }, { _id: lead.contactId, display: contact.display }),
+    permissionsDocumented: (await permissionsDocumented(ctx, lead.orgId, account.fields)) && (await permissionsDocumented(ctx, lead.orgId, contact.fields)),
+  });
+  if (!gate.ok) throw new Error(`lead no longer passes distributability (${gate.failed.join(", ")}); it cannot be ${what}`);
+}
+
 /** One of exactly two writes to an existing lead. Touches `inventoryState` and nothing else. */
-export async function setInventoryState(ctx: MutationCtx, args: { leadId: Id<"leads">; state: InventoryState }): Promise<void> {
+export async function setInventoryState(ctx: MutationCtx, args: { leadId: Id<"leads">; state: InventoryState; suppressed: boolean }): Promise<void> {
   if (!INVENTORY_STATES.includes(args.state)) throw new Error("not an inventory state");
   const lead = await loadLead(ctx, args.leadId);
   if (SHIPPING_INVENTORY.includes(args.state) && !lead.distributability.ok) {
     throw new Error("a lead that failed distributability cannot be reserved, sold or delivered");
   }
+  if (RECHECKED_INVENTORY.includes(args.state)) await assertStillDistributable(ctx, lead, args.suppressed, "reserved, sold or delivered");
   await ctx.db.patch(lead._id, { inventoryState: args.state });
 }
 
 /** The other of exactly two writes to an existing lead. Touches `disposition` and nothing else. */
-export async function setDisposition(ctx: MutationCtx, args: { leadId: Id<"leads">; disposition: Disposition }): Promise<void> {
+export async function setDisposition(ctx: MutationCtx, args: { leadId: Id<"leads">; disposition: Disposition; suppressed: boolean }): Promise<void> {
   if (!DISPOSITIONS.includes(args.disposition)) throw new Error("not a disposition");
   const lead = await loadLead(ctx, args.leadId);
   if (SHIPPING_DISPOSITIONS.includes(args.disposition) && !lead.distributability.ok) {
     throw new Error("a lead that failed distributability cannot be released");
   }
+  if (RECHECKED_DISPOSITIONS.includes(args.disposition)) await assertStillDistributable(ctx, lead, args.suppressed, "released");
   await ctx.db.patch(lead._id, { disposition: args.disposition });
 }

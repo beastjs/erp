@@ -23,4 +23,17 @@ export const signals = defineTable({
   expiresAt: v.optional(v.number()),
   // Which source reported the event; part of the exact-duplicate key in appendSignal.
   sourceId: v.optional(v.id("sources")),
-}).index("by_subject_observed", ["orgId", "subjectType", "subjectId", "observedAt"]);
+  /**
+   * The reporter's own identity for the event (an id from the provider, a webhook delivery key). When present
+   * it IS the event's identity: a retry of the same event is a no-op however its observedAt was reported, and two
+   * genuinely distinct events on one day are told apart. Absent, identity falls back to the exact
+   * (subject, kind, observedAt, sourceId) tuple.
+   */
+  externalId: v.optional(v.string()),
+})
+  .index("by_subject_observed", ["orgId", "subjectType", "subjectId", "observedAt"])
+  // Idempotency lookups. Both end in an exact key, so `.first()` decides existence with no bound to truncate at.
+  .index("by_subject_external", ["orgId", "subjectType", "subjectId", "kind", "sourceId", "externalId"])
+  .index("by_subject_event", ["orgId", "subjectType", "subjectId", "kind", "observedAt", "sourceId", "externalId"])
+  // Recorded-at order (the implicit _creationTime), so staleness can ask "any signal since the score?" in one read.
+  .index("by_subject_created", ["orgId", "subjectType", "subjectId"]);

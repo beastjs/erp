@@ -3,7 +3,7 @@ import { api, internal } from "../_generated/api";
 import type { Doc, Id } from "../_generated/dataModel";
 import { action, internalMutation, mutation, query, type MutationCtx } from "../_generated/server";
 import { unsafeCtxAsOrgForInternalOnly, withOrg } from "../_shared/org";
-import { bumpRun, loadRun, settleRun } from "../runs/mutations";
+import { bumpRun, failRun, loadRun, settleRun } from "../runs/mutations";
 import { checkContractVersion, validateCandidate } from "./contract";
 import { parseCsv } from "./csv";
 import { INGEST_BATCH, ingestCandidate } from "./ingest";
@@ -234,6 +234,12 @@ export const processStagedChunk = internalMutation({
     if (!run || run.orgId !== args.orgId || run.status !== "running") return null;
     const chunk = await ctx.db.query("importChunks").withIndex("by_run_and_seq", (q) => q.eq("runId", args.runId).eq("seq", args.seq)).first();
     const mapping = chunk && (await ctx.db.get(chunk.mappingId));
+    // A chunk whose mapping is gone can never be imported, and the chain must not walk past it: chunksProcessed
+    // would stay short and the run would sit `running` forever. Say so, loudly, and stop the chain.
+    if (chunk && !mapping) {
+      await failRun(ctx, run._id, `mapping_not_found: staged chunk ${args.seq} references a column mapping that no longer exists`);
+      return null;
+    }
     if (chunk && mapping) {
       const rows = chunk.rows.map((cells) => Object.fromEntries(chunk.columns.map((c, i) => [c, cells[i] ?? ""])));
       const res = await importChunk(ctx, args.orgId, run, mapping, rows, chunk.rowOffset);
@@ -249,6 +255,12 @@ export const processStagedChunk = internalMutation({
     }
     if (args.seq + 1 < (run.chunksExpected ?? 0)) {
       await ctx.scheduler.runAfter(0, internal.sources.import.processStagedChunk, { orgId: args.orgId, runId: args.runId, seq: args.seq + 1 });
+    } else {
+      // End of the chain. Every staged chunk must have been counted by now; one that was lost leaves the run short forever.
+      const last = await ctx.db.get(run._id);
+      if (last && last.status === "running" && (last.chunksProcessed ?? 0) < (last.chunksExpected ?? 0)) {
+        await failRun(ctx, run._id, `chunks_missing: ${last.chunksProcessed ?? 0} of ${last.chunksExpected} staged chunks were imported`);
+      }
     }
     return null;
   },

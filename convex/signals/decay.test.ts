@@ -208,14 +208,16 @@ test("activeSignals annotates contribution = weight x confidence", async () => {
   expect(s.contribution).toBeCloseTo(s.weight * 0.5, 12);
 });
 
-test("appendSignal rejects an exact duplicate event but allows distinct ones", async () => {
+test("appendSignal treats an exact duplicate event as a no-op but records distinct ones", async () => {
   const sourceId = await raw.run(async (ctx) => {
     const org = (await ctx.db.query("orgs").first())!._id;
     return ctx.db.insert("sources", { orgId: org, key: "web", kind: "crawler", trustWeight: 1, lawfulBasis: "legitimate_interest" });
   });
   const ev = { ...base(), sourceId };
-  await t.run((ctx) => appendSignal(ctx, ev));
-  await expect(t.run((ctx) => appendSignal(ctx, { ...ev, confidence: 0.2 }))).rejects.toThrow("duplicate signal");
+  const first = await t.run((ctx) => appendSignal(ctx, ev));
+  expect(first.created).toBe(true);
+  // The same event again returns the existing row and writes nothing, whatever else about the report differs.
+  expect(await t.run((ctx) => appendSignal(ctx, { ...ev, confidence: 0.2 }))).toEqual({ id: first.id, created: false });
   // different observedAt, kind, or source are different events
   await t.run((ctx) => appendSignal(ctx, { ...ev, observedAt: ev.observedAt - 1 }));
   await t.run((ctx) => appendSignal(ctx, { ...ev, kind: "executive_hired" }));

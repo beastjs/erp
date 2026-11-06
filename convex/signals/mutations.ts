@@ -1,10 +1,12 @@
+import { v } from "convex/values";
 import type { Id } from "../_generated/dataModel";
-import type { MutationCtx, QueryCtx } from "../_generated/server";
+import { mutation, type MutationCtx, type QueryCtx } from "../_generated/server";
 import { withOrg } from "../_shared/org";
 import { scoringConfigForRead, getScoringModel } from "../icp/queries";
-import type { SubjectType } from "../claims/schema";
+import { subjectType, type SubjectType } from "../claims/schema";
+import { markScoreStale } from "../pipeline/stages";
 import { decayedWeight, signalContribution } from "./decay";
-import type { Signal, SignalStrength } from "./schema";
+import { signalStrength, type Signal, type SignalStrength } from "./schema";
 
 /** Upper bound on signals read per subject; newest first, so the cap only drops the stalest. */
 export const MAX_SIGNALS = 200;
@@ -21,7 +23,12 @@ export type AppendSignalArgs = {
   observedAt: number;
   expiresAt?: number;
   sourceId?: Id<"sources">;
+  /** The reporter's identity for the event; see the schema. Makes a retry an idempotent no-op and tells same-day events apart. */
+  externalId?: string;
 };
+
+/** An externalId is an opaque key, not a document. */
+export const MAX_EXTERNAL_ID_LENGTH = 200;
 
 function canonicalSubject(ctx: Pick<QueryCtx, "db">, type: SubjectType, id: string) {
   return ctx.db.normalizeId(type === "account" ? "accounts" : "contacts", id);
@@ -30,8 +37,14 @@ function canonicalSubject(ctx: Pick<QueryCtx, "db">, type: SubjectType, id: stri
 /**
  * Append-only write, validated and failing closed. A plain helper, deliberately not a public
  * function: signals come from ingest, and nothing here accepts an org from a caller.
+ *
+ * IDEMPOTENT: re-reporting an event that is already recorded changes nothing and returns the existing row
+ * with `created: false`, so a retried batch is safe. (It used to throw, which aborted the whole mutation.)
+ * An event's identity is `(subject, kind, source, externalId)` when the reporter supplies an externalId,
+ * else the exact `(subject, kind, observedAt, source)` tuple. Both are index lookups ending in `.first()`:
+ * there is no bound a duplicate could hide behind. A new signal makes any score of the subject stale.
  */
-export async function appendSignal(ctx: MutationCtx, args: AppendSignalArgs): Promise<Id<"signals">> {
+export async function appendSignal(ctx: MutationCtx, args: AppendSignalArgs): Promise<{ id: Id<"signals">; created: boolean }> {
   const { orgId } = await withOrg(ctx, args);
   if (!(Number.isFinite(args.confidence) && args.confidence >= 0 && args.confidence <= 1)) {
     throw new Error("confidence must be between 0 and 1");
@@ -44,6 +57,9 @@ export async function appendSignal(ctx: MutationCtx, args: AppendSignalArgs): Pr
     if (!Number.isFinite(args.expiresAt)) throw new Error("expiresAt must be a finite number");
     if (args.expiresAt <= args.observedAt) throw new Error("expiresAt must be after observedAt");
   }
+  if (args.externalId !== undefined && (args.externalId.trim() === "" || args.externalId.length > MAX_EXTERNAL_ID_LENGTH)) {
+    throw new Error(`externalId must be a non-empty string of at most ${MAX_EXTERNAL_ID_LENGTH} characters`);
+  }
   const subjectId = canonicalSubject(ctx, args.subjectType, args.subjectId);
   if (!subjectId) throw new Error("invalid subject id");
   const subject = await ctx.db.get(subjectId);
@@ -52,20 +68,35 @@ export async function appendSignal(ctx: MutationCtx, args: AppendSignalArgs): Pr
     const source = await ctx.db.get(args.sourceId);
     if (!source || source.orgId !== orgId) throw new Error("source not found");
   }
-  // Re-observing one event (same source twice, or the same report via a retry) must not double intent.
-  // Deliberately narrow: only an exact subject+kind+observedAt+sourceId match; fuzzier "probably the
-  // same event" supersession needs its own design and belongs with signal ingestion.
-  const sameInstant = await ctx.db
-    .query("signals")
-    .withIndex("by_subject_observed", (q) =>
-      q.eq("orgId", orgId).eq("subjectType", args.subjectType).eq("subjectId", subjectId).eq("observedAt", args.observedAt),
-    )
-    .take(MAX_SIGNALS);
-  if (sameInstant.some((s) => s.kind === args.kind && s.sourceId === args.sourceId)) {
-    throw new Error("duplicate signal");
-  }
-  return await ctx.db.insert("signals", { ...args, subjectId, orgId });
+  const existing =
+    args.externalId !== undefined
+      ? await ctx.db
+          .query("signals")
+          .withIndex("by_subject_external", (q) =>
+            q.eq("orgId", orgId).eq("subjectType", args.subjectType).eq("subjectId", subjectId).eq("kind", args.kind).eq("sourceId", args.sourceId).eq("externalId", args.externalId),
+          )
+          .first()
+      : await ctx.db
+          .query("signals")
+          .withIndex("by_subject_event", (q) =>
+            q
+              .eq("orgId", orgId)
+              .eq("subjectType", args.subjectType)
+              .eq("subjectId", subjectId)
+              .eq("kind", args.kind)
+              .eq("observedAt", args.observedAt)
+              .eq("sourceId", args.sourceId)
+              .eq("externalId", undefined),
+          )
+          .first();
+  if (existing) return { id: existing._id, created: false };
+  const id = await ctx.db.insert("signals", { ...args, subjectId, orgId });
+  await markScoreStale(ctx, { subjectType: args.subjectType, subjectId });
+  return { id, created: true };
 }
+
+/** A retried ingest batch must stay small enough for one transaction: each signal is an index read, a write and a staleness mark. */
+export const MAX_SIGNAL_BATCH = 100;
 
 /**
  * KNOWN LIMITATION (unowned, no task owns it yet; flagged for Task 10 and the final review): this does not follow identityLinks. Signals on a merged-away account
@@ -104,3 +135,39 @@ export async function activeSignals(
     .map((s) => ({ ...s, weight: decayedWeight(s, args.now, params), contribution: signalContribution(s, args.now, params) }))
     .filter((s) => s.weight > 0);
 }
+
+/**
+ * Public signal ingestion: a batch of dated events, authenticated once. The org comes from identity; no
+ * argument names one. ALL-OR-NOTHING: one invalid item throws and nothing is written, so a client can fix
+ * the batch and resend it whole. Resending a batch that already landed is a no-op for every item that has
+ * an identity (see appendSignal) and reports how many were new. Give each event an `externalId` whenever
+ * the reporter has one: without it two same-day events from one source are indistinguishable.
+ */
+export const recordSignals = mutation({
+  args: {
+    signals: v.array(
+      v.object({
+        subjectType,
+        subjectId: v.string(),
+        kind: v.string(),
+        strength: signalStrength,
+        confidence: v.number(),
+        observedAt: v.number(),
+        expiresAt: v.optional(v.number()),
+        sourceId: v.optional(v.id("sources")),
+        externalId: v.optional(v.string()),
+      }),
+    ),
+  },
+  handler: async (ctx, args): Promise<{ created: number; duplicates: number }> => {
+    await withOrg(ctx, args);
+    if (args.signals.length > MAX_SIGNAL_BATCH) {
+      throw new Error(`batch_too_large: at most ${MAX_SIGNAL_BATCH} signals per call (got ${args.signals.length})`);
+    }
+    let created = 0;
+    for (const s of args.signals) {
+      if ((await appendSignal(ctx, s)).created) created++;
+    }
+    return { created, duplicates: args.signals.length - created };
+  },
+});

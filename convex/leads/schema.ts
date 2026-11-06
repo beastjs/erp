@@ -91,4 +91,5 @@ export const leads = defineTable({
   packagedAt: v.number(),
 })
   .index("by_org_and_score_run", ["orgId", "scoreRunId"])
+  .index("by_org_and_contact", ["orgId", "contactId"])
   .index("by_org_and_disposition", ["orgId", "disposition"]);

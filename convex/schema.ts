@@ -7,6 +7,7 @@ import { signals } from "./signals/schema";
 import { icpDefinitions, scoringModels } from "./icp/schema";
 import { scoreRuns } from "./scoring/schema";
 import { leads } from "./leads/schema";
+import { pipelineState } from "./pipeline/schema";
 import { accounts, contacts, contactKeys, identityLinks } from "./projections/schema";
 
 export default defineSchema({
@@ -30,4 +31,5 @@ export default defineSchema({
   scoringModels,
   scoreRuns,
   leads,
+  pipelineState,
 });

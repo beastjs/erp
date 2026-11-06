@@ -726,3 +726,37 @@ test("the same bad date in a column the mapping does not use imports cleanly", (
     await drain();
     expect(await getRun()).toMatchObject({ status: "completed", candidatesInserted: 1, rowsRejected: 0 });
   }));
+
+// ----------------------------------------------------------------- a run that can never settle says so
+
+test("a staged chunk whose mapping is gone fails the run instead of leaving it running forever", () =>
+  withFakeTimers(async () => {
+    await t.action(api.sources.import.importCsv, { runId, mappingId, storageId: await store(csvOf(1001)) });
+    await raw.run((ctx) => ctx.db.delete(mappingId));
+    await drain();
+    const run = await getRun();
+    expect(run.status).toBe("failed");
+    expect(run.failureReason).toMatch(/^mapping_not_found: /);
+    expect(run.finishedAt).toBeDefined();
+    // The chain stopped at the bad chunk: nothing was imported and nothing was skipped past.
+    expect(run.chunksProcessed).toBe(0);
+    expect(await all("importChunks")).toHaveLength(3);
+    expect(await all("candidates")).toHaveLength(0);
+    // A failed run is terminal: it cannot be resumed, and finishing it does not turn it into a success.
+    await expect(t.mutation(api.sources.import.resumeImport, { runId })).rejects.toThrow("run_not_active");
+    await t.mutation(api.runs.mutations.finishRun, { runId });
+    expect((await getRun()).status).toBe("failed");
+  }), 120_000);
+
+test("a staged chunk that went missing fails the run at the end of the chain", () =>
+  withFakeTimers(async () => {
+    await t.action(api.sources.import.importCsv, { runId, mappingId, storageId: await store(csvOf(1001)) });
+    await raw.run(async (ctx) => {
+      const lost = (await ctx.db.query("importChunks").collect()).find((c) => c.seq === 1);
+      await ctx.db.delete(lost!._id);
+    });
+    await drain();
+    const run = await getRun();
+    expect(run.status).toBe("failed");
+    expect(run.failureReason).toBe("chunks_missing: 2 of 3 staged chunks were imported");
+  }), 120_000);

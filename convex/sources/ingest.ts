@@ -15,10 +15,11 @@ import type { SubjectType } from "../claims/schema";
 import { rebuildProjection } from "../projections/build";
 import { matchCandidate } from "../projections/identity";
 import { bumpRun, type RunCounter } from "../runs/mutations";
-import { withOrg, withTrustedOrgForInternalOnly } from "../_shared/org";
+import { withTrustedOrgForInternalOnly } from "../_shared/org";
 import { candidateSuppressed } from "../privacy/suppress";
 import { redactCandidate } from "../privacy/redact";
 import { checkContractVersion, validateCandidate, type NormalizedCandidate } from "./contract";
+import { requireRole } from "../_shared/authz";
 
 /** Per-mutation cap: each candidate costs ~30 document writes, and a mutation may write 16k. */
 export const INGEST_BATCH = 50;
@@ -278,7 +279,7 @@ export async function ingestBatch(
 export const ingestCandidates = mutation({
   args: { candidateIds: v.array(v.id("candidates")) },
   handler: async (ctx, args): Promise<{ consumed: number; rejected: number }> => {
-    const { orgId } = await withOrg(ctx, args);
+    const { orgId } = await requireRole(ctx, "operator");
     return await ingestBatch(ctx, orgId, args.candidateIds);
   },
 });

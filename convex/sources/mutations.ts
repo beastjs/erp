@@ -1,15 +1,17 @@
 import { v } from "convex/values";
 import type { Id } from "../_generated/dataModel";
 import { mutation, type MutationCtx } from "../_generated/server";
-import { resolveOrg, withOrg } from "../_shared/org";
+import { resolveOrg } from "../_shared/org";
 import { CANDIDATE_CONTRACT_VERSION, checkContractVersion, candidatePersonKey, computeDedupeHash, validateCandidate } from "./contract";
 import { candidateSuppressed } from "../privacy/suppress";
 import { lawfulBasis, sourceKind } from "./schema";
+import { requireRole } from "../_shared/authz";
+import { writeAudit } from "../audit/log";
 
 export const registerSource = mutation({
   args: { key: v.string(), kind: sourceKind, trustWeight: v.number(), lawfulBasis },
   handler: async (ctx, args) => {
-    const { orgId } = await withOrg(ctx, args);
+    const { orgId, actor } = await requireRole(ctx, "admin");
     const key = args.key.trim();
     // Negated conjunction on purpose: every comparison with NaN is false, so NaN fails closed.
     // Claim resolution orders by trustWeight; a NaN would break its total order.
@@ -22,7 +24,15 @@ export const registerSource = mutation({
       .withIndex("by_org_and_key", (q) => q.eq("orgId", orgId).eq("key", key))
       .first();
     if (existing) throw new Error("source key already registered");
-    return await ctx.db.insert("sources", { ...args, key, orgId });
+    const id = await ctx.db.insert("sources", { ...args, key, orgId });
+    await writeAudit(ctx, {
+      actor,
+      action: "source.registered",
+      targetTable: "sources",
+      targetId: id,
+      after: { kind: args.kind, trustWeight: args.trustWeight, lawfulBasis: args.lawfulBasis },
+    });
+    return id;
   },
 });
 

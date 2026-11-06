@@ -1,5 +1,6 @@
 import { defineTable } from "convex/server";
 import { v } from "convex/values";
+import { actor } from "../_shared/actor";
 import { subjectType } from "../claims/schema";
 
 export const SUPPRESSION_REASONS = ["erasure", "opt_out", "complaint", "manual"] as const;
@@ -23,11 +24,38 @@ export const suppressions = defineTable({
 }).index("by_org_and_hash", ["orgId", "hash"]);
 
 /**
+ * ACCOUNTABILITY for an erasure: who asked, why, and on what legal basis. All closed vocabularies plus an opaque case
+ * reference, never free text: this row is permanent (it is the proof the erasure happened), so a "reason" field that
+ * accepted prose would be where someone types the data subject's name and re-creates what was just erased.
+ */
+export const LEGAL_BASES = ["gdpr_art17_erasure", "ccpa_deletion", "consent_withdrawn", "legal_obligation", "controller_decision"] as const;
+export type LegalBasis = (typeof LEGAL_BASES)[number];
+export const legalBasis = v.union(
+  v.literal("gdpr_art17_erasure"),
+  v.literal("ccpa_deletion"),
+  v.literal("consent_withdrawn"),
+  v.literal("legal_obligation"),
+  v.literal("controller_decision"),
+);
+export const ERASURE_REASONS = ["data_subject_request", "opt_out", "complaint", "regulator_order", "data_quality"] as const;
+export type ErasureReason = (typeof ERASURE_REASONS)[number];
+export const erasureReason = v.union(
+  v.literal("data_subject_request"),
+  v.literal("opt_out"),
+  v.literal("complaint"),
+  v.literal("regulator_order"),
+  v.literal("data_quality"),
+);
+/** An opaque case or ticket id (letters, digits, `._:-`, at least one digit, so a bare name does not pass). Heuristic: it keeps prose out, it cannot prove an id is not a name. */
+export const REFERENCE_PATTERN = /^(?=.*\d)[A-Za-z0-9][A-Za-z0-9._:-]{2,63}$/;
+
+/**
  * The fact that a subject was erased, and how far the erasure has got. Contains NO personal data: ids, counts and
  * times. Its existence is what makes an erased subject inert (no new claims or signals, no pipeline, empty projection)
  * and it survives as the proof that the erasure happened. One row per subject. `completedAt` absent = still in
  * progress (a subject with more rows than one transaction handles is erased across several calls).
- * Who requested it is NOT recorded here: that belongs to Task 14's audit log.
+ * Who requested it, why, and on what basis IS recorded here (`requestedBy`, `reasonCode`, `legalBasis`, `reference`):
+ * it is the record that matters if the erasure is ever challenged, so it lives on the row that proves the erasure.
  *
  * LIVENESS. An in-progress erasure is carried by a self-scheduled chain, and a scheduled mutation that throws is NOT
  * retried by the platform, so the chain can die with the person half-erased. `resumeAt` is therefore the time before
@@ -41,6 +69,10 @@ export const erasures = defineTable({
   subjectType,
   subjectId: v.string(),
   requestedAt: v.number(),
+  requestedBy: actor,
+  reasonCode: erasureReason,
+  legalBasis,
+  reference: v.string(),
   completedAt: v.optional(v.number()),
   resumeAt: v.optional(v.number()),
   attempts: v.optional(v.number()),

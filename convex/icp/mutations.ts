@@ -1,25 +1,20 @@
 import type { Id } from "../_generated/dataModel";
 import type { MutationCtx } from "../_generated/server";
+import type { Actor } from "../_shared/actor";
+import { systemActor } from "../_shared/authz";
 import { resolveOrg } from "../_shared/org";
+import { writeAudit } from "../audit/log";
 import { DEFAULT_SCORING_MODEL } from "./defaults";
 import { latestIcp, latestScoringModel } from "./queries";
 import type { IcpCriteria, ScoringConfig, ScoringModel } from "./schema";
 import { validateIcpCriteria, validateScoringConfig } from "./validate";
 
-/** Attribution for the default scoring model when seeded with no authenticated caller. Not a person; nothing may treat it as one. */
-export const SYSTEM_ACTOR_DEFAULT_MODEL_SEED = "system:default-scoring-model-seed";
-
-async function creator(ctx: MutationCtx): Promise<string> {
-  const identity = await ctx.auth.getUserIdentity();
-  if (!identity) throw new Error("no identity");
-  return identity.tokenIdentifier;
-}
-
 /**
  * History is one chain per org. A new version must name the current newest as `supersedesId` (and the
  * first must name none), so two editors working from the same base cannot both succeed and fork it:
- * the second finds a newer head and is refused. Plain helpers, not public functions: who may call
- * them (the `analyst` role, spec 8) is an authorization decision that does not exist yet.
+ * the second finds a newer head and is refused. Plain helpers, not public
+ * functions: the `analyst` role check lives in icp/api.ts, and the ACTOR is a required argument here so that every
+ * version, however it is made, names who made it (a verified user, or a typed system actor), never a guess.
  */
 function checkChain(head: { _id: string; version: number } | null, supersedesId: string | undefined): number {
   if (head === null) {
@@ -33,27 +28,30 @@ function checkChain(head: { _id: string; version: number } | null, supersedesId:
 export async function createIcpVersion(
   ctx: MutationCtx,
   args: { name: string; criteria: IcpCriteria; supersedesId?: Id<"icpDefinitions"> },
+  actor: Actor,
 ): Promise<Id<"icpDefinitions">> {
   const { orgId } = await resolveOrg(ctx);
   if (typeof args.name !== "string" || args.name.trim() === "") throw new Error("name is required");
   validateIcpCriteria(args.criteria);
   const version = checkChain(await latestIcp(ctx, {}), args.supersedesId);
-  return await ctx.db.insert("icpDefinitions", {
+  const id = await ctx.db.insert("icpDefinitions", {
     orgId,
     version,
     name: args.name,
     criteria: args.criteria,
     supersedesId: args.supersedesId,
-    createdBy: await creator(ctx),
+    createdBy: actor,
     activeFrom: Date.now(),
   });
+  await writeAudit(ctx, { actor, action: "icp.created", targetTable: "icpDefinitions", targetId: id, before: version > 1 ? { version: version - 1 } : undefined, after: { version } });
+  return id;
 }
 
 export async function createScoringModel(
   ctx: MutationCtx,
   args: ScoringConfig & { supersedesId?: Id<"scoringModels"> },
-  /** Who the row is attributed to. Omitted means "the caller", which must be authenticated: no identity throws. */
-  actor?: string,
+  /** Who the row is attributed to. Required: a caller with no person behind it passes `systemActor(...)`, never nothing. */
+  actor: Actor,
 ): Promise<Id<"scoringModels">> {
   const { orgId } = await resolveOrg(ctx);
   // Pick fields explicitly: never spread caller-shaped input into an insert that also carries orgId.
@@ -72,14 +70,16 @@ export async function createScoringModel(
   };
   validateScoringConfig(config);
   const version = checkChain(await latestScoringModel(ctx, {}), supersedesId);
-  return await ctx.db.insert("scoringModels", {
+  const id = await ctx.db.insert("scoringModels", {
     orgId,
     version,
     ...config,
     supersedesId,
-    createdBy: actor ?? (await creator(ctx)),
+    createdBy: actor,
     activeFrom: Date.now(),
   });
+  await writeAudit(ctx, { actor, action: "scoring_model.created", targetTable: "scoringModels", targetId: id, before: version > 1 ? { version: version - 1 } : undefined, after: { version } });
+  return id;
 }
 
 /**
@@ -90,11 +90,10 @@ export async function createScoringModel(
 export async function ensureActiveScoringModel(ctx: MutationCtx): Promise<ScoringModel> {
   const existing = await latestScoringModel(ctx, {});
   if (existing) return existing;
-  // The seed can happen inside a scheduled pipeline stage, which has NO identity. It used to be attributed to a
-  // fabricated "internal|<orgId>" actor. Now a real caller is still recorded, and the absence of one is recorded
-  // as an explicitly NON-PERSON system label instead of a counterfeit identity.
-  const identity = await ctx.auth.getUserIdentity();
-  const id = await createScoringModel(ctx, structuredClone(DEFAULT_SCORING_MODEL), identity?.tokenIdentifier ?? SYSTEM_ACTOR_DEFAULT_MODEL_SEED);
+  // The seed can happen inside a scheduled pipeline stage, which has NO identity, and it is the system's own act even
+  // when a person's request happened to trigger it: attributed to a typed system actor, never to a caller who did not
+  // choose it and never to a fabricated identity.
+  const id = await createScoringModel(ctx, structuredClone(DEFAULT_SCORING_MODEL), systemActor("default_scoring_model_seed"));
   const row = await ctx.db.get(id);
   if (!row) throw new Error("scoring model seed failed");
   return row;

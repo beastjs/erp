@@ -5,6 +5,7 @@ import { api } from "../_generated/api";
 import type { Id } from "../_generated/dataModel";
 import { MAX_CLAIMS } from "../claims/queries";
 import type { ClaimMethod, SubjectType } from "../claims/schema";
+import { asMember } from "../_shared/testkit";
 import schema from "../schema";
 import { applyClaimToProjection, rebuildProjection } from "./build";
 
@@ -42,7 +43,7 @@ beforeEach(async () => {
   orgId = seeded.orgId;
   otherOrgId = seeded.otherOrgId;
   sources = seeded.sources;
-  t = raw.withIdentity({ subject: "u1", orgId });
+  t = await asMember(raw, "u1", orgId);
 });
 
 const newAccount = () => t.run((ctx) => ctx.db.insert("accounts", { orgId, fields: [], display: {} }));

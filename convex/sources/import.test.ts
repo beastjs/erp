@@ -4,6 +4,7 @@ import { strToU8, zipSync } from "fflate";
 import { beforeEach, expect, test, vi } from "vitest";
 import { api, internal } from "../_generated/api";
 import type { Id } from "../_generated/dataModel";
+import { asMember } from "../_shared/testkit";
 import schema from "../schema";
 import { CANDIDATE_CONTRACT_VERSION, checkContractVersion } from "./contract";
 import { MAX_IMPORT_BYTES, MAX_IMPORT_ROWS } from "./import";
@@ -37,7 +38,7 @@ beforeEach(async () => {
   });
   orgId = seeded.orgId;
   sourceId = seeded.sourceId;
-  t = raw.withIdentity({ subject: "u1", orgId });
+  t = await asMember(raw, "u1", orgId);
   runId = await t.mutation(api.runs.mutations.startRun, { sourceId, creditBudget: 100 });
   mappingId = await t.mutation(api.sources.import.saveMapping, { name: "crm", columns: COLUMNS });
 });
@@ -181,7 +182,7 @@ test("importRows refuses more rows than one mutation may safely process", async 
 
 test("importRows refuses a mapping or run from another org, and a finished run", async () => {
   const otherOrg = await raw.run((ctx) => ctx.db.insert("orgs", { name: "Org 2", createdAt: 0 }));
-  const other = raw.withIdentity({ subject: "u2", orgId: otherOrg });
+  const other = await asMember(raw, "u2", otherOrg);
   await expect(other.mutation(api.sources.import.importRows, { runId, mappingId, rows: [jane()] })).rejects.toThrow("run not found");
   const otherRun = await raw.run(async (ctx) => {
     const src = await ctx.db.insert("sources", { orgId: otherOrg, key: "x", kind: "csv", trustWeight: 1, lawfulBasis: "consent" });
@@ -337,7 +338,7 @@ test("one candidate that cannot be processed is rejected without aborting the re
 test("ingestCandidates refuses another org's candidate and an oversized batch", async () => {
   const id = (await t.mutation(api.sources.import.importRows, { runId, mappingId, rows: [jane()] })).candidateIds[0]!;
   const otherOrg = await raw.run((ctx) => ctx.db.insert("orgs", { name: "Org 2", createdAt: 0 }));
-  const other = raw.withIdentity({ subject: "u2", orgId: otherOrg });
+  const other = await asMember(raw, "u2", otherOrg);
   await expect(other.mutation(api.sources.ingest.ingestCandidates, { candidateIds: [id] })).rejects.toThrow("candidate not found");
   const ids = Array.from({ length: 51 }, () => id);
   await expect(t.mutation(api.sources.ingest.ingestCandidates, { candidateIds: ids })).rejects.toThrow("batch_too_large");
@@ -655,8 +656,9 @@ test("submitCandidates refuses an oversized batch and a source from another org"
     t.mutation(api.sources.import.submitCandidates, { sourceId, contractVersion: CANDIDATE_CONTRACT_VERSION, candidates: Array.from({ length: 501 }, () => lead()) }),
   ).rejects.toThrow("chunk_too_large");
   const otherOrg = await raw.run((ctx) => ctx.db.insert("orgs", { name: "Org 2", createdAt: 0 }));
+  const u2 = await asMember(raw, "u2", otherOrg);
   await expect(
-    raw.withIdentity({ subject: "u2", orgId: otherOrg }).mutation(api.sources.import.submitCandidates, {
+    u2.mutation(api.sources.import.submitCandidates, {
       sourceId, contractVersion: CANDIDATE_CONTRACT_VERSION, candidates: [lead()],
     }),
   ).rejects.toThrow("source not found");

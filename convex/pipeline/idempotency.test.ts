@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { api } from "../_generated/api";
 import type { Doc, Id } from "../_generated/dataModel";
 import { appendClaimRecord } from "../claims/mutations";
-import { createIcpVersion } from "../icp/mutations";
+import { createIcpVersion, asMember } from "../_shared/testkit";
 import { latestIcp } from "../icp/queries";
 import schema from "../schema";
 import { deadLetterQueue } from "./deadletter";
@@ -25,7 +25,7 @@ beforeEach(async () => {
   vi.useFakeTimers();
   raw = convexTest(schema, modules);
   orgId = await raw.run((ctx) => ctx.db.insert("orgs", { name: "Org 1", createdAt: 0 }));
-  t = raw.withIdentity({ subject: "u1", orgId });
+  t = await asMember(raw, "u1", orgId);
 });
 afterEach(() => {
   Object.assign(stageHandlers, originals);
@@ -347,7 +347,7 @@ describe("the dead-letter queue", () => {
     // Paginated variant agrees, and another org sees none of it.
     const page = await t.query(api.pipeline.deadletter.listDeadLetters, { reasonCode: "invalid_domain", paginationOpts: { numItems: 10, cursor: null } });
     expect(page.page).toHaveLength(2);
-    const other = raw.withIdentity({ subject: "u2", orgId: await raw.run((ctx) => ctx.db.insert("orgs", { name: "Org 2", createdAt: 0 })) });
+    const other = await asMember(raw, "u2", await raw.run((ctx) => ctx.db.insert("orgs", { name: "Org 2", createdAt: 0 })));
     expect(await other.run((ctx) => deadLetterQueue(ctx))).toEqual([]);
   });
 
@@ -422,7 +422,7 @@ describe("enqueue", () => {
 
   test("refuses a subject that does not exist or belongs to another org", async () => {
     const s = await seed();
-    const other = raw.withIdentity({ subject: "u2", orgId: await raw.run((ctx) => ctx.db.insert("orgs", { name: "Org 2", createdAt: 0 })) });
+    const other = await asMember(raw, "u2", await raw.run((ctx) => ctx.db.insert("orgs", { name: "Org 2", createdAt: 0 })));
     await expect(other.mutation(api.pipeline.stages.startPipeline, { subjectType: "contact", subjectId: s.contactId })).rejects.toThrow("subject not found");
     await expect(t.mutation(api.pipeline.stages.startPipeline, { subjectType: "contact", subjectId: s.accountId })).rejects.toThrow("subject not found");
     expect(await raw.run((ctx) => ctx.db.query("pipelineState").collect())).toHaveLength(0);

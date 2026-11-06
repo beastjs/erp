@@ -4,6 +4,7 @@ import { beforeEach, expect, test } from "vitest";
 import { api } from "../_generated/api";
 import type { Id } from "../_generated/dataModel";
 import { DEFAULT_SCORING_MODEL } from "../icp/defaults";
+import { asMember } from "../_shared/testkit";
 import schema from "../schema";
 import { MAX_CLAIMS } from "./queries";
 
@@ -33,7 +34,7 @@ beforeEach(async () => {
   orgId = seeded.orgId;
   contactId = seeded.contact;
   subject = { subjectType: "account", subjectId: seeded.account };
-  t = raw.withIdentity({ subject: "u1", orgId: seeded.orgId });
+  t = await asMember(raw, "u1", seeded.orgId);
 });
 
 const observedDomainClaim = () => ({
@@ -77,7 +78,7 @@ test("appendClaim clamps to the ACTIVE scoring model's ceilings, not a constant"
     await ctx.db.insert("scoringModels", {
       ...DEFAULT_SCORING_MODEL,
       methodCeilings: { observed: 0.9, extracted: 0.4, inferred: 0.2 },
-      orgId, version: 1, createdBy: "u1", activeFrom: 0,
+      orgId, version: 1, createdBy: { kind: "user", userId: "u1", role: "analyst" }, activeFrom: 0,
     });
   });
   const inferred = await t.mutation(api.claims.mutations.appendClaim, { ...observedDomainClaim(), method: "inferred", confidence: 0.9 });
@@ -122,7 +123,7 @@ test("claims are never updated: a second claim for the same field appends", asyn
 
 test("claims are isolated by org", async () => {
   await t.mutation(api.claims.mutations.appendClaim, observedDomainClaim());
-  const other = raw.withIdentity({ subject: "u2", orgId: otherOrgId });
+  const other = await asMember(raw, "u2", otherOrgId);
   expect(await other.query(api.claims.queries.claimsForSubject, subject)).toHaveLength(0);
 });
 

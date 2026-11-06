@@ -2,7 +2,7 @@ import { v } from "convex/values";
 import { api, internal } from "../_generated/api";
 import type { Doc, Id } from "../_generated/dataModel";
 import { action, internalMutation, mutation, query, type MutationCtx } from "../_generated/server";
-import { withOrg, withTrustedOrgForInternalOnly } from "../_shared/org";
+import { withTrustedOrgForInternalOnly } from "../_shared/org";
 import { bumpRun, failRun, loadRun, purgeStagedChunks as purgeStagedChunksFor, settleRun } from "../runs/mutations";
 import { checkContractVersion, validateCandidate } from "./contract";
 import { parseCsv } from "./csv";
@@ -10,6 +10,8 @@ import { INGEST_BATCH, ingestCandidate } from "./ingest";
 import { missingColumns, rowToCandidate, validateMapping, type ColumnPair } from "./mapping";
 import { SuppressedCandidateError, insertCandidate } from "./mutations";
 import { parseXlsx, sniffFormat } from "./xlsx";
+import { requireRole } from "../_shared/authz";
+import { writeAudit } from "../audit/log";
 
 /**
  * Rows per mutation. A mutation may write 16k documents and read 32k; an inserted candidate costs a
@@ -33,7 +35,7 @@ type RowError = { row: number; errors: string[] };
 export const saveMapping = mutation({
   args: { name: v.string(), columns: v.record(v.string(), v.string()) },
   handler: async (ctx, args) => {
-    const { orgId } = await withOrg(ctx, args);
+    const { orgId } = await requireRole(ctx, "operator");
     const name = args.name.trim();
     if (name === "") throw new Error("name must not be empty");
     const columns: ColumnPair[] = Object.entries(args.columns).map(([column, target]) => ({ column, target }));
@@ -51,7 +53,7 @@ export const saveMapping = mutation({
 export const getMapping = query({
   args: { mappingId: v.id("columnMappings") },
   handler: async (ctx, args) => {
-    const { orgId } = await withOrg(ctx, args);
+    const { orgId } = await requireRole(ctx, "operator");
     const mapping = await ctx.db.get(args.mappingId);
     if (!mapping || mapping.orgId !== orgId) throw new Error("mapping not found");
     return mapping;
@@ -132,7 +134,7 @@ export const importRows = mutation({
     rowOffset: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
-    const { orgId } = await withOrg(ctx, args);
+    const { orgId } = await requireRole(ctx, "operator");
     if (args.rows.length > CHUNK_SIZE) {
       throw new Error(`chunk_too_large: at most ${CHUNK_SIZE} rows per call (got ${args.rows.length}); use importCsv or send chunks`);
     }
@@ -211,7 +213,7 @@ export const startStagedImport = internalMutation({
 export const resumeImport = mutation({
   args: { runId: v.id("discoveryRuns") },
   handler: async (ctx, args) => {
-    const { orgId } = await withOrg(ctx, args);
+    const { orgId } = await requireRole(ctx, "operator");
     const run = await loadRun(ctx, orgId, args.runId, { active: true });
     // Ingest batches can be lost too, so re-arm candidates still pending (a bounded slice per call;
     // call again for more). Ingest skips anything already consumed, so over-arming is harmless.
@@ -389,17 +391,19 @@ export const importCsv = action({
 export const addManualLead = mutation({
   args: { candidate: v.any() },
   handler: async (ctx, args) => {
-    const { orgId } = await withOrg(ctx, args);
-    const identity = await ctx.auth.getUserIdentity();
-    if (!identity) throw new Error("no identity");
-    const key = `manual:${identity.tokenIdentifier}`;
+    const { orgId, userId, actor } = await requireRole(ctx, "operator");
+    const key = `manual:${userId}`;
     const existing = await ctx.db
       .query("sources")
       .withIndex("by_org_and_key", (q) => q.eq("orgId", orgId).eq("key", key))
       .first();
-    const sourceId =
-      existing?._id ??
-      (await ctx.db.insert("sources", { orgId, key, kind: "manual", trustWeight: 1, lawfulBasis: "legitimate_interest" }));
+    let sourceId = existing?._id;
+    if (!sourceId) {
+      // A per-operator source of fixed shape (manual, trust 1, legitimate interest). The one source an operator may
+      // create without being an admin, and still audited like any other registration.
+      sourceId = await ctx.db.insert("sources", { orgId, key, kind: "manual", trustWeight: 1, lawfulBasis: "legitimate_interest" });
+      await writeAudit(ctx, { actor, action: "source.registered", targetTable: "sources", targetId: sourceId, after: { kind: "manual", trustWeight: 1, lawfulBasis: "legitimate_interest" } });
+    }
     const id = await insertCandidate(ctx, { candidate: args.candidate, sourceId });
     if (!id) throw new Error("duplicate_candidate: an identical lead is already waiting to be processed");
     const result = await ingestCandidate(ctx, orgId, id);
@@ -423,7 +427,7 @@ export const submitCandidates = mutation({
     runId: v.optional(v.id("discoveryRuns")),
   },
   handler: async (ctx, args) => {
-    const { orgId } = await withOrg(ctx, args);
+    const { orgId } = await requireRole(ctx, "operator");
     const version = checkContractVersion(args.contractVersion);
     if (!version.ok) throw new Error(version.error);
     if (args.candidates.length > CHUNK_SIZE) {

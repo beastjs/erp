@@ -9,6 +9,8 @@ import { scoreRuns } from "./scoring/schema";
 import { leads } from "./leads/schema";
 import { pipelineState } from "./pipeline/schema";
 import { accounts, contacts, contactKeys, identityLinks } from "./projections/schema";
+import { auditLog } from "./audit/schema";
+import { memberships } from "./members/schema";
 import { erasureSnapshotRefs, erasures, suppressions } from "./privacy/schema";
 
 export default defineSchema({
@@ -36,4 +38,6 @@ export default defineSchema({
   suppressions,
   erasures,
   erasureSnapshotRefs,
+  memberships,
+  auditLog,
 });

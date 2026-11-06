@@ -2,11 +2,12 @@ import { paginationOptsValidator, type PaginationResult } from "convex/server";
 import { v } from "convex/values";
 import type { Doc, Id } from "../_generated/dataModel";
 import { mutation, query, type MutationCtx, type QueryCtx } from "../_generated/server";
-import { resolveOrg, withOrg } from "../_shared/org";
+import { resolveOrg } from "../_shared/org";
 import { subjectType as subjectTypeValidator, type SubjectType } from "../claims/schema";
 import { assertNotErased } from "../privacy/erased";
 import { advance, findState } from "./stages";
 import { STAGES, reasonCode as reasonCodeValidator, stage as stageValidator, stageIndex, type ReasonCode, type Stage } from "./schema";
+import { requireRole } from "../_shared/authz";
 
 /**
  * Most dead letters `deadLetterQueue` returns whole. Past it the call throws, named, rather than hand back a
@@ -61,7 +62,7 @@ export async function deadLetterQueue(ctx: QueryCtx, args: { reasonCode?: Reason
 export const listDeadLetters = query({
   args: { reasonCode: v.optional(reasonCodeValidator), paginationOpts: paginationOptsValidator },
   handler: async (ctx, args): Promise<PaginationResult<DeadLetterRow>> => {
-    const { orgId } = await withOrg(ctx, args);
+    const { orgId } = await requireRole(ctx, "operator");
     const page = await deadLetters(ctx, orgId, args.reasonCode).paginate(args.paginationOpts);
     return { ...page, page: page.page.map(toRow) };
   },
@@ -114,6 +115,7 @@ export async function resumeDeadLettered(ctx: MutationCtx, args: { subjectType: 
 export const resumeSubject = mutation({
   args: { subjectType: subjectTypeValidator, subjectId: v.string(), fromStage: v.optional(stageValidator) },
   handler: async (ctx, args): Promise<null> => {
+    await requireRole(ctx, "operator");
     await resumeDeadLettered(ctx, args);
     return null;
   },

@@ -4,9 +4,11 @@ import { beforeEach, expect, test } from "vitest";
 import type { Id } from "../_generated/dataModel";
 import type { MutationCtx } from "../_generated/server";
 import { decayedWeight } from "../signals/decay";
+import { asMember } from "../_shared/testkit";
 import schema from "../schema";
 import { DEFAULT_SCORING_MODEL } from "./defaults";
-import { createIcpVersion, createScoringModel, ensureActiveScoringModel } from "./mutations";
+import { ensureActiveScoringModel } from "./mutations";
+import { createIcpVersion, createScoringModel } from "../_shared/testkit";
 import { tierFor } from "./tier";
 import { activeIcp, scoringConfigForRead, getIcpVersion, getScoringModel } from "./queries";
 import type { IcpCriteria, ScoringConfig } from "./schema";
@@ -23,7 +25,7 @@ let orgId: Id<"orgs">;
 beforeEach(async () => {
   raw = convexTest(schema, modules);
   orgId = await raw.run((ctx) => ctx.db.insert("orgs", { name: "Org 1", createdAt: 0 }));
-  t = raw.withIdentity({ subject: "u1", orgId });
+  t = await asMember(raw, "u1", orgId);
 });
 
 const model = (over: Partial<ScoringConfig> = {}): ScoringConfig => ({ ...structuredClone(DEFAULT_SCORING_MODEL), ...over });
@@ -126,7 +128,7 @@ test("editing a model creates a new version and leaves the old row byte-identica
   expect(second).toMatchObject({ version: 2, supersedesId: v1, orgId, weights: { intent: 50 } });
   expect(before).toMatchObject({ version: 1, orgId });
   expect(before!.supersedesId).toBeUndefined();
-  expect(typeof before!.createdBy).toBe("string");
+  expect(before!.createdBy).toMatchObject({ kind: "user" });
   expect(before!.activeFrom).toBeGreaterThan(0);
 });
 
@@ -171,7 +173,7 @@ test("versions form one chain: forks, stale bases and bogus supersedesId are ref
 test("versions are per org: another org's history and rows are invisible", async () => {
   const mine = await run((ctx) => createScoringModel(ctx, model()));
   const other = await raw.run((ctx) => ctx.db.insert("orgs", { name: "Org 2", createdAt: 0 }));
-  const theirs = raw.withIdentity({ subject: "u2", orgId: other });
+  const theirs = await asMember(raw, "u2", other);
   const theirId = await theirs.run((ctx) => createScoringModel(ctx, model()));
   expect((await raw.run((ctx) => ctx.db.get(theirId)))!.version).toBe(1);
   await expect(theirs.run((ctx) => getScoringModel(ctx, { id: mine }))).rejects.toThrow("scoring model not found");
@@ -186,7 +188,7 @@ test("createIcpVersion records supersedesId and createdBy", async () => {
   expect(r1).toMatchObject({ version: 1, name: "Mid-market SaaS", orgId, criteria });
   expect(r1.supersedesId).toBeUndefined();
   expect(r2).toMatchObject({ version: 2, supersedesId: v1, createdBy: r1.createdBy });
-  expect(r1.createdBy).toContain("u1");
+  expect(r1.createdBy).toMatchObject({ kind: "user", userId: expect.stringContaining("u1") });
   expect(r2.criteria.employeeMax).toBe(1000);
   expect(r1.criteria.employeeMax).toBe(500);
   expect((await run((ctx) => activeIcp(ctx, {})))._id).toBe(v2);
@@ -205,6 +207,14 @@ test("no public function can write or delete these tables, and no orgId argument
   for (const [path, src] of Object.entries(sources)) {
     if (path.endsWith(".test.ts")) continue;
     expect(src, path).not.toMatch(/db\.(patch|replace|delete)\(/);
+    // The analyst-gated endpoints live in api.ts and nowhere else in this folder (authz.guard.test.ts checks every
+    // registration for a role check; here the point is that no OTHER file in icp/ can grow a public door).
+    if (path.endsWith("/icp/api.ts")) {
+      const registrations = src.match(/\b(mutation|query|action)\(\{/g) ?? [];
+      expect(registrations).toHaveLength(2);
+      expect(src.match(/requireRole\(ctx, "analyst"\)/g)).toHaveLength(2);
+      continue;
+    }
     expect(src, path).not.toMatch(/\b(mutation|query|action)\(\{/);
   }
 });

@@ -1,6 +1,7 @@
 import { defineTable } from "convex/server";
 import { v } from "convex/values";
 import type { Doc } from "../_generated/dataModel";
+import { actor } from "../_shared/actor";
 
 export type IcpDefinition = Doc<"icpDefinitions">;
 export type ScoringModel = Doc<"scoringModels">;
@@ -79,7 +80,7 @@ export const icpDefinitions = defineTable({
   name: v.string(),
   criteria: icpCriteria,
   supersedesId: v.optional(v.id("icpDefinitions")),
-  createdBy: v.string(),
+  createdBy: actor,
   activeFrom: v.number(),
 }).index("by_org_and_version", ["orgId", "version"]);
 
@@ -89,6 +90,6 @@ export const scoringModels = defineTable({
   version: v.number(),
   ...scoringConfig,
   supersedesId: v.optional(v.id("scoringModels")),
-  createdBy: v.string(),
+  createdBy: actor,
   activeFrom: v.number(),
 }).index("by_org_and_version", ["orgId", "version"]);

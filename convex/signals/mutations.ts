@@ -1,13 +1,14 @@
 import { v } from "convex/values";
 import type { Id } from "../_generated/dataModel";
 import { mutation, type MutationCtx, type QueryCtx } from "../_generated/server";
-import { resolveOrg, withOrg } from "../_shared/org";
+import { resolveOrg } from "../_shared/org";
 import { scoringConfigForRead, getScoringModel } from "../icp/queries";
 import { subjectType, type SubjectType } from "../claims/schema";
 import { markScoreStale } from "../pipeline/stages";
 import { assertNotErased } from "../privacy/erased";
 import { decayedWeight, signalContribution } from "./decay";
 import { signalStrength, type Signal, type SignalStrength } from "./schema";
+import { requireRole } from "../_shared/authz";
 
 /** Upper bound on signals read per subject; newest first, so the cap only drops the stalest. */
 export const MAX_SIGNALS = 200;
@@ -162,7 +163,7 @@ export const recordSignals = mutation({
     ),
   },
   handler: async (ctx, args): Promise<{ created: number; duplicates: number }> => {
-    await withOrg(ctx, args);
+    await requireRole(ctx, "operator");
     if (args.signals.length > MAX_SIGNAL_BATCH) {
       throw new Error(`batch_too_large: at most ${MAX_SIGNAL_BATCH} signals per call (got ${args.signals.length})`);
     }

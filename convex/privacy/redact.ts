@@ -2,11 +2,15 @@ import { v } from "convex/values";
 import { internal } from "../_generated/api";
 import type { Doc, Id } from "../_generated/dataModel";
 import { internalMutation, type MutationCtx } from "../_generated/server";
+import type { Actor } from "../_shared/actor";
+import { systemActor } from "../_shared/authz";
 import { resolveOrg, withTrustedOrgForInternalOnly } from "../_shared/org";
+import { writeAudit } from "../audit/log";
 import { subjectType as subjectTypeValidator, type SubjectType } from "../claims/schema";
 import { hasBeenDelivered } from "../leads/mutations";
 import { storeEmptyProjection } from "../projections/build";
 import { ERASED_REASON, findErasure } from "./erased";
+import { ERASURE_REASONS, LEGAL_BASES, REFERENCE_PATTERN, type ErasureReason, type LegalBasis } from "./schema";
 import type { IdentifierKind } from "./normalize";
 import { tryNormalizeIdentifier } from "./normalize";
 import { addSuppression, getSuppressionSalt, type KindedIdentifier } from "./suppress";
@@ -194,8 +198,21 @@ async function recordSnapshotRefs(ctx: MutationCtx, orgId: Id<"orgs">, erasureId
   }
 }
 
+/** Who asked for an erasure, why and on what legal basis. Required to START one; see `eraseSubject`. */
+export type ErasureRequest = { requestedBy: Actor; reasonCode: ErasureReason; legalBasis: LegalBasis; reference: string };
+
+function checkRequest(request: ErasureRequest | undefined): ErasureRequest {
+  if (!request) throw new Error("an erasure must record who requested it, why and on what legal basis");
+  if (!(ERASURE_REASONS as readonly string[]).includes(request.reasonCode)) throw new Error("not an erasure reason");
+  if (!(LEGAL_BASES as readonly string[]).includes(request.legalBasis)) throw new Error("not a legal basis");
+  if (typeof request.reference !== "string" || !REFERENCE_PATTERN.test(request.reference)) {
+    throw new Error("reference must be an opaque case id (3-64 characters of letters, digits and ._:-, with at least one digit)");
+  }
+  return request;
+}
+
 /**
- * Erases one subject. A plain helper (no role check: Task 14), and IDEMPOTENT and RESUMABLE: if the subject has more
+ * Erases one subject. A plain helper (the role check, `admin`, is in privacy/api.ts), and IDEMPOTENT and RESUMABLE: if the subject has more
  * rows than one transaction may rewrite it returns `complete: false` having made progress, and is called again;
  * a completed erasure returns its totals and writes nothing. Everything is scoped by the caller's org.
  *
@@ -207,7 +224,7 @@ async function recordSnapshotRefs(ctx: MutationCtx, orgId: Id<"orgs">, erasureId
  */
 export async function eraseSubject(
   ctx: MutationCtx,
-  args: { subjectType: SubjectType; subjectId: string },
+  args: { subjectType: SubjectType; subjectId: string; /** Required on the call that STARTS the erasure; later calls (resuming) find the row and need none. */ request?: ErasureRequest },
   opts: { budget?: number } = {},
 ): Promise<ErasureResult> {
   const { orgId } = await resolveOrg(ctx);
@@ -223,13 +240,26 @@ export async function eraseSubject(
   const now = Date.now();
   let record = await findErasure(ctx, orgId, args.subjectType, id);
   if (!record) {
+    // No row without an accountable request, and no request without its audit entry: all in this transaction.
+    const request = checkRequest(args.request);
     const recordId = await ctx.db.insert("erasures", {
       orgId,
       subjectType: args.subjectType,
       subjectId: id,
       requestedAt: now,
+      requestedBy: request.requestedBy,
+      reasonCode: request.reasonCode,
+      legalBasis: request.legalBasis,
+      reference: request.reference,
       resumeAt: now + ERASE_STALL_MS,
       ...zero(),
+    });
+    await writeAudit(ctx, {
+      actor: request.requestedBy,
+      action: "erasure.requested",
+      targetTable: "erasures",
+      targetId: recordId,
+      after: { legalBasis: request.legalBasis, reasonCode: request.reasonCode },
     });
     record = (await ctx.db.get(recordId))!;
   }
@@ -372,6 +402,24 @@ export async function eraseSubject(
     ...(leadsDone ? { completedAt: now, resumeAt: undefined } : { resumeAt: now + ERASE_STALL_MS }),
   });
   record = (await ctx.db.get(record._id))!;
+  // Completion is the PROCESS finishing, not a person acting (it may happen in a scheduled step with no identity, or
+  // inline in the request's own transaction): a system actor either way. The requester is on the erasures row.
+  if (leadsDone) {
+    await writeAudit(ctx, {
+      actor: systemActor("erasure"),
+      action: "erasure.completed",
+      targetTable: "erasures",
+      targetId: record._id,
+      after: {
+        claimsRedacted: record.claimsRedacted,
+        contactKeysDeleted: record.contactKeysDeleted,
+        candidatesRedacted: record.candidatesRedacted,
+        signalsRedacted: record.signalsRedacted,
+        leadsRedacted: record.leadsRedacted,
+        suppressionsAdded: record.suppressionsAdded,
+      },
+    });
+  }
   return { ...finished(), snapshotRefs: [...snapshotRefs] };
 }
 
@@ -394,8 +442,8 @@ const describeError = (e: unknown): string => (e instanceof Error ? e.message : 
 
 /**
  * Runs an erasure to completion across as many transactions as it needs. INTERNAL: it takes the org as an argument
- * because scheduled work carries no identity, so it cannot be called by a client. There is deliberately NO public
- * erasure endpoint yet: anyone who could call one could destroy an org's data, and role checks are Task 14's.
+ * because scheduled work carries no identity, so it cannot be called by a client. The public entry is
+ * `requestErasure` in privacy/api.ts, which requires the `admin` role and then schedules this.
  *
  * A scheduled mutation that throws is not retried by the platform, so a thrown step would end the chain with the
  * person half-erased and nothing the wiser. The step therefore runs NESTED: when it throws, its writes roll back,

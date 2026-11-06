@@ -8,21 +8,30 @@
  * @module
  */
 
+import type * as _shared_actor from "../_shared/actor.js";
+import type * as _shared_authz from "../_shared/authz.js";
 import type * as _shared_normalize from "../_shared/normalize.js";
 import type * as _shared_org from "../_shared/org.js";
+import type * as _shared_testkit from "../_shared/testkit.js";
+import type * as audit_api from "../audit/api.js";
+import type * as audit_log from "../audit/log.js";
 import type * as claims_mutations from "../claims/mutations.js";
 import type * as claims_queries from "../claims/queries.js";
 import type * as crons from "../crons.js";
+import type * as icp_api from "../icp/api.js";
 import type * as icp_defaults from "../icp/defaults.js";
 import type * as icp_mutations from "../icp/mutations.js";
 import type * as icp_queries from "../icp/queries.js";
 import type * as icp_tier from "../icp/tier.js";
 import type * as icp_validate from "../icp/validate.js";
+import type * as leads_api from "../leads/api.js";
 import type * as leads_mutations from "../leads/mutations.js";
 import type * as leads_queries from "../leads/queries.js";
+import type * as members_api from "../members/api.js";
 import type * as pipeline_deadletter from "../pipeline/deadletter.js";
 import type * as pipeline_hash from "../pipeline/hash.js";
 import type * as pipeline_stages from "../pipeline/stages.js";
+import type * as privacy_api from "../privacy/api.js";
 import type * as privacy_erased from "../privacy/erased.js";
 import type * as privacy_normalize from "../privacy/normalize.js";
 import type * as privacy_redact from "../privacy/redact.js";
@@ -55,21 +64,30 @@ import type {
 } from "convex/server";
 
 declare const fullApi: ApiFromModules<{
+  "_shared/actor": typeof _shared_actor;
+  "_shared/authz": typeof _shared_authz;
   "_shared/normalize": typeof _shared_normalize;
   "_shared/org": typeof _shared_org;
+  "_shared/testkit": typeof _shared_testkit;
+  "audit/api": typeof audit_api;
+  "audit/log": typeof audit_log;
   "claims/mutations": typeof claims_mutations;
   "claims/queries": typeof claims_queries;
   crons: typeof crons;
+  "icp/api": typeof icp_api;
   "icp/defaults": typeof icp_defaults;
   "icp/mutations": typeof icp_mutations;
   "icp/queries": typeof icp_queries;
   "icp/tier": typeof icp_tier;
   "icp/validate": typeof icp_validate;
+  "leads/api": typeof leads_api;
   "leads/mutations": typeof leads_mutations;
   "leads/queries": typeof leads_queries;
+  "members/api": typeof members_api;
   "pipeline/deadletter": typeof pipeline_deadletter;
   "pipeline/hash": typeof pipeline_hash;
   "pipeline/stages": typeof pipeline_stages;
+  "privacy/api": typeof privacy_api;
   "privacy/erased": typeof privacy_erased;
   "privacy/normalize": typeof privacy_normalize;
   "privacy/redact": typeof privacy_redact;

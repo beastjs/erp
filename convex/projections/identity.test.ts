@@ -3,6 +3,7 @@ import { convexTest } from "convex-test";
 import { beforeEach, describe, expect, test } from "vitest";
 import type { Id } from "../_generated/dataModel";
 import { emailDomain, normalizeCompanyName, normalizeDomain, normalizeEmail } from "../_shared/normalize";
+import { asMember } from "../_shared/testkit";
 import schema from "../schema";
 import {
   linkIdentity,
@@ -27,7 +28,7 @@ beforeEach(async () => {
   }));
   orgId = seeded.orgId;
   otherOrgId = seeded.otherOrgId;
-  t = raw.withIdentity({ subject: "u1", orgId });
+  t = await asMember(raw, "u1", orgId);
 });
 
 const seedAccount = (display: { name?: string; domain?: string }, org = orgId) =>
@@ -124,7 +125,7 @@ test("unlinkIdentity refuses another org's link", async () => {
   const linkId = await t.run((ctx) =>
     linkIdentity(ctx, { subjectType: "account", subjectId: a, mergedFromId: b, score: 1, signals: [] }),
   );
-  const other = raw.withIdentity({ subject: "u2", orgId: otherOrgId });
+  const other = await asMember(raw, "u2", otherOrgId);
   await expect(other.run((ctx) => unlinkIdentity(ctx, { linkId }))).rejects.toThrow(/link not found/);
 });
 

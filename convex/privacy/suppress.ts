@@ -63,7 +63,7 @@ async function assertSaltMatchesLedger(ctx: Pick<QueryCtx, "db">, orgId: Id<"org
 
 type Ident = { identifier: string; kind?: IdentifierKind };
 
-/** Adds an identifier to the org's list. Idempotent: an identifier already on it returns the existing row. A plain helper; no role check (Task 14). */
+/** Adds an identifier to the org's list. Idempotent: an identifier already on it returns the existing row. A plain helper: the `admin` role check and the audit entry are in privacy/api.ts. */
 export async function addSuppression(
   ctx: MutationCtx,
   args: Ident & { reason: SuppressionReason },

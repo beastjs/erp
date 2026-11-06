@@ -2,6 +2,7 @@
 import { convexTest } from "convex-test";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import type { Id } from "../_generated/dataModel";
+import { asMember } from "../_shared/testkit";
 import schema from "../schema";
 import { DEFAULT_SCORING_MODEL } from "../icp/defaults";
 import { DEFAULT_STRENGTH_BY_KIND, decayedWeight, signalContribution, type Signal } from "./decay";
@@ -97,8 +98,8 @@ beforeEach(async () => {
   });
   accountId = s.account;
   otherOrgAccount = s.otherAccount;
-  t = raw.withIdentity({ subject: "u1", orgId: s.org });
-  otherT = raw.withIdentity({ subject: "u2", orgId: s.other });
+  t = await asMember(raw, "u1", s.org);
+  otherT = await asMember(raw, "u2", s.other);
 });
 
 const base = () => ({
@@ -120,9 +121,9 @@ test("appendSignal stores a signal and activeSignals returns it annotated with w
 
 test("activeSignals decays under the active model by default and under a named historical model on request", async () => {
   const org = (await raw.run((ctx) => ctx.db.get(accountId)))!.orgId;
-  const v1 = await raw.run((ctx) => ctx.db.insert("scoringModels", { ...P, orgId: org, version: 1, createdBy: "u1", activeFrom: 0 }));
+  const v1 = await raw.run((ctx) => ctx.db.insert("scoringModels", { ...P, orgId: org, version: 1, createdBy: { kind: "user", userId: "u1", role: "analyst" }, activeFrom: 0 }));
   await raw.run((ctx) =>
-    ctx.db.insert("scoringModels", { ...P, strengthWeights: { high: 0.5, medium: 0.3, low: 0.1 }, orgId: org, version: 2, supersedesId: v1, createdBy: "u1", activeFrom: 1 }),
+    ctx.db.insert("scoringModels", { ...P, strengthWeights: { high: 0.5, medium: 0.3, low: 0.1 }, orgId: org, version: 2, supersedesId: v1, createdBy: { kind: "user", userId: "u1", role: "analyst" }, activeFrom: 1 }),
   );
   await t.run((ctx) => appendSignal(ctx, { ...base(), observedAt: NOW, confidence: 1 }));
   const args = { subjectType: "account" as const, subjectId: accountId as string, now: NOW };
@@ -247,7 +248,9 @@ test("appendSignal rejects a future-dated observedAt beyond the skew but allows 
   await expect(
     t.run((ctx) => appendSignal(ctx, { ...base(), observedAt: Date.parse("2062-01-01") })),
   ).rejects.toThrow("observedAt is in the future");
-  await expect(t.run((ctx) => appendSignal(ctx, { ...base(), observedAt: NOW + MAX_FUTURE_SKEW_MS + 1 }))).rejects.toThrow(
+  // A minute past the skew, not 1 ms: convex-test pins a handler's clock to the latest document creation time
+  // (inserts within one millisecond are nudged forward), so the handler's "now" is not exactly the faked NOW.
+  await expect(t.run((ctx) => appendSignal(ctx, { ...base(), observedAt: NOW + MAX_FUTURE_SKEW_MS + 60_000 }))).rejects.toThrow(
     "observedAt is in the future",
   );
   await t.run((ctx) => appendSignal(ctx, { ...base(), observedAt: NOW + MAX_FUTURE_SKEW_MS }));

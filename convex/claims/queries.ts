@@ -1,8 +1,9 @@
 import { v } from "convex/values";
 import type { Id } from "../_generated/dataModel";
 import { query, type QueryCtx } from "../_generated/server";
-import { withOrg } from "../_shared/org";
+
 import { subjectType, type SubjectType } from "./schema";
+import { requireRole } from "../_shared/authz";
 
 /**
  * Most claims a single subject (or subject+field) may hold for a read. Exceeding
@@ -44,7 +45,7 @@ export async function loadClaimsForField(
 export const claimsForSubject = query({
   args: { subjectType, subjectId: v.string() },
   handler: async (ctx, args) => {
-    const { orgId } = await withOrg(ctx, args);
+    const { orgId } = await requireRole(ctx, "operator");
     return await loadClaimsForSubject(ctx, orgId, args);
   },
 });
@@ -52,7 +53,7 @@ export const claimsForSubject = query({
 export const claimsForField = query({
   args: { subjectType, subjectId: v.string(), field: v.string() },
   handler: async (ctx, args) => {
-    const { orgId } = await withOrg(ctx, args);
+    const { orgId } = await requireRole(ctx, "operator");
     return await loadClaimsForField(ctx, orgId, args);
   },
 });

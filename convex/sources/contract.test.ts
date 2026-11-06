@@ -3,6 +3,7 @@ import { convexTest } from "convex-test";
 import { beforeEach, expect, test } from "vitest";
 import { api } from "../_generated/api";
 import type { Id } from "../_generated/dataModel";
+import { asMember } from "../_shared/testkit";
 import schema from "../schema";
 import { normalizeProfileUrl } from "../_shared/normalize";
 import { insertCandidate, registerSource } from "./mutations";
@@ -35,7 +36,7 @@ let orgId: Id<"orgs">;
 beforeEach(async () => {
   raw = convexTest(schema, modules);
   orgId = await raw.run((ctx) => ctx.db.insert("orgs", { name: "Org 1", createdAt: 0 }));
-  t = raw.withIdentity({ subject: "u1", orgId });
+  t = await asMember(raw, "u1", orgId);
 });
 
 const register = (over: Record<string, unknown> = {}) =>
@@ -119,7 +120,7 @@ test("insertCandidate fails closed on invalid candidates and foreign sources", a
     t.run((ctx) => insertCandidate(ctx, { candidate: { ...candidate, extra: 1 }, sourceId })),
   ).rejects.toThrow("invalid candidate");
   const otherOrg = await raw.run((ctx) => ctx.db.insert("orgs", { name: "Org 2", createdAt: 0 }));
-  const other = raw.withIdentity({ subject: "u2", orgId: otherOrg });
+  const other = await asMember(raw, "u2", otherOrg);
   await expect(
     other.run((ctx) => insertCandidate(ctx, { candidate, sourceId })),
   ).rejects.toThrow("source not found");
@@ -130,7 +131,7 @@ test("the same hash in a different org is not a duplicate", async () => {
   const candidate = minimal();
   await t.run((ctx) => insertCandidate(ctx, { candidate, sourceId }));
   const otherOrg = await raw.run((ctx) => ctx.db.insert("orgs", { name: "Org 2", createdAt: 0 }));
-  const other = raw.withIdentity({ subject: "u2", orgId: otherOrg });
+  const other = await asMember(raw, "u2", otherOrg);
   const otherSource = await other.mutation(api.sources.mutations.registerSource, {
     key: "csv-1", kind: "csv", trustWeight: 0.5, lawfulBasis: "consent",
   });

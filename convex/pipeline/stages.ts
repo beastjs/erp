@@ -2,7 +2,7 @@ import { ConvexError, v } from "convex/values";
 import { internal } from "../_generated/api";
 import type { Doc, Id } from "../_generated/dataModel";
 import { internalMutation, mutation, query, type MutationCtx, type QueryCtx } from "../_generated/server";
-import { resolveOrg, withOrg, withTrustedOrgForInternalOnly } from "../_shared/org";
+import { resolveOrg, withTrustedOrgForInternalOnly } from "../_shared/org";
 import { loadClaimsForSubject } from "../claims/queries";
 import { subjectType as subjectTypeValidator, type SubjectType } from "../claims/schema";
 import { ensureActiveScoringModel } from "../icp/mutations";
@@ -13,6 +13,8 @@ import { rebuildProjection } from "../projections/build";
 import { trySpendCredits } from "../runs/mutations";
 import { scoreLead } from "../scoring/assemble";
 import { MAX_SIGNALS, activeSignals } from "../signals/mutations";
+import { requireRole, systemActor } from "../_shared/authz";
+import { writeAudit } from "../audit/log";
 import { stageInputHash } from "./hash";
 import {
   CREDITS_PER_SUBJECT,
@@ -428,7 +430,18 @@ export const stageHandlers: Record<Stage, StageHandler> = {
     const prior = await ctx.db.query("leads").withIndex("by_org_and_contact", (q) => q.eq("orgId", orgId).eq("contactId", contactId)).take(MAX_PRIOR_LEADS + 1);
     if (prior.length > MAX_PRIOR_LEADS) throw new Error(`contact ${contactId} has more than ${MAX_PRIOR_LEADS} leads; refusing a partial read`);
     for (const p of prior) {
-      if (p._id !== leadId && p.inventoryState === "Available") await setInventoryState(ctx, { leadId: p._id, state: "Replaced" });
+      if (p._id !== leadId && p.inventoryState === "Available") {
+        await setInventoryState(ctx, { leadId: p._id, state: "Replaced" });
+        // The pipeline did this on its own (a stage has no identity), so the entry names a system process, not a person.
+        await writeAudit(ctx, {
+          actor: systemActor("lead_supersession"),
+          action: "lead.inventory_state_set",
+          targetTable: "leads",
+          targetId: p._id,
+          before: { inventoryState: "Available" },
+          after: { inventoryState: "Replaced" },
+        });
+      }
     }
     return { kind: "done", output: { leadId } };
   },
@@ -484,7 +497,7 @@ export async function enqueueSubject(
 export const startPipeline = mutation({
   args: { subjectType: subjectTypeValidator, subjectId: v.string(), runId: v.optional(v.id("discoveryRuns")) },
   handler: async (ctx, args) => {
-    await withOrg(ctx, args);
+    await requireRole(ctx, "operator");
     return await enqueueSubject(ctx, args);
   },
 });
@@ -492,7 +505,7 @@ export const startPipeline = mutation({
 export const pipelineStatus = query({
   args: { subjectType: subjectTypeValidator, subjectId: v.string() },
   handler: async (ctx, args): Promise<Doc<"pipelineState"> | null> => {
-    const { orgId } = await withOrg(ctx, args);
+    const { orgId } = await requireRole(ctx, "operator");
     return await findState(ctx, orgId, args.subjectType, args.subjectId);
   },
 });

@@ -3,6 +3,7 @@ import { convexTest } from "convex-test";
 import { beforeEach, expect, test } from "vitest";
 import { api } from "../_generated/api";
 import type { Id } from "../_generated/dataModel";
+import { asMember } from "../_shared/testkit";
 import schema from "../schema";
 
 const modules = import.meta.glob("/convex/**/*.ts");
@@ -19,13 +20,13 @@ beforeEach(async () => {
   const seeded = await raw.run(async (ctx) => {
     const orgId = await ctx.db.insert("orgs", { name: "Org 1", createdAt: 0 });
     const sourceId = await ctx.db.insert("sources", { orgId, key: "csv", kind: "csv", trustWeight: 0.8, lawfulBasis: "consent" });
-    const icpVersionId = await ctx.db.insert("icpDefinitions", { orgId, version: 1, name: "v1", criteria, createdBy: "u1", activeFrom: 0 });
+    const icpVersionId = await ctx.db.insert("icpDefinitions", { orgId, version: 1, name: "v1", criteria, createdBy: { kind: "user", userId: "u1", role: "analyst" }, activeFrom: 0 });
     return { orgId, sourceId, icpVersionId };
   });
   orgId = seeded.orgId;
   sourceId = seeded.sourceId;
   icpVersionId = seeded.icpVersionId;
-  t = raw.withIdentity({ subject: "u1", orgId });
+  t = await asMember(raw, "u1", orgId);
 });
 
 const start = (creditBudget = 10) => t.mutation(api.runs.mutations.startRun, { sourceId, icpVersionId, creditBudget });
@@ -43,7 +44,7 @@ test("startRun opens a running run with zeroed accounting", async () => {
 test("startRun refuses an ICP version from another org", async () => {
   const foreign = await raw.run(async (ctx) => {
     const other = await ctx.db.insert("orgs", { name: "Org 2", createdAt: 0 });
-    return await ctx.db.insert("icpDefinitions", { orgId: other, version: 1, name: "theirs", criteria, createdBy: "x", activeFrom: 0 });
+    return await ctx.db.insert("icpDefinitions", { orgId: other, version: 1, name: "theirs", criteria, createdBy: { kind: "user", userId: "x", role: "analyst" }, activeFrom: 0 });
   });
   await expect(t.mutation(api.runs.mutations.startRun, { sourceId, icpVersionId: foreign, creditBudget: 5 })).rejects.toThrow("icp version not found");
 });
@@ -92,7 +93,7 @@ test("consumeCredits refuses a finished run and a run from another org", async (
   const runId = await start(10);
   await t.mutation(api.runs.mutations.finishRun, { runId });
   await expect(t.mutation(api.runs.mutations.consumeCredits, { runId, credits: 1 })).rejects.toThrow("run_not_active");
-  const other = raw.withIdentity({ subject: "u2", orgId: await raw.run((ctx) => ctx.db.insert("orgs", { name: "Org 2", createdAt: 0 })) });
+  const other = await asMember(raw, "u2", await raw.run((ctx) => ctx.db.insert("orgs", { name: "Org 2", createdAt: 0 })));
   await expect(other.mutation(api.runs.mutations.consumeCredits, { runId, credits: 1 })).rejects.toThrow("run not found");
 });
 

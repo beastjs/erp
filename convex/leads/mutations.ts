@@ -224,7 +224,7 @@ const BUYER_OUTCOMES: readonly Disposition[] = ["Accepted", "Converted"];
 export const hasBeenDelivered = (lead: Doc<"leads">) =>
   lead.inventoryState === "Delivered" || lead.disposition === "Delivered" || lead.disposition === "Accepted" || lead.disposition === "Converted";
 
-async function loadLead(ctx: MutationCtx, leadId: Id<"leads">): Promise<Doc<"leads">> {
+export async function loadLead(ctx: MutationCtx, leadId: Id<"leads">): Promise<Doc<"leads">> {
   const { orgId } = await resolveOrg(ctx);
   const lead = await ctx.db.get(leadId);
   if (!lead || lead.orgId !== orgId) throw new Error("lead not found");

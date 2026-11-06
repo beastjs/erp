@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { api, internal } from "../_generated/api";
 import type { Doc, Id } from "../_generated/dataModel";
 import { appendClaimRecord } from "../claims/mutations";
-import { createIcpVersion } from "../icp/mutations";
+import { createIcpVersion, asMember } from "../_shared/testkit";
 import { latestIcp } from "../icp/queries";
 import { packageLead, setDisposition, setInventoryState } from "../leads/mutations";
 import { applyClaimToProjection, rebuildProjection } from "../projections/build";
@@ -30,7 +30,7 @@ beforeEach(async () => {
   vi.useFakeTimers();
   raw = convexTest(schema, modules);
   orgId = await raw.run((ctx) => ctx.db.insert("orgs", { name: "Org 1", createdAt: 0 }));
-  t = raw.withIdentity({ subject: "u1", orgId });
+  t = await asMember(raw, "u1", orgId);
 });
 afterEach(() => {
   vi.useRealTimers();
@@ -93,7 +93,8 @@ async function world(over: { pipeline?: boolean; person?: typeof person; company
   return { contactId: contact._id, accountId, sourceId, leadId };
 }
 
-const erase = (subjectType: "contact" | "account", subjectId: string, opts?: { budget?: number }) => t.run((ctx) => eraseSubject(ctx, { subjectType, subjectId }, opts));
+const REQUEST = { requestedBy: { kind: "user", userId: "https://convex.test|u1", role: "admin" }, reasonCode: "data_subject_request", legalBasis: "gdpr_art17_erasure", reference: "CASE-1001" } as const;
+const erase = (subjectType: "contact" | "account", subjectId: string, opts?: { budget?: number }) => t.run((ctx) => eraseSubject(ctx, { subjectType, subjectId, request: REQUEST }, opts));
 const lead = (id: Id<"leads">) => raw.run((ctx) => ctx.db.get(id)) as Promise<Doc<"leads">>;
 
 describe("claims: redaction, not deletion", () => {
@@ -496,14 +497,14 @@ describe("suppression: erased means kept out", () => {
   test("the list is per org: another org's copy of the same person is untouched", async () => {
     const w = await world();
     const other = await raw.run((ctx) => ctx.db.insert("orgs", { name: "Org 2", createdAt: 0 }));
-    const o = raw.withIdentity({ subject: "u2", orgId: other });
+    const o = await asMember(raw, "u2", other);
     await o.mutation(api.sources.import.addManualLead, { candidate: { person, company, acquisition: { acquiredAt: Date.now() - DAY } } });
     await erase("contact", w.contactId);
     const theirs = (await raw.run((ctx) => ctx.db.query("contacts").collect())).find((c) => c.orgId === other)!;
     expect(theirs.fields.length).toBeGreaterThan(3);
     expect((await raw.run((ctx) => ctx.db.query("claims").collect())).filter((c) => c.orgId === other).every((c) => c.redactedAt === undefined)).toBe(true);
     expect(await o.run((ctx) => isSuppressed(ctx, { identifier: "bob.tables@acme.com" }))).toBe(false);
-    await expect(o.run((ctx) => eraseSubject(ctx, { subjectType: "contact", subjectId: w.contactId }))).rejects.toThrow("subject not found");
+    await expect(o.run((ctx) => eraseSubject(ctx, { subjectType: "contact", subjectId: w.contactId, request: REQUEST }))).rejects.toThrow("subject not found");
   });
 });
 
@@ -570,9 +571,18 @@ describe("idempotent and resumable", () => {
 
   test("the internal runner carries an erasure through, with no identity, as the scheduler would", async () => {
     const w = await world({ pipeline: true });
+    // The runner can only CONTINUE an accountable erasure: a request with a recorded requester started it.
+    expect((await erase("contact", w.contactId, { budget: 1 })).complete).toBe(false);
     expect(await raw.mutation(internal.privacy.redact.runErasure, { orgId, subjectType: "contact", subjectId: w.contactId })).toEqual({ complete: true });
     await drain();
     expect(await tablesHolding(PII)).toEqual([]);
+  });
+
+  test("the internal runner cannot START an erasure: with no request on record there is nobody accountable, so nothing is erased", async () => {
+    const w = await world();
+    await expect(raw.mutation(internal.privacy.redact.runErasure, { orgId, subjectType: "contact", subjectId: w.contactId })).rejects.toThrow(/who requested it/);
+    expect(await dump("erasures")).toHaveLength(0);
+    expect((await claimsOf("contact", w.contactId)).some((c) => c.value !== null)).toBe(true);
   });
 
   test("snapshot references on the redacted claims are handed back so the raw snapshots (R2) can be deleted", async () => {
@@ -677,7 +687,7 @@ describe("liveness: a stalled erasure is DETECTED and resumed, not merely resuma
       for (let i = 0; i < SWEEP_BATCH + 3; i++) {
         const contactId = await ctx.db.insert("contacts", { orgId, fields: [], display: {} });
         ids.push(contactId);
-        await ctx.db.insert("erasures", { orgId, subjectType: "contact", subjectId: contactId, requestedAt: 0, resumeAt: 1, claimsRedacted: 0, contactKeysDeleted: 0, candidatesRedacted: 0, signalsRedacted: 0, leadsRedacted: 0, suppressionsAdded: 0 });
+        await ctx.db.insert("erasures", { orgId, subjectType: "contact", subjectId: contactId, requestedAt: 0, ...REQUEST, resumeAt: 1, claimsRedacted: 0, contactKeysDeleted: 0, candidatesRedacted: 0, signalsRedacted: 0, leadsRedacted: 0, suppressionsAdded: 0 });
       }
     });
     await tick();
@@ -698,6 +708,7 @@ describe("snapshot references (R2): recorded durably, not handed to a caller tha
       await ctx.db.patch(mine[2]!._id, { snapshotRef: "r2://crawl/def456" });
     });
     // through the RUNNER, in small steps, as production does: the old runner returned only { complete }
+    await erase("contact", w.contactId, { budget: 1 });
     let res = await raw.mutation(internal.privacy.redact.runErasure, { orgId, subjectType: "contact", subjectId: w.contactId });
     expect(res.complete).toBe(true);
     const refs = (await dump("erasureSnapshotRefs")) as Doc<"erasureSnapshotRefs">[];
@@ -775,5 +786,89 @@ describe("a suppressed lead reaches no buyer-facing state by ANY route", () => {
     await t.run((ctx) => addSuppression(ctx, { identifier: "bob.tables@acme.com", reason: "opt_out" }));
     await t.run((ctx) => setDisposition(ctx, { leadId: w.leadId!, disposition: "Accepted" }));
     await expect(t.run((ctx) => setInventoryState(ctx, { leadId: w.leadId!, state: "Sold" }))).rejects.toThrow();
+  });
+});
+
+/*
+ * THE AUDIT LOG MUST SURVIVE AN ERASURE WITHOUT BECOMING A SECOND COPY OF THE PERSON (Task 14). The log is append-only,
+ * so nothing may need redacting in it: `writeAudit` accepts no content (audit/log.ts). The all-tables sweep
+ * (`tablesHolding` walks `Object.keys(schema.tables)`) picks `auditLog` up on its own, but a sweep over an EMPTY table
+ * proves nothing (Task 13 H-2), so this world is populated by every path that writes audit rows.
+ */
+describe("audit log: populated, append-only, and holding none of the subject's data after an erasure", () => {
+  const auditRows = () => dump("auditLog") as Promise<Doc<"auditLog">[]>;
+
+  /** A world that has been through every audited path a person can touch: manual source, model seed (system), delivery, erasure. */
+  async function auditedWorld() {
+    const w = await world({ pipeline: true });
+    await t.mutation(api.leads.api.markInventoryState, { leadId: w.leadId!, state: "Delivered" });
+    await t.mutation(api.leads.api.markDisposition, { leadId: w.leadId!, disposition: "Delivered" });
+    return w;
+  }
+  const requestErasure = (id: string) =>
+    t.mutation(api.privacy.api.requestErasure, { subjectType: "contact", subjectId: id, reasonCode: "data_subject_request", legalBasis: "gdpr_art17_erasure", reference: "CASE-1001" });
+
+  test("the world really does populate the audit log, from a person AND from the system", async () => {
+    await auditedWorld();
+    const actions = (await auditRows()).map((r) => `${r.actor.kind}:${r.action}`).sort();
+    expect(actions).toEqual(
+      expect.arrayContaining(["user:source.registered", "system:scoring_model.created", "user:lead.inventory_state_set", "user:lead.disposition_set"]),
+    );
+  });
+
+  test("after erasing the subject through the public endpoint no table, the audit log included, holds any of their data", async () => {
+    const w = await auditedWorld();
+    const before = await auditRows();
+    expect(before.length).toBeGreaterThanOrEqual(4);
+    expect(await tablesHolding(PII)).toContain("claims"); // the sweep sees the person before
+
+    expect((await requestErasure(w.contactId)).complete).toBe(true);
+    await drain();
+
+    expect(await tablesHolding(PII)).toEqual([]); // includes auditLog and erasures: the table list comes from the schema
+    const after = await auditRows();
+    // append-only: every earlier entry is byte-identical, and the erasure ADDED entries
+    expect(after.slice(0, before.length)).toEqual(before);
+    expect(after.slice(before.length).map((r) => r.action)).toEqual(["erasure.requested", "erasure.completed"]);
+    expect(JSON.stringify(after).toLowerCase()).not.toMatch(/bobby|tables|acme|5550104242|linkedin/);
+  });
+
+  test("the sweep is not vacuous for the audit log: personal data written into it WOULD be found", async () => {
+    await auditedWorld();
+    expect(await tablesHolding(PII)).not.toContain("auditLog"); // the other tables hold the person, the log does not
+    await raw.run((ctx) => ctx.db.insert("auditLog", { orgId, actor: { kind: "system", process: "erasure" }, action: "x", targetTable: "claims", targetId: "y", after: { kind: "bob.tables@acme.com" }, createdAt: 0 }));
+    expect(await tablesHolding(PII)).toContain("auditLog");
+  });
+
+  test("the erasure's own record names who asked, why and on what basis, with no personal data", async () => {
+    const w = await auditedWorld();
+    await requestErasure(w.contactId);
+    const [row] = (await dump("erasures")) as Doc<"erasures">[];
+    expect(row).toMatchObject({
+      requestedBy: { kind: "user", userId: "https://convex.test|u1", role: "admin" },
+      reasonCode: "data_subject_request",
+      legalBasis: "gdpr_art17_erasure",
+      reference: "CASE-1001",
+    });
+    const log = (await auditRows()).filter((r) => r.action.startsWith("erasure."));
+    expect(log[0]).toMatchObject({ action: "erasure.requested", actor: row!.requestedBy, targetId: row!._id, after: { legalBasis: "gdpr_art17_erasure", reasonCode: "data_subject_request" } });
+  });
+
+  test("an erasure finished by the CRON is audited as completed by the system, the requester staying on the row", async () => {
+    const w = await auditedWorld();
+    expect((await erase("contact", w.contactId, { budget: 1 })).complete).toBe(false);
+    expect((await auditRows()).some((r) => r.action === "erasure.completed")).toBe(false);
+    vi.setSystemTime(Date.now() + ERASE_STALL_MS + 60_000);
+    await raw.mutation(internal.privacy.sweep.sweepStalledErasures, {});
+    await drain();
+    const done = (await auditRows()).filter((r) => r.action === "erasure.completed");
+    expect(done).toHaveLength(1); // exactly once, however many ticks
+    expect(done[0]!.actor).toEqual({ kind: "system", process: "erasure" });
+    expect(done[0]!.after).toMatchObject({ claimsRedacted: expect.any(Number) });
+    expect(((await dump("erasures")) as Doc<"erasures">[])[0]!.requestedBy).toMatchObject({ kind: "user" });
+    expect(await tablesHolding(PII)).toEqual([]);
+    await raw.mutation(internal.privacy.sweep.sweepStalledErasures, {});
+    await drain();
+    expect((await auditRows()).filter((r) => r.action === "erasure.completed")).toHaveLength(1);
   });
 });

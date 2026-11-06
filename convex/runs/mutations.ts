@@ -2,7 +2,9 @@ import { v } from "convex/values";
 import { internal } from "../_generated/api";
 import type { Doc, Id } from "../_generated/dataModel";
 import { mutation, type MutationCtx } from "../_generated/server";
-import { withOrg } from "../_shared/org";
+import { requireRole } from "../_shared/authz";
+import { writeAudit } from "../audit/log";
+
 
 export type RunCounter =
   | "rowsProcessed"
@@ -137,7 +139,7 @@ export async function trySpendCredits(ctx: MutationCtx, orgId: Id<"orgs">, runId
 export const startRun = mutation({
   args: { sourceId: v.id("sources"), icpVersionId: v.optional(v.id("icpDefinitions")), creditBudget: v.number() },
   handler: async (ctx, args) => {
-    const { orgId } = await withOrg(ctx, args);
+    const { orgId, actor } = await requireRole(ctx, "admin");
     // Negated conjunction: NaN fails every comparison, so it fails closed. An infinite budget is no budget.
     if (!(Number.isFinite(args.creditBudget) && args.creditBudget >= 0)) {
       throw new Error("creditBudget must be a finite number >= 0");
@@ -148,7 +150,7 @@ export const startRun = mutation({
       const icp = await ctx.db.get(args.icpVersionId);
       if (!icp || icp.orgId !== orgId) throw new Error("icp version not found");
     }
-    return await ctx.db.insert("discoveryRuns", {
+    const runId = await ctx.db.insert("discoveryRuns", {
       orgId,
       sourceId: args.sourceId,
       icpVersionId: args.icpVersionId,
@@ -163,6 +165,8 @@ export const startRun = mutation({
       candidatesConsumed: 0,
       candidatesRejected: 0,
     });
+    await writeAudit(ctx, { actor, action: "run.started", targetTable: "discoveryRuns", targetId: runId, after: { creditBudget: args.creditBudget } });
+    return runId;
   },
 });
 
@@ -174,7 +178,7 @@ export const startRun = mutation({
 export const consumeCredits = mutation({
   args: { runId: v.id("discoveryRuns"), credits: v.number() },
   handler: async (ctx, args) => {
-    const { orgId } = await withOrg(ctx, args);
+    const { orgId } = await requireRole(ctx, "operator");
     return await spendCredits(ctx, orgId, args.runId, args.credits);
   },
 });
@@ -183,7 +187,7 @@ export const consumeCredits = mutation({
 export const finishRun = mutation({
   args: { runId: v.id("discoveryRuns") },
   handler: async (ctx, args) => {
-    const { orgId } = await withOrg(ctx, args);
+    const { orgId } = await requireRole(ctx, "operator");
     const run = await loadRun(ctx, orgId, args.runId);
     // A failed run stays failed: completing it would erase the only signal that it died.
     if (run.status !== "running") return null;

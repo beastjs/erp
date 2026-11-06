@@ -3,6 +3,7 @@ import { convexTest } from "convex-test";
 import { beforeEach, expect, test } from "vitest";
 import { api } from "../_generated/api";
 import type { Id } from "../_generated/dataModel";
+import { asMember } from "../_shared/testkit";
 import schema from "../schema";
 import { MAX_SIGNAL_BATCH, MAX_SIGNALS, appendSignal } from "./mutations";
 
@@ -26,7 +27,7 @@ beforeEach(async () => {
       sourceId: await ctx.db.insert("sources", { orgId, key: "feed", kind: "crawler", trustWeight: 1, lawfulBasis: "legitimate_interest" }),
     };
   }));
-  t = raw.withIdentity({ subject: "u1", orgId });
+  t = await asMember(raw, "u1", orgId);
 });
 
 const ev = (over: Record<string, unknown> = {}) =>
@@ -102,7 +103,7 @@ test("recordSignals is all-or-nothing and refuses an oversized batch or a foreig
   expect(await count()).toBe(0);
   const many = Array.from({ length: MAX_SIGNAL_BATCH + 1 }, (_, i) => ev({ externalId: `e${i}` }));
   await expect(t.mutation(api.signals.mutations.recordSignals, { signals: many })).rejects.toThrow("batch_too_large");
-  const foreign = raw.withIdentity({ subject: "u2", orgId: await raw.run((ctx) => ctx.db.insert("orgs", { name: "Org 2", createdAt: 0 })) });
+  const foreign = await asMember(raw, "u2", await raw.run((ctx) => ctx.db.insert("orgs", { name: "Org 2", createdAt: 0 })));
   await expect(foreign.mutation(api.signals.mutations.recordSignals, { signals: [ev()] })).rejects.toThrow("subject not found");
   expect(await count()).toBe(0);
 });

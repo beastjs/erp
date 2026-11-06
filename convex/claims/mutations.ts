@@ -1,6 +1,7 @@
 import { v } from "convex/values";
 import type { Id } from "../_generated/dataModel";
 import { mutation, type MutationCtx } from "../_generated/server";
+import { requireRole } from "../_shared/authz";
 import { resolveOrg } from "../_shared/org";
 import { scoringConfigForRead } from "../icp/queries";
 import { markScoreStale } from "../pipeline/stages";
@@ -73,5 +74,8 @@ export const appendClaim = mutation({
     snapshotRef: v.optional(v.string()),
     runId: v.optional(v.id("discoveryRuns")),
   },
-  handler: async (ctx, args) => appendClaimRecord(ctx, args),
+  handler: async (ctx, args) => {
+    await requireRole(ctx, "operator");
+    return await appendClaimRecord(ctx, args);
+  },
 });

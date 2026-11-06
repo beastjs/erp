@@ -3,7 +3,7 @@ import { convexTest } from "convex-test";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { api, internal } from "../_generated/api";
 import type { Doc, Id } from "../_generated/dataModel";
-import { SYSTEM_ACTOR_DEFAULT_MODEL_SEED, createIcpVersion } from "../icp/mutations";
+import { createIcpVersion, asMember } from "../_shared/testkit";
 import { latestIcp } from "../icp/queries";
 import { appendClaimRecord } from "../claims/mutations";
 import { setInventoryState } from "../leads/mutations";
@@ -24,7 +24,7 @@ beforeEach(async () => {
   vi.useFakeTimers();
   raw = convexTest(schema, modules);
   orgId = await raw.run((ctx) => ctx.db.insert("orgs", { name: "Org 1", createdAt: 0 }));
-  t = raw.withIdentity({ subject: "u1", orgId });
+  t = await asMember(raw, "u1", orgId);
 });
 afterEach(() => {
   Object.assign(stageHandlers, originals);
@@ -157,7 +157,7 @@ describe("end to end", () => {
 
   // Finding from the resolveOrg refactor: the score stage seeds the default scoring model from a scheduled function. That
   // used to record the fabricated identity "internal|<orgId>" as the row's author. No person made it, and no person is claimed.
-  test("a scoring model seeded by a scheduled stage is attributed to the system label, not a fabricated actor", async () => {
+  test("a scoring model seeded by a scheduled stage is attributed to a typed system actor, not a person and not a fabricated identity", async () => {
     const { contactId, accountId, sourceId } = await ingestLead();
     await makeIcp();
     await funding(accountId, sourceId);
@@ -165,8 +165,8 @@ describe("end to end", () => {
     await drain();
     const models = await raw.run((ctx) => ctx.db.query("scoringModels").collect());
     expect(models).toHaveLength(1);
-    expect(models[0]!.createdBy).toBe(SYSTEM_ACTOR_DEFAULT_MODEL_SEED);
-    expect(models[0]!.createdBy).not.toContain("internal");
+    expect(models[0]!.createdBy).toEqual({ kind: "system", process: "default_scoring_model_seed" });
+    expect(JSON.stringify(models[0]!.createdBy)).not.toContain("internal");
   });
 });
 

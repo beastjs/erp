@@ -3,7 +3,7 @@ import { convexTest } from "convex-test";
 import { beforeEach, expect, test } from "vitest";
 import type { Id } from "../_generated/dataModel";
 import { DEFAULT_SCORING_MODEL } from "../icp/defaults";
-import { createIcpVersion } from "../icp/mutations";
+import { createIcpVersion, asMember } from "../_shared/testkit";
 import type { IcpCriteria } from "../icp/schema";
 import type { ClaimMethod } from "../claims/schema";
 import schema from "../schema";
@@ -401,7 +401,7 @@ let orgId: Id<"orgs">;
 beforeEach(async () => {
   raw = convexTest(schema, modules);
   orgId = await raw.run((ctx) => ctx.db.insert("orgs", { name: "Org 1", createdAt: 0 }));
-  t = raw.withIdentity({ subject: "u1", orgId });
+  t = await asMember(raw, "u1", orgId);
 });
 
 async function seed() {

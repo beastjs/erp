@@ -5,10 +5,10 @@ import { api, internal } from "../_generated/api";
 import type { Doc, Id } from "../_generated/dataModel";
 import { systemActor } from "../_shared/authz";
 import { withTrustedOrgForInternalOnly } from "../_shared/org";
-import { TEST_ACTOR, asMember, tokenOf } from "../_shared/testkit";
+import { TEST_ACTOR, asMember, tokenOf } from "../_shared/testkit.support";
 import { DEFAULT_SCORING_MODEL } from "../icp/defaults";
 import schema from "../schema";
-import { AUDIT_ACTIONS, writeAudit } from "./log";
+import { AUDIT_ACTIONS, checkFields, writeAudit } from "./log";
 
 const modules = import.meta.glob("/convex/**/*.ts");
 
@@ -34,15 +34,60 @@ describe("what an entry may hold: no content, ever", () => {
     expect(await rows()).toHaveLength(0);
   });
 
-  test("even on an allowed field, a value that is not a number, flag, null or short token is refused: a name or address cannot ride along", async () => {
+  test("even on an allowed field, a value outside THAT FIELD'S declared domain is refused: a name or address cannot ride along", async () => {
     const sourceId = await sourceRow();
-    for (const value of ["Bobby Tables", "bob.tables@acme.com", "+1 555 010 4242", "https://linkedin.com/in/bobby", "x".repeat(65), "", { nested: "bob" }, ["bob"], NaN, Infinity, undefined]) {
+    // Several of these pass a generic token shape ([A-Za-z0-9_.:-]{1,64}); none is a member of the field's closed set.
+    for (const value of ["Bobby", "bob.tables.acme.com", "1-555-010-4242", "Bobby Tables", "bob.tables@acme.com", "https://linkedin.com/in/bobby", "x".repeat(65), "", "CRM", "crawler ", { nested: "bob" }, ["bob"], 7, true, null, NaN, Infinity, undefined]) {
       await expect(
         userRun((ctx) => writeAudit(ctx, { actor: TEST_ACTOR, action: "source.registered", targetTable: "sources", targetId: sourceId, after: { kind: value as never } })),
         String(JSON.stringify(value)),
-      ).rejects.toThrow(/must be a finite number|flat record/);
+      ).rejects.toThrow(/outside its declared domain|flat record/);
+    }
+    // numbers: out of range, fractional where an integer is declared, non-finite, and strings in a numeric field
+    for (const [action, table, field, value] of [
+      ["source.registered", "sources", "trustWeight", 1.5],
+      ["source.registered", "sources", "trustWeight", "0.5"],
+      ["icp.created", "icpDefinitions", "version", 1.5],
+      ["icp.created", "icpDefinitions", "version", 0],
+      ["erasure.completed", "erasures", "claimsRedacted", 15550104242],
+      ["run.started", "discoveryRuns", "creditBudget", 15550104242],
+      ["run.started", "discoveryRuns", "creditBudget", -1],
+    ] as const) {
+      await expect(userRun((ctx) => writeAudit(ctx, { actor: TEST_ACTOR, action, targetTable: table, targetId: sourceId, after: { [field]: value } })), `${action}.${field}=${value}`).rejects.toThrow(/outside its declared domain|not an id/);
     }
     expect(await rows()).toHaveLength(0);
+  });
+
+  test("a field with no declared domain, or a loose one (a bare string, a regex, a token shape), is not auditable: checkFields fails closed", () => {
+    // This is the regression the old generic-token check could not catch: someone adds `key` (a v.string()) to an allowlist.
+    const base = { kind: { enum: ["crm"] } };
+    expect(() => checkFields("x", "after", { ...base, key: undefined }, { key: "bob.tables.acme.com" })).toThrow(/outside its declared domain/);
+    expect(() => checkFields("x", "after", { ...base, key: "string" }, { key: "bob.tables.acme.com" })).toThrow(/outside its declared domain/);
+    expect(() => checkFields("x", "after", { ...base, key: { string: true } }, { key: "bob.tables.acme.com" })).toThrow(/outside its declared domain/);
+    expect(() => checkFields("x", "after", { ...base, key: { token: /^[A-Za-z0-9_.:-]{1,64}$/ } }, { key: "bob.tables.acme.com" })).toThrow(/outside its declared domain/);
+    expect(() => checkFields("x", "after", { ...base, key: { number: [0, Infinity] } }, { key: 5 })).toThrow(/outside its declared domain/);
+    expect(() => checkFields("x", "after", { ...base, key: { enum: ["crm"] } }, { key: "bob.tables.acme.com" })).toThrow(/outside its declared domain/);
+    // and the control still admits what it declares
+    expect(checkFields("x", "after", { kind: { enum: ["crm"] }, n: { int: [0, 9] } }, { kind: "crm", n: 3 })).toEqual({ kind: "crm", n: 3 });
+  });
+
+  test("every declared domain is closed or tightly bounded, whatever is added later", () => {
+    for (const [action, spec] of Object.entries(AUDIT_ACTIONS)) {
+      for (const [field, d] of Object.entries(spec.fields) as [string, Record<string, unknown>][]) {
+        const id = `${action}.${field}`;
+        expect(Object.keys(d), id).toHaveLength(1);
+        if ("enum" in d) {
+          const members = d.enum as string[];
+          expect(members.length, id).toBeGreaterThan(0);
+          expect(members.length, id).toBeLessThanOrEqual(16);
+          for (const m of members) expect(m, id).toMatch(/^[A-Za-z][A-Za-z0-9_]{0,31}$/);
+        } else {
+          const [lo, hi] = (d.int ?? d.number) as [number, number];
+          expect(Number.isFinite(lo) && Number.isFinite(hi) && lo <= hi, id).toBe(true);
+          expect(hi, id).toBeLessThanOrEqual(1_000_000); // seven digits: never room for a phone number
+        }
+      }
+    }
   });
 
   test("an unknown action, a table that is not the action's, and an id of another table are all refused", async () => {
@@ -52,11 +97,18 @@ describe("what an entry may hold: no content, ever", () => {
     await expect(userRun((ctx) => writeAudit(ctx, { actor: TEST_ACTOR, action: "run.started", targetTable: "discoveryRuns", targetId: sourceId }))).rejects.toThrow("not an id of that table");
   });
 
-  test("every declared field name is free of personal-data vocabulary (a review prompt for whoever adds one)", () => {
-    const banned = /name|email|phone|address|profile|title|value|snapshot|payload|reason$|note|text|comment/i;
-    const all = Object.values(AUDIT_ACTIONS).flatMap((s) => [...s.fields]);
+  test("every declared field name is free of personal-data and identifier vocabulary (a review prompt for whoever adds one)", () => {
+    const substrings = /name|email|phone|address|profile|title|value|snapshot|payload|reason$|note|text|comment|login|secret|password|birth/i;
+    const words = new Set(["key", "keys", "id", "ids", "ref", "refs", "reference", "url", "uri", "handle", "identifier", "token", "domain", "host", "user", "ip", "ssn", "dob", "label", "slug", "subject", "criteria"]);
+    const flagged = (f: string) => substrings.test(f) || f.replace(/([a-z0-9])([A-Z])/g, "$1 $2").toLowerCase().split(" ").some((w) => words.has(w));
+    // non-vacuity: the review prompt really catches the vocabulary it is for (an earlier version had no `key` and caught nothing)
+    for (const bad of ["key", "userId", "contactEmail", "profileUrl", "ref", "reference", "displayName", "apiKey", "domain", "ownerHandle", "subjectId"]) expect(flagged(bad), bad).toBe(true);
+    for (const ok of ["version", "kind", "trustWeight", "lawfulBasis", "creditBudget", "role", "claimsRedacted"]) expect(flagged(ok), ok).toBe(false);
+    const all = Object.values(AUDIT_ACTIONS).flatMap((s) => Object.keys(s.fields));
     expect(all.length).toBeGreaterThan(10);
-    expect(all.filter((f) => banned.test(f))).toEqual([]);
+    // contactKeysDeleted is a COUNT (bounded integer domain above), the one field whose name contains "keys" legitimately
+    expect(all.filter((f) => flagged(f) && f !== "contactKeysDeleted")).toEqual([]);
+    expect(AUDIT_ACTIONS["erasure.completed"].fields.contactKeysDeleted).toEqual({ int: [0, 1_000_000] });
   });
 });
 

@@ -6,7 +6,7 @@ import type { Id } from "../_generated/dataModel";
 import { DEFAULT_SCORING_MODEL } from "../icp/defaults";
 import schema from "../schema";
 import { ROLES, isRole, requireRole, roleSatisfies, systemActor, type Role } from "./authz";
-import { asMember, grant, tokenOf } from "./testkit";
+import { asMember, grant, tokenOf } from "./testkit.support";
 import { withTrustedOrgForInternalOnly } from "./org";
 
 const modules = import.meta.glob("/convex/**/*.ts");
@@ -169,5 +169,25 @@ describe("the matrix of spec 7.1, as enforced", () => {
     const audit = await mine.query(api.audit.api.recentAudit, { paginationOpts: { numItems: 50, cursor: null } });
     expect(audit.page.every((r) => r.orgId === orgId)).toBe(true);
     expect(audit.page.some((r) => r.targetId === runId)).toBe(false);
+  });
+
+  test("through the public API an org never loses its last admin: the 'A promotes C, C demotes A, C demotes B' walk ends with C, and a long random walk never reaches zero", async () => {
+    const users = ["A", "B", "C", "D"];
+    const t = Object.fromEntries(await Promise.all(users.map(async (u) => [u, await as(u, u === "A" || u === "B" ? "admin" : "operator")])));
+    const adminCount = async () => (await raw.run((ctx) => ctx.db.query("memberships").collect())).filter((m) => m.role === "admin").length;
+    const set = (by: string, target: string, role: Role) => t[by]!.mutation(api.members.api.setMemberRole, { userId: tokenOf(target), role }).then(() => true, () => false);
+    expect(await set("A", "C", "admin")).toBe(true);
+    expect(await set("C", "A", "operator")).toBe(true);
+    expect(await set("C", "B", "operator")).toBe(true);
+    expect(await adminCount()).toBe(1); // C, who cannot demote themselves, and nobody else can without being an admin
+    expect(await set("C", "C", "operator")).toBe(false);
+    expect(await set("A", "C", "operator")).toBe(false); // A is no longer an admin
+    // deterministic pseudo-random walk over every actor, target and role: each attempt may succeed or be refused, never leave zero admins
+    let x = 12345;
+    const next = (n: number) => ((x = (x * 1103515245 + 12345) % 2147483648), x % n);
+    for (let i = 0; i < 80; i++) {
+      await set(users[next(4)]!, users[next(4)]!, ROLES[next(3)]!);
+      expect(await adminCount(), `step ${i}`).toBeGreaterThanOrEqual(1);
+    }
   });
 });

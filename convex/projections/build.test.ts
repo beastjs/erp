@@ -5,7 +5,7 @@ import { api } from "../_generated/api";
 import type { Id } from "../_generated/dataModel";
 import { MAX_CLAIMS } from "../claims/queries";
 import type { ClaimMethod, SubjectType } from "../claims/schema";
-import { asMember } from "../_shared/testkit";
+import { asMember } from "../_shared/testkit.support";
 import schema from "../schema";
 import { applyClaimToProjection, rebuildProjection } from "./build";
 

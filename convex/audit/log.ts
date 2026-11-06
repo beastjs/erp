@@ -1,7 +1,11 @@
 import type { Id, TableNames } from "../_generated/dataModel";
 import type { MutationCtx } from "../_generated/server";
 import { SYSTEM_PROCESSES, ROLES, type Actor, type Role } from "../_shared/actor";
+import { MAX_CREDIT_BUDGET } from "../_shared/limits";
 import { resolveOrg } from "../_shared/org";
+import { DISPOSITIONS, INVENTORY_STATES } from "../leads/schema";
+import { ERASURE_REASONS, LEGAL_BASES, suppressionReason } from "../privacy/schema";
+import { lawfulBasis, sourceKind } from "../sources/schema";
 
 /*
  * THE PII TRAP, AND WHY THIS FILE LOOKS THE WAY IT DOES.
@@ -9,10 +13,12 @@ import { resolveOrg } from "../_shared/org";
  * redaction that way and `before` holds exactly the personal data being erased, in a table that is append-only and
  * must outlive the erasure: a permanent PII store, defeating erasure (spec 7.3) across every store Task 13 swept.
  *
- * Resolution: THE LOG NEVER STORES CONTENT. Every action is declared below with the exact fields it may carry, all of
- * them non-personal attributes (a version number, a lifecycle state, a budget, a count). `writeAudit` THROWS on a
- * field outside the declaration, on a value that is not a finite number, a boolean, null or a short token, and on an
- * action it does not know. Rejected in preference to alternatives:
+ * Resolution: THE LOG NEVER STORES CONTENT. Every action is declared below with the exact fields it may carry, and
+ * EACH FIELD DECLARES ITS OWN DOMAIN: a closed set of strings (`{ enum }`) or a bounded number (`{ int }` / `{ number }`).
+ * `writeAudit` THROWS on a field outside the declaration, on a value outside that field's domain, and on an action it
+ * does not know. There is deliberately NO generic "short token" domain: a token SHAPE admits `Bobby`, a domain name
+ * and a phone number, so a shape is not a control. A field whose domain cannot be declared cannot be audited; to audit
+ * a free-form value is to build a permanent PII store. Rejected in preference to alternatives:
  *   - storing hashes: a hash of an email is still the email's identity (it is how the suppression list works), and
  *     low-entropy values are reversible by guessing;
  *   - storing values but redacting audit rows on erasure: it makes the audit table mutable by the erasure path, which
@@ -29,44 +35,71 @@ import { resolveOrg } from "../_shared/org";
  * observes the failure from outside; that is observability (Task 16), not this log.
  */
 
-type Spec = { table: TableNames; fields: readonly string[] };
+/** A closed set of strings, or a number in [min, max]. The ONLY domains a field may declare. */
+export type Domain = { readonly enum: readonly string[] } | { readonly int: readonly [number, number] } | { readonly number: readonly [number, number] };
+type Spec = { table: TableNames; fields: Readonly<Record<string, Domain>> };
 
-/** Every audited action and the only fields it may carry. Adding a field is a privacy decision: it must never hold content about a person. */
+/** The literal members of a `v.union(v.literal(..), ..)`, so an enum domain is the SAME set the schema enforces and cannot drift from it. */
+function literals(validator: { members: readonly unknown[] }): readonly string[] {
+  return validator.members.map((m) => {
+    const lit = m as { kind?: unknown; value?: unknown };
+    if (lit.kind !== "literal" || typeof lit.value !== "string") throw new Error("audit enum domains are built from string literals only");
+    return lit.value;
+  });
+}
+
+const VERSION: Domain = { int: [1, 100_000] };
+/** Counts of rows one erasure touched. Bounded well below any phone number or id, so a count cannot carry one. */
+const COUNT: Domain = { int: [0, 1_000_000] };
+
+/**
+ * Every audited action and the only fields it may carry, each with its domain. Adding a field is a privacy decision:
+ * it must never hold content about a person, and its domain must be small enough that it provably cannot.
+ */
 export const AUDIT_ACTIONS = {
-  "icp.created": { table: "icpDefinitions", fields: ["version"] },
-  "scoring_model.created": { table: "scoringModels", fields: ["version"] },
-  "source.registered": { table: "sources", fields: ["kind", "trustWeight", "lawfulBasis"] },
-  "run.started": { table: "discoveryRuns", fields: ["creditBudget"] },
-  "lead.inventory_state_set": { table: "leads", fields: ["inventoryState"] },
-  "lead.disposition_set": { table: "leads", fields: ["disposition"] },
-  "erasure.requested": { table: "erasures", fields: ["legalBasis", "reasonCode"] },
+  "icp.created": { table: "icpDefinitions", fields: { version: VERSION } },
+  "scoring_model.created": { table: "scoringModels", fields: { version: VERSION } },
+  "source.registered": { table: "sources", fields: { kind: { enum: literals(sourceKind) }, trustWeight: { number: [0, 1] }, lawfulBasis: { enum: literals(lawfulBasis) } } },
+  "run.started": { table: "discoveryRuns", fields: { creditBudget: { number: [0, MAX_CREDIT_BUDGET] } } },
+  "lead.inventory_state_set": { table: "leads", fields: { inventoryState: { enum: INVENTORY_STATES } } },
+  "lead.disposition_set": { table: "leads", fields: { disposition: { enum: DISPOSITIONS } } },
+  "erasure.requested": { table: "erasures", fields: { legalBasis: { enum: LEGAL_BASES }, reasonCode: { enum: ERASURE_REASONS } } },
   "erasure.completed": {
     table: "erasures",
-    fields: ["claimsRedacted", "contactKeysDeleted", "candidatesRedacted", "signalsRedacted", "leadsRedacted", "suppressionsAdded"],
+    fields: { claimsRedacted: COUNT, contactKeysDeleted: COUNT, candidatesRedacted: COUNT, signalsRedacted: COUNT, leadsRedacted: COUNT, suppressionsAdded: COUNT },
   },
-  "suppression.added": { table: "suppressions", fields: ["kind", "reasonCode"] },
-  "member.role_set": { table: "memberships", fields: ["role"] },
+  "suppression.added": { table: "suppressions", fields: { kind: { enum: ["email", "domain", "phone", "profile"] }, reasonCode: { enum: literals(suppressionReason) } } },
+  "member.role_set": { table: "memberships", fields: { role: { enum: ROLES } } },
 } as const satisfies Record<string, Spec>;
 export type AuditAction = keyof typeof AUDIT_ACTIONS;
 
-/** A value that can only be a token (an enum member, a short identifier): no spaces, no punctuation a name or address needs. */
-const TOKEN = /^[A-Za-z0-9_.:-]{1,64}$/;
 export type AuditFields = Readonly<Record<string, string | number | boolean | null>>;
 
-function checkFields(action: AuditAction, side: "before" | "after", fields: AuditFields | undefined): Record<string, string | number | boolean | null> | undefined {
+/** True when `value` is inside `domain`. A domain that is not one of the three shapes admits NOTHING (fails closed). */
+function inDomain(domain: unknown, value: unknown): boolean {
+  const d = domain as { enum?: unknown; int?: unknown; number?: unknown } | null | undefined;
+  if (d && Array.isArray(d.enum)) return typeof value === "string" && d.enum.includes(value);
+  const range = d && (Array.isArray(d.int) ? d.int : Array.isArray(d.number) ? d.number : undefined);
+  if (!range || range.length !== 2 || !(Number.isFinite(range[0]) && Number.isFinite(range[1]))) return false;
+  // Negated conjunction: NaN and Infinity fail every comparison, so they fail closed.
+  if (!(typeof value === "number" && Number.isFinite(value) && value >= range[0] && value <= range[1])) return false;
+  return Array.isArray(d.int) ? Number.isInteger(value) : true;
+}
+
+/** Validates `fields` against per-field domains. Exported so a test can prove a field with no or a loose domain is refused. */
+export function checkFields(
+  action: string,
+  side: "before" | "after",
+  domains: Readonly<Record<string, unknown>>,
+  fields: AuditFields | undefined,
+): Record<string, string | number> | undefined {
   if (fields === undefined) return undefined;
   if (typeof fields !== "object" || fields === null || Array.isArray(fields)) throw new Error(`audit ${side} must be a flat record`);
-  const allowed = AUDIT_ACTIONS[action].fields as readonly string[];
-  const out: Record<string, string | number | boolean | null> = {};
+  const out: Record<string, string | number> = {};
   for (const [key, value] of Object.entries(fields)) {
-    if (!allowed.includes(key)) throw new Error(`audit field "${key}" is not allowed for ${action}`);
-    const ok =
-      value === null ||
-      typeof value === "boolean" ||
-      (typeof value === "number" && Number.isFinite(value)) ||
-      (typeof value === "string" && TOKEN.test(value));
-    if (!ok) throw new Error(`audit field "${key}" must be a finite number, a boolean, null or a short token`);
-    out[key] = value;
+    if (!Object.hasOwn(domains, key)) throw new Error(`audit field "${key}" is not allowed for ${action}`);
+    if (!inDomain(domains[key], value)) throw new Error(`audit field "${key}" is outside its declared domain`);
+    out[key] = value as string | number;
   }
   return out;
 }
@@ -99,8 +132,8 @@ export async function writeAudit(
   const targetId = ctx.db.normalizeId(spec.table, args.targetId);
   if (!targetId) throw new Error("audit target is not an id of that table");
   const actor = checkActor(args.actor);
-  const before = checkFields(args.action, "before", args.before);
-  const after = checkFields(args.action, "after", args.after);
+  const before = checkFields(args.action, "before", spec.fields, args.before);
+  const after = checkFields(args.action, "after", spec.fields, args.after);
   return await ctx.db.insert("auditLog", {
     orgId,
     actor,

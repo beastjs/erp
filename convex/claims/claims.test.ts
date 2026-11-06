@@ -4,7 +4,7 @@ import { beforeEach, expect, test } from "vitest";
 import { api } from "../_generated/api";
 import type { Id } from "../_generated/dataModel";
 import { DEFAULT_SCORING_MODEL } from "../icp/defaults";
-import { asMember } from "../_shared/testkit";
+import { asMember } from "../_shared/testkit.support";
 import schema from "../schema";
 import { MAX_CLAIMS } from "./queries";
 

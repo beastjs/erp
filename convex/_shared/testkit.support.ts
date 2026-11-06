@@ -5,7 +5,9 @@ import { createIcpVersion as realCreateIcpVersion, createScoringModel as realCre
 import type { Actor, Role } from "./actor";
 
 /**
- * Test support only (nothing in the product imports this). convex-test's default identity issuer, so the
+ * Test support only. NOT DEPLOYED: the double dot in this file's name makes Convex's bundler skip it, so it is neither a module
+ * of the deployment nor in the generated API. Only `*.test.ts` files may import it (pinned by authz.guard.test.ts C4), and it
+ * is excluded from the actor-construction guard (C2) rather than allowlisted by it. convex-test's default identity issuer, so the
  * `tokenIdentifier` a test caller presents is predictable and a `memberships` row can be written for it.
  */
 export const tokenOf = (subject: string): string => `https://convex.test|${subject}`;

@@ -88,3 +88,22 @@ function handleButtonPress() {
 Use the Convex CLI to push your functions to a deployment. See everything
 the Convex CLI can do by running `npx convex -h` in your project root
 directory. To learn more, launch the docs with `npx convex docs`.
+
+## First deploy: nothing works until you bootstrap an admin
+
+A fresh deployment has no `memberships`, and every public function requires one, so **every call is refused with
+`forbidden: not a member of this org` for everyone, the intended admin included.** This is the system failing closed,
+not a bug, and it must not be "fixed" by relaxing `requireRole`. `bootstrapMember` is the **trust root**: an internal
+function only an operator of the deployment (CLI or dashboard) can run, because nobody inside an org can be its first
+admin. It is also the way back from any lockout, and it is audited as the `membership_bootstrap` system process.
+
+No function creates an org either, so first insert one `orgs` row (dashboard, Data tab: `{ "name": "Acme", "createdAt": 0 }`)
+and copy its `_id`. Then, per org:
+
+```bash
+npx convex run members/api:bootstrapMember '{"orgId": "<orgs _id>", "userId": "<tokenIdentifier>", "role": "admin"}'
+```
+
+`userId` is the identity's `tokenIdentifier` (issuer and subject joined by `|`, e.g. `https://your-issuer.example|user_123`),
+not the bare subject. The org the caller acts in comes from the `orgId` claim on their token and must be that same `_id`.
+Add `--prod` to target production. After this, the admin grants everyone else through `members/api:setMemberRole`.

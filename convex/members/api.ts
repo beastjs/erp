@@ -8,8 +8,14 @@ import { writeAudit } from "../audit/log";
 /**
  * Sets (grants, or changes) a user's role in the caller's org. Role: `admin` (spec 7.1: admin manages users). The
  * target is named by the identity's `tokenIdentifier`, never by org: the org is the caller's. An admin may not change
- * their OWN role, so the last admin cannot demote themselves and leave the org with nobody who can manage users.
- * (Demoting a different admin is allowed; `bootstrapMember` is the way back from any lockout.)
+ * their OWN role.
+ *
+ * What that guarantees: an org that has an admin keeps one through this endpoint. Every successful call is made by an
+ * admin about SOMEONE ELSE, so the caller is still an admin afterwards, and a concurrent demotion of the caller commits
+ * first or second but never both (the second then fails `requireRole`). Demoting a different admin is allowed.
+ * What it does NOT guarantee: that the org keeps the admin it has. `bootstrapMember` (internal, run by an operator of
+ * the DEPLOYMENT) can set any role, including demoting the last admin, and it is also the way back from any lockout.
+ * (Pinned by the walk in authz.test.ts.)
  */
 export const setMemberRole = mutation({
   args: { userId: v.string(), role: roleValidator },

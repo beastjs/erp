@@ -2,7 +2,14 @@
 import { expect, test } from "vitest";
 
 const files = import.meta.glob("/convex/**/*.ts", { query: "?raw", import: "default", eager: true }) as Record<string, string>;
-const sources = Object.entries(files).filter(([p]) => !p.endsWith(".test.ts") && !p.includes("/_generated/"));
+/**
+ * Test support. It builds a hardcoded `user` actor, so it must NEVER be on a guard's allowlist (a product file forging an
+ * actor through it would then be invisible to C2). Instead it is excluded from `sources` here, and C4 pins what makes
+ * that safe: Convex's bundler skips a file whose name has more than one dot (so it is not deployed and not in the
+ * generated API), and only test files import it.
+ */
+const TESTKIT = "/convex/_shared/testkit.support.ts";
+const sources = Object.entries(files).filter(([p]) => !p.endsWith(".test.ts") && !p.includes("/_generated/") && p !== TESTKIT);
 const strip = (s: string) => s.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
 const code = (path: string) => strip(files[path] ?? "");
 const where = (pattern: RegExp) => sources.filter(([, s]) => pattern.test(strip(s))).map(([p]) => p).sort();
@@ -14,6 +21,14 @@ const where = (pattern: RegExp) => sources.filter(([, s]) => pattern.test(strip(
  *   A. every PUBLIC registration enforces a role, and the role it enforces is the one in the matrix below;
  *   B. the audit log is append-only: one writer, no mutation in any file that touches the table;
  *   C. who can be a `user` actor or a `system` actor: only the files listed.
+ *
+ * LIMITS, so nobody over-trusts these. They are lexical, and each can be evaded by spelling, none of which is live today:
+ *   A. a CONDITIONAL `requireRole` (`if (x) await requireRole(ctx, "admin")`) reads as protected; the net sees the call, not
+ *      whether it always runs. Only authz.test.ts (runtime) proves the role is really enforced. Registrations are found by
+ *      the `export const x = query|mutation|action({` shape; another declaration style would not be seen at all.
+ *   B. mutation is found by the `db.patch|replace|delete(` shape only; an aliased `const d = ctx.db; d.patch(` is invisible.
+ *   C. `systemActor(variable)` is not seen (the net wants a string literal), and neither is `kind: K` through a const;
+ *      only a literal `kind: "user"` / `kind: "system"` is caught.
  */
 
 // ---------------------------------------------------------------------------------------------------- A. roles
@@ -178,9 +193,30 @@ test("C1. systemActor( is called from exactly the places where nobody is acting"
 });
 
 test("C2. no file but the actor modules builds a `user` actor", () => {
-  expect(where(/kind:\s*["']user["']/)).toEqual(["/convex/_shared/actor.ts", "/convex/_shared/authz.ts", "/convex/_shared/testkit.ts", "/convex/audit/log.ts"]);
-  expect(where(/kind:\s*["']system["']/)).toEqual(["/convex/_shared/actor.ts", "/convex/_shared/authz.ts", "/convex/_shared/testkit.ts", "/convex/audit/log.ts"]);
+  expect(where(/kind:\s*["']user["']/)).toEqual(["/convex/_shared/actor.ts", "/convex/_shared/authz.ts", "/convex/audit/log.ts"]);
+  expect(where(/kind:\s*["']system["']/)).toEqual(["/convex/_shared/actor.ts", "/convex/_shared/authz.ts", "/convex/audit/log.ts"]);
   expect(where(/system:default-scoring-model-seed|SYSTEM_ACTOR_DEFAULT_MODEL_SEED/)).toEqual([]); // the magic string is gone
+});
+
+/** Files (other than the support module itself) that import it, by any spelling of the specifier. */
+export const importersOfTestkit = (all: Record<string, string>): string[] =>
+  Object.entries(all)
+    .filter(([p, s]) => p !== TESTKIT && /\btestkit\.support\b/.test(strip(s)))
+    .map(([p]) => p)
+    .sort();
+
+test("C4. the testkit forges an actor, so it is neither deployed nor reachable from product code", () => {
+  expect(Object.keys(files)).toContain(TESTKIT); // the exclusion above is not pointing at nothing
+  // not deployed: Convex's bundler skips any file with more than one dot in its name (bundler/index.ts), so it is also absent from _generated/api
+  expect(TESTKIT.split("/").pop()!.split(".").length).toBeGreaterThan(2);
+  const importers = importersOfTestkit(files);
+  expect(importers.length).toBeGreaterThan(10); // real importers exist, so the net is not matching nothing
+  expect(importers.filter((p) => !p.endsWith(".test.ts"))).toEqual([]);
+});
+
+test("C4b. net separation: a product file importing the testkit is caught", () => {
+  const mutant = { ...files, "/convex/leads/sneaky.ts": 'import { TEST_ACTOR } from "../_shared/testkit.support";\nexport const a = TEST_ACTOR;' };
+  expect(importersOfTestkit(mutant).filter((p) => !p.endsWith(".test.ts"))).toEqual(["/convex/leads/sneaky.ts"]);
 });
 
 test("C3. a stored actor is a typed union: createdBy and the log never hold a bare string", () => {

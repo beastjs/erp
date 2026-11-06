@@ -3,7 +3,7 @@ import { convexTest } from "convex-test";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { api, internal } from "../_generated/api";
 import type { Doc, Id } from "../_generated/dataModel";
-import { createIcpVersion, asMember } from "../_shared/testkit";
+import { createIcpVersion, asMember } from "../_shared/testkit.support";
 import { latestIcp } from "../icp/queries";
 import { appendClaimRecord } from "../claims/mutations";
 import { setInventoryState } from "../leads/mutations";

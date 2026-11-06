@@ -10,9 +10,9 @@
 
 import type * as _shared_actor from "../_shared/actor.js";
 import type * as _shared_authz from "../_shared/authz.js";
+import type * as _shared_limits from "../_shared/limits.js";
 import type * as _shared_normalize from "../_shared/normalize.js";
 import type * as _shared_org from "../_shared/org.js";
-import type * as _shared_testkit from "../_shared/testkit.js";
 import type * as audit_api from "../audit/api.js";
 import type * as audit_log from "../audit/log.js";
 import type * as claims_mutations from "../claims/mutations.js";
@@ -66,9 +66,9 @@ import type {
 declare const fullApi: ApiFromModules<{
   "_shared/actor": typeof _shared_actor;
   "_shared/authz": typeof _shared_authz;
+  "_shared/limits": typeof _shared_limits;
   "_shared/normalize": typeof _shared_normalize;
   "_shared/org": typeof _shared_org;
-  "_shared/testkit": typeof _shared_testkit;
   "audit/api": typeof audit_api;
   "audit/log": typeof audit_log;
   "claims/mutations": typeof claims_mutations;

@@ -3,8 +3,8 @@ import { convexTest } from "convex-test";
 import { strToU8, zipSync } from "fflate";
 import { beforeEach, expect, test, vi } from "vitest";
 import { api, internal } from "../_generated/api";
-import type { Id } from "../_generated/dataModel";
-import { asMember } from "../_shared/testkit";
+import type { Doc, Id } from "../_generated/dataModel";
+import { asMember } from "../_shared/testkit.support";
 import schema from "../schema";
 import { CANDIDATE_CONTRACT_VERSION, checkContractVersion } from "./contract";
 import { MAX_IMPORT_BYTES, MAX_IMPORT_ROWS } from "./import";
@@ -53,6 +53,18 @@ const jane = () => ({
 
 const all = <T extends "claims" | "accounts" | "contacts" | "candidates" | "importChunks">(table: T) =>
   raw.run((ctx) => ctx.db.query(table).collect());
+/** Every rejection of the run, read a page at a time (page size 3, so any run with more than 3 crosses a page boundary). */
+const rejectionsOf = async (id: Id<"discoveryRuns">) => {
+  const out: Doc<"importRejections">[] = [];
+  let cursor: string | null = null;
+  for (let i = 0; i < 1000; i++) {
+    const page: { page: Doc<"importRejections">[]; isDone: boolean; continueCursor: string } = await t.query(api.runs.queries.rejectionsForRun, { runId: id, paginationOpts: { numItems: 3, cursor } });
+    out.push(...page.page);
+    if (page.isDone) return out;
+    cursor = page.continueCursor;
+  }
+  throw new Error("pagination did not finish");
+};
 const getRun = () => t.query(api.runs.queries.getRun, { runId });
 
 // ---------------------------------------------------------------- importRows
@@ -446,7 +458,7 @@ test("importCsv keeps rejected rows, numbered against the file, for after the ru
     await t.action(api.sources.import.importCsv, { runId, mappingId, storageId: await store(lines.join("\n")) });
     await drain();
     expect(await getRun()).toMatchObject({ status: "completed", candidatesInserted: 3, rowsRejected: 1 });
-    const rejections = await t.query(api.runs.queries.rejectionsForRun, { runId });
+    const rejections = await rejectionsOf(runId);
     expect(rejections.map((r) => r.row)).toEqual([1]);
     expect(rejections[0]!.errors.join(" ")).toContain("email");
   }));
@@ -531,7 +543,7 @@ test("staged chunks are bounded by bytes as well as rows, and a single huge row 
     expect(chunks.reduce((n, c) => n + c.rows.length, 0)).toBe(20);
     await drain();
     expect(await getRun()).toMatchObject({ status: "completed", rowsProcessed: 20, rowsRejected: 20, candidatesInserted: 0 });
-    const rows = (await t.query(api.runs.queries.rejectionsForRun, { runId })).map((r) => r.row);
+    const rows = (await rejectionsOf(runId)).map((r) => r.row);
     expect(rows).toEqual(Array.from({ length: 20 }, (_, i) => i));
   }), 60_000);
 
@@ -742,7 +754,7 @@ test("a bad cell in a mapped column rejects that row only; a bad cell in an unma
     await t.action(api.sources.import.importCsv, { runId, mappingId: withDate, storageId: await storeBytes(xlsxOf(table, { dateCol: 5 })) });
     await drain();
     expect(await getRun()).toMatchObject({ status: "completed", rowsProcessed: 2, candidatesInserted: 1, rowsRejected: 1 });
-    const rejections = await t.query(api.runs.queries.rejectionsForRun, { runId });
+    const rejections = await rejectionsOf(runId);
     expect(rejections).toHaveLength(1);
     expect(rejections[0]!.row).toBe(0);
     expect(rejections[0]!.errors).toEqual([

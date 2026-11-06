@@ -72,6 +72,14 @@ export const erasures = defineTable({
   requestedBy: actor,
   reasonCode: erasureReason,
   legalBasis,
+  /**
+   * CONTROLLER OBLIGATION. An opaque case or ticket id, validated by REFERENCE_PATTERN, which keeps prose out but cannot
+   * tell a case id from a name (by construction: both are short tokens). It is kept because a case reference is a
+   * legitimate controller record and dropping it would cost traceability. The consequence is the controller's to enforce:
+   * an operator who puts a person's name or any identifier here has made it PERMANENT and unreachable by every erasure
+   * mechanism (this row is the proof the erasure happened, so erasure never redacts it, and the audit log does not carry
+   * it). Issue references from the case system, never from the data subject's details.
+   */
   reference: v.string(),
   completedAt: v.optional(v.number()),
   resumeAt: v.optional(v.number()),

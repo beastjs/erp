@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { api, internal } from "../_generated/api";
 import type { Doc, Id } from "../_generated/dataModel";
 import { appendClaimRecord } from "../claims/mutations";
-import { createIcpVersion, asMember } from "../_shared/testkit";
+import { createIcpVersion, asMember } from "../_shared/testkit.support";
 import { latestIcp } from "../icp/queries";
 import { packageLead, setDisposition, setInventoryState } from "../leads/mutations";
 import { applyClaimToProjection, rebuildProjection } from "../projections/build";

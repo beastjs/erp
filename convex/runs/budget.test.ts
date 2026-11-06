@@ -1,9 +1,10 @@
 /// <reference types="vite/client" />
 import { convexTest } from "convex-test";
 import { beforeEach, expect, test } from "vitest";
+import { MAX_CREDIT_BUDGET } from "../_shared/limits";
 import { api } from "../_generated/api";
 import type { Id } from "../_generated/dataModel";
-import { asMember } from "../_shared/testkit";
+import { asMember } from "../_shared/testkit.support";
 import schema from "../schema";
 
 const modules = import.meta.glob("/convex/**/*.ts");
@@ -50,9 +51,13 @@ test("startRun refuses an ICP version from another org", async () => {
 });
 
 test("startRun refuses a bad budget and a source from another org", async () => {
-  for (const creditBudget of [-1, Number.NaN, Number.POSITIVE_INFINITY]) {
-    await expect(t.mutation(api.runs.mutations.startRun, { sourceId, creditBudget })).rejects.toThrow("creditBudget");
+  // past the declared bound is REFUSED, not clamped: the budget lands in two stores erasure cannot redact (a phone number must not fit)
+  for (const creditBudget of [-1, Number.NaN, Number.POSITIVE_INFINITY, MAX_CREDIT_BUDGET + 1, 15550104242]) {
+    await expect(t.mutation(api.runs.mutations.startRun, { sourceId, creditBudget })).rejects.toThrow("creditBudget must be a finite number");
   }
+  expect(await raw.run((ctx) => ctx.db.query("discoveryRuns").collect())).toHaveLength(0);
+  expect(await raw.run((ctx) => ctx.db.query("auditLog").collect())).toHaveLength(0);
+  await start(MAX_CREDIT_BUDGET); // the bound itself is allowed
   const foreign = await raw.run(async (ctx) => {
     const other = await ctx.db.insert("orgs", { name: "Org 2", createdAt: 0 });
     return ctx.db.insert("sources", { orgId: other, key: "x", kind: "csv", trustWeight: 1, lawfulBasis: "consent" });

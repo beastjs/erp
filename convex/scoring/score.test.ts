@@ -3,7 +3,7 @@ import { convexTest } from "convex-test";
 import { beforeEach, expect, test } from "vitest";
 import type { Id } from "../_generated/dataModel";
 import { DEFAULT_SCORING_MODEL } from "../icp/defaults";
-import { createIcpVersion, asMember } from "../_shared/testkit";
+import { createIcpVersion, asMember } from "../_shared/testkit.support";
 import type { IcpCriteria } from "../icp/schema";
 import type { ClaimMethod } from "../claims/schema";
 import schema from "../schema";

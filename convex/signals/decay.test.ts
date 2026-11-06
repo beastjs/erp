@@ -2,7 +2,7 @@
 import { convexTest } from "convex-test";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import type { Id } from "../_generated/dataModel";
-import { asMember } from "../_shared/testkit";
+import { asMember } from "../_shared/testkit.support";
 import schema from "../schema";
 import { DEFAULT_SCORING_MODEL } from "../icp/defaults";
 import { DEFAULT_STRENGTH_BY_KIND, decayedWeight, signalContribution, type Signal } from "./decay";

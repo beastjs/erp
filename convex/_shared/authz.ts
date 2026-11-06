@@ -44,6 +44,9 @@ export async function requireRole(ctx: Pick<QueryCtx, "auth" | "db">, min: Role)
     .withIndex("by_org_and_user", (q) => q.eq("orgId", orgId).eq("userId", userId))
     .unique();
   if (!member) throw new Error("forbidden: not a member of this org");
+  // Defence in depth: the schema's role validator makes a malformed role unreachable through normal writes, and
+  // `roleSatisfies` would refuse it anyway. Its test pins the MESSAGE, so removing this reads as a message regression
+  // (the refusal would still happen, worded differently), not as a security one.
   if (!isRole(member.role)) throw new Error("forbidden: malformed membership");
   if (!roleSatisfies(member.role, min)) throw new Error(`forbidden: requires the ${min} role`);
   return { orgId, userId, role: member.role, actor: { kind: "user", userId, role: member.role } };

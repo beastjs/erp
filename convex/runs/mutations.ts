@@ -2,6 +2,7 @@ import { v } from "convex/values";
 import { internal } from "../_generated/api";
 import type { Doc, Id } from "../_generated/dataModel";
 import { mutation, type MutationCtx } from "../_generated/server";
+import { MAX_CREDIT_BUDGET } from "../_shared/limits";
 import { requireRole } from "../_shared/authz";
 import { writeAudit } from "../audit/log";
 
@@ -140,9 +141,10 @@ export const startRun = mutation({
   args: { sourceId: v.id("sources"), icpVersionId: v.optional(v.id("icpDefinitions")), creditBudget: v.number() },
   handler: async (ctx, args) => {
     const { orgId, actor } = await requireRole(ctx, "admin");
-    // Negated conjunction: NaN fails every comparison, so it fails closed. An infinite budget is no budget.
-    if (!(Number.isFinite(args.creditBudget) && args.creditBudget >= 0)) {
-      throw new Error("creditBudget must be a finite number >= 0");
+    // Negated conjunction: NaN fails every comparison, so it fails closed. An infinite budget is no budget. The upper
+    // bound is a REFUSAL, not a clamp: the budget lands in two stores erasure cannot redact (see MAX_CREDIT_BUDGET).
+    if (!(Number.isFinite(args.creditBudget) && args.creditBudget >= 0 && args.creditBudget <= MAX_CREDIT_BUDGET)) {
+      throw new Error(`creditBudget must be a finite number between 0 and ${MAX_CREDIT_BUDGET}`);
     }
     const source = await ctx.db.get(args.sourceId);
     if (!source || source.orgId !== orgId) throw new Error("source not found");

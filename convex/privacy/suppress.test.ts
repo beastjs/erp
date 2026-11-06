@@ -2,7 +2,7 @@
 import { convexTest } from "convex-test";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import type { Id } from "../_generated/dataModel";
-import { asMember } from "../_shared/testkit";
+import { asMember } from "../_shared/testkit.support";
 import schema from "../schema";
 import { addSuppression, getSuppressionSalt, isSuppressed, leadIdentifiers, suppressionHash } from "./suppress";
 

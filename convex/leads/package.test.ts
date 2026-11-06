@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { Doc, Id } from "../_generated/dataModel";
 import { appendClaimRecord } from "../claims/mutations";
 import { DEFAULT_SCORING_MODEL } from "../icp/defaults";
-import { createIcpVersion, createScoringModel, asMember } from "../_shared/testkit";
+import { createIcpVersion, createScoringModel, asMember } from "../_shared/testkit.support";
 import { latestIcp } from "../icp/queries";
 import type { IcpCriteria } from "../icp/schema";
 import { MAX_LINKS_SCANNED, linkIdentity, unlinkIdentity } from "../projections/identity";

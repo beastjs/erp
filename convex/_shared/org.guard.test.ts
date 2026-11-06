@@ -13,6 +13,10 @@ const files = import.meta.glob("/convex/**/*.ts", { query: "?raw", import: "defa
  *     `Object.assign`, a hand-built ctx) it would bypass guard 1 entirely, so no other non-test file may name it.
  *     Likewise nothing but org.ts may fabricate an identity: `getUserIdentity:` may not be defined in non-test code.
  *
+ * LIMITS. Net 2 is textual: `getUserIdentity:` is the only spelling matched (a computed key such as `["getUserIdentity"]:` or an
+ * object built by `Object.fromEntries` is not), and its only positive is a SYNTHETIC string (line ~72), never a real file, since
+ * no real file defines one outside org.ts. So it is proven to match the spelling it names, not proven against real code.
+ *
  * Returns the offending locations of NAME in `source`: any use that is not directly inside a top-level
  * `export const x = internalMutation|internalAction|internalQuery(...)`. The nearest top-level
  * declaration above a use must be such a registration; a use after a plain helper, a public

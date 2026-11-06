@@ -3,7 +3,7 @@ import { convexTest } from "convex-test";
 import { beforeEach, describe, expect, test } from "vitest";
 import type { Id } from "../_generated/dataModel";
 import { emailDomain, normalizeCompanyName, normalizeDomain, normalizeEmail } from "../_shared/normalize";
-import { asMember } from "../_shared/testkit";
+import { asMember } from "../_shared/testkit.support";
 import schema from "../schema";
 import {
   linkIdentity,

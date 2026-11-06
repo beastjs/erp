@@ -1,0 +1,315 @@
+/// <reference types="vite/client" />
+import { convexTest } from "convex-test";
+import { beforeEach, expect, test } from "vitest";
+import type { Id } from "../_generated/dataModel";
+import { DEFAULT_SCORING_MODEL } from "../icp/defaults";
+import { createIcpVersion } from "../icp/mutations";
+import type { IcpCriteria } from "../icp/schema";
+import type { ClaimMethod } from "../claims/schema";
+import schema from "../schema";
+import { recordScoreRun } from "./mutations";
+import { computeScore, parseSize, type ScoreInput, type ScoreResult, type VerificationResult } from "./score";
+
+const modules = import.meta.glob("/convex/**/*.ts");
+const DAY = 24 * 60 * 60 * 1000;
+const NOW = 1_000 * DAY;
+
+const criteria: IcpCriteria = {
+  industries: ["software"],
+  geographies: ["US"],
+  technologies: ["convex"],
+  decisionMakerRoles: ["CTO"],
+  employeeMin: 50,
+  employeeMax: 500,
+};
+const icp = { criteria };
+const model = DEFAULT_SCORING_MODEL;
+
+let n = 0;
+const id = (): Id<"claims"> => `claim${n++}` as Id<"claims">;
+function fields(entries: Record<string, unknown>, method: ClaimMethod = "observed", confidence = 1, observedAt = NOW) {
+  return Object.entries(entries)
+    .sort(([a], [b]) => (a < b ? -1 : 1))
+    .map(([field, value]) => ({ field, value, claimId: id(), method, confidence, observedAt }));
+}
+const perfectAccount = { industry: "Software", country: "US", techStack: ["Convex", "React"], size: "51-200" };
+const perfectContact = { title: "CTO" };
+const signal = (over: Partial<ScoreInput["signals"][number]> = {}): ScoreInput["signals"][number] => ({
+  _id: `s${n++}` as Id<"signals">,
+  _creationTime: 0,
+  orgId: "o" as Id<"orgs">,
+  subjectType: "account",
+  subjectId: "a",
+  kind: "funding_announcement",
+  strength: "high",
+  confidence: 1,
+  observedAt: NOW,
+  ...over,
+});
+const input = (over: Partial<ScoreInput> = {}): ScoreInput => ({
+  account: { fields: fields(perfectAccount) },
+  contact: { fields: fields(perfectContact) },
+  signals: [signal()],
+  icp,
+  model,
+  now: NOW,
+  ...over,
+});
+
+test("a perfect-fit, high-intent, fully-observed subject scores 100 and tiers S", () => {
+  const r = computeScore(input());
+  expect(r.fit).toBe(100);
+  expect(r.intent).toBe(100);
+  expect(r.score).toBe(100);
+  expect(r.confidence).toBe(1);
+  expect(r.priority).toBe(100);
+  expect(r.tier).toBe("S");
+});
+
+test("inferred-only claims cap confidence at 0.5", () => {
+  const r = computeScore(
+    input({ account: { fields: fields(perfectAccount, "inferred", 0.99) }, contact: { fields: fields(perfectContact, "inferred", 0.99) } }),
+  );
+  expect(r.confidence).toBe(0.5);
+  const extracted = computeScore(input({ account: { fields: fields(perfectAccount, "extracted", 0.99) }, contact: { fields: fields(perfectContact, "extracted", 0.99) } }));
+  expect(extracted.confidence).toBe(0.7);
+});
+
+test("a 92 score below the tier S confidence floor does not tier S", () => {
+  // Score 100 sits in the S band; confidence 0.7 is under the S floor (0.8) and meets A's (0.7).
+  const r = computeScore(input({ account: { fields: fields(perfectAccount, "observed", 0.7) }, contact: { fields: fields(perfectContact, "observed", 0.7) } }));
+  expect(r.score).toBe(100);
+  expect(r.confidence).toBeCloseTo(0.7, 12);
+  expect(r.tier).toBe("A");
+  // And a 92 proper: intent 0.8 -> 100 - 45*0.2 = 91.
+  const low = computeScore(
+    input({
+      signals: [signal({ confidence: 0.8 })],
+      account: { fields: fields(perfectAccount, "observed", 0.5) },
+      contact: { fields: fields(perfectContact, "observed", 0.5) },
+    }),
+  );
+  expect(low.score).toBeCloseTo(91, 9);
+  expect(low.tier).toBe("C"); // confidence 0.5 meets only C's floor
+});
+
+test("excellent fit with zero intent does not reach tier S", () => {
+  const r = computeScore(input({ signals: [] }));
+  expect(r.fit).toBe(100);
+  expect(r.intent).toBe(0);
+  expect(r.score).toBe(55);
+  expect(r.tier).toBe("Reject");
+});
+
+test("priority is fit × intent, not a sum", () => {
+  const half = computeScore(input({ signals: [signal({ confidence: 0.5 })] }));
+  expect(half.fit).toBe(100);
+  expect(half.intent).toBe(50);
+  expect(half.priority).toBe(50); // a sum or mean would be 150 / 75
+  const poorFit = computeScore(input({ account: { fields: fields({ industry: "mining" }) }, contact: { fields: fields({ title: "Intern" }) } }));
+  expect(poorFit.fit).toBe(0);
+  expect(poorFit.intent).toBe(100);
+  expect(poorFit.priority).toBe(0); // high intent cannot rescue a poor fit
+  const noIntent = computeScore(input({ signals: [] }));
+  expect(noIntent.priority).toBe(0);
+});
+
+test("zero signals yields intent 0, not NaN", () => {
+  const r = computeScore(input({ signals: [] }));
+  expect(r.intent).toBe(0);
+  expect(Object.is(r.intent, 0)).toBe(true);
+  expect(r.contributions.find((c) => c.factor === "intent")).toEqual({ factor: "intent", input: 0, weight: 45, contributed: 0 });
+});
+
+test("a subject with no claims yields score 0, confidence 0, tier Reject", () => {
+  // A signal is present on purpose: nothing is known about the subject, so it must not score.
+  const r = computeScore(input({ account: { fields: [] }, contact: { fields: [] } }));
+  expect(r.score).toBe(0);
+  expect(r.confidence).toBe(0);
+  expect(r.fit).toBe(0);
+  expect(r.intent).toBe(0);
+  expect(r.priority).toBe(0);
+  expect(r.tier).toBe("Reject");
+  expect(r.contributions.every((c) => c.input === 0 && c.contributed === 0)).toBe(true);
+});
+
+test("contributions list every weighted factor and its input value", () => {
+  const r = computeScore(input({ account: { fields: fields({ ...perfectAccount, techStack: ["Convex", "Go"] }) } }));
+  expect(r.contributions.map((c) => c.factor)).toEqual([
+    "company.industry",
+    "company.geography",
+    "company.technologies",
+    "company.size",
+    "contact.role",
+    "intent",
+  ]);
+  expect(r.contributions.map((c) => c.input)).toEqual([1, 1, 1, 1, 1, 1]);
+  expect(r.contributions.map((c) => c.weight)).toEqual([8.75, 8.75, 8.75, 8.75, 20, 45]);
+  expect(r.contributions.reduce((s, c) => s + c.weight, 0)).toBe(100);
+  expect(r.contributions.reduce((s, c) => s + c.contributed, 0)).toBe(r.score);
+  // Partial technology coverage shows up as a fractional input, not a hidden adjustment.
+  const partial = computeScore(input({ icp: { criteria: { ...criteria, technologies: ["convex", "rust"] } } }));
+  expect(partial.contributions.find((c) => c.factor === "company.technologies")?.input).toBe(0.5);
+});
+
+test("data quality is absent from contributions", () => {
+  const r = computeScore(input());
+  expect(r.contributions.some((c) => /data.?quality|confidence/i.test(c.factor))).toBe(false);
+  expect(Object.keys(model.weights).sort()).toEqual(["companyFit", "contactFit", "intent"]);
+  // Confidence moves the tier, never the score.
+  const weak = computeScore(input({ account: { fields: fields(perfectAccount, "inferred", 0.1) }, contact: { fields: fields(perfectContact, "inferred", 0.1) } }));
+  expect(weak.score).toBe(r.score);
+  expect(weak.confidence).toBeCloseTo(0.1, 12);
+});
+
+test("a failed email verification lowers confidence", () => {
+  const base = computeScore(input()).confidence;
+  const failed = computeScore(input({ verifications: [{ kind: "email", outcome: "fail", checkedAt: NOW }] }));
+  expect(base).toBe(1);
+  expect(failed.confidence).toBe(0.5);
+  expect(failed.tier).toBe("C"); // 100 points, confidence 0.5
+  const both = computeScore(input({ verifications: [{ kind: "email", outcome: "fail", checkedAt: NOW }, { kind: "phone", outcome: "fail", checkedAt: NOW }] }));
+  expect(both.confidence).toBe(0.25);
+  // Only the latest result per kind counts: a later pass supersedes an earlier fail.
+  const recovered = computeScore(input({ verifications: [{ kind: "email", outcome: "fail", checkedAt: 1 }, { kind: "email", outcome: "pass", checkedAt: 2 }] }));
+  expect(recovered.confidence).toBe(1);
+});
+
+test("an empty verifications array scores the same as before Task 15", () => {
+  const without = computeScore(input());
+  expect(computeScore(input({ verifications: [] }))).toEqual(without);
+  const neutral: VerificationResult[] = [{ kind: "email", outcome: "pass", checkedAt: NOW }, { kind: "phone", outcome: "unknown", checkedAt: NOW }];
+  expect(computeScore(input({ verifications: neutral }))).toEqual(without);
+});
+
+test("claim age lowers confidence by at most half", () => {
+  const year = 365 * DAY;
+  const aged = (age: number) => computeScore(input({ account: { fields: fields(perfectAccount, "observed", 1, NOW - age) }, contact: { fields: fields(perfectContact, "observed", 1, NOW - age) } })).confidence;
+  expect(aged(0)).toBe(1);
+  expect(aged(year)).toBe(0.75);
+  expect(aged(1000 * year)).toBeCloseTo(0.5, 12);
+  expect(aged(-5 * DAY)).toBe(1); // future-dated: no penalty
+});
+
+test("intent uses confidence-weighted contribution: an unverified rumour counts for less", () => {
+  const confirmed = computeScore(input({ signals: [signal({ confidence: 1 })] })).intent;
+  const rumour = computeScore(input({ signals: [signal({ confidence: 0.2 })] })).intent;
+  expect(confirmed).toBe(100);
+  expect(rumour).toBeCloseTo(20, 9);
+  // Decay and expiry still apply.
+  const old = computeScore(input({ signals: [signal({ observedAt: NOW - 90 * DAY })] })).intent;
+  expect(old).toBeCloseTo(50, 9);
+  expect(computeScore(input({ signals: [signal({ expiresAt: NOW })] })).intent).toBe(0);
+  // Several signals accumulate but cannot exceed 100.
+  const many = computeScore(input({ signals: [signal({ confidence: 0.5 }), signal({ confidence: 0.5 }), signal({ strength: "medium", confidence: 0.5 })] }));
+  expect(many.intent).toBeCloseTo(100 * (1 - 0.5 * 0.5 * 0.7), 9);
+});
+
+test("float drift in the sum of contributions cannot push a perfect score past 100 and into Reject", () => {
+  // These weights sum to exactly 100, yet 12.13/3 three times + 24.91 + 62.96000000000001 is 100.00000000000001.
+  const weights = { companyFit: 12.13, contactFit: 24.91, intent: 62.96000000000001 };
+  expect(weights.companyFit + weights.contactFit + weights.intent).toBe(100);
+  const r = computeScore(input({ model: { ...model, weights }, icp: { criteria: { ...criteria, technologies: [] } } }));
+  expect(r.score).toBe(100);
+  expect(r.tier).toBe("S");
+});
+
+test("fail-closed on hostile numbers: never NaN, negative or Infinity", () => {
+  const bad = (confidence: number) => ({ field: "industry", value: "software", claimId: id(), method: "observed" as const, confidence, observedAt: NOW });
+  for (const c of [NaN, Infinity, -1, 2]) {
+    const r = computeScore(input({ account: { fields: [bad(c)] }, contact: { fields: [] } }));
+    expect(r.confidence).toBe(0);
+    expect(r.tier).toBe("Reject");
+    for (const k of ["fit", "intent", "score", "priority"] as const) expect(Number.isFinite(r[k]) && r[k] >= 0 && r[k] <= 100).toBe(true);
+  }
+  const nanAge = computeScore(input({ account: { fields: fields(perfectAccount, "observed", 1, NaN) }, contact: { fields: fields(perfectContact, "observed", 1, NaN) } }));
+  expect(nanAge.confidence).toBe(0.5);
+  // A zero-weight model must not divide by zero.
+  const zero = computeScore(input({ model: { ...model, weights: { companyFit: 0, contactFit: 0, intent: 100 } } }));
+  expect(zero.fit).toBe(0);
+  expect(zero.score).toBe(100);
+  // An ICP that asks for nothing matches nothing.
+  const empty = computeScore(input({ icp: { criteria: { industries: [], geographies: [], technologies: [], decisionMakerRoles: [] } } }));
+  expect(empty.fit).toBe(0);
+  expect(empty.contributions[0]).toEqual({ factor: "company.criteria", input: 0, weight: 35, contributed: 0 });
+});
+
+test("fit matching: role is whole-word, size handles ranges, geography reads country or location", () => {
+  const role = (title: string) => computeScore(input({ contact: { fields: fields({ title }) } })).contributions.find((c) => c.factor === "contact.role")?.input;
+  expect(role("Chief Technology Officer, CTO")).toBe(1);
+  expect(role("Director of Sales")).toBe(0); // "cto" hides inside "dire-cto-r"
+  const size = (s: string) => computeScore(input({ account: { fields: fields({ ...perfectAccount, size: s }) } })).contributions.find((c) => c.factor === "company.size")?.input;
+  expect(size("100")).toBe(1);
+  expect(size("201-1,000")).toBe(0.5);
+  expect(size("10000+")).toBe(0);
+  expect(size("many")).toBe(0);
+  const geo = (f: Record<string, unknown>) => computeScore(input({ account: { fields: fields({ ...perfectAccount, country: undefined, ...f }) } })).contributions.find((c) => c.factor === "company.geography")?.input;
+  expect(geo({ country: "us" })).toBe(1);
+  expect(geo({ country: undefined, location: "Austin, TX, US" })).toBe(1);
+  expect(geo({ country: "DE" })).toBe(0);
+  expect(parseSize("1,000+")).toEqual({ lo: 1000, hi: Infinity });
+});
+
+// ---- recordScoreRun -------------------------------------------------------------------------
+
+let raw: ReturnType<typeof convexTest>;
+let t: ReturnType<ReturnType<typeof convexTest>["withIdentity"]>;
+let orgId: Id<"orgs">;
+beforeEach(async () => {
+  raw = convexTest(schema, modules);
+  orgId = await raw.run((ctx) => ctx.db.insert("orgs", { name: "Org 1", createdAt: 0 }));
+  t = raw.withIdentity({ subject: "u1", orgId });
+});
+
+async function seed() {
+  return await t.run(async (ctx) => {
+    const accountId = await ctx.db.insert("accounts", { orgId, fields: [], display: {} });
+    const icpId = await createIcpVersion(ctx, { name: "ICP", criteria });
+    return { accountId, icpId };
+  });
+}
+const goodResult = (): ScoreResult => computeScore(input());
+
+test("recordScoreRun appends a row citing a real scoring model, seeding v1 when none exists", async () => {
+  const { accountId, icpId } = await seed();
+  expect(await raw.run((ctx) => ctx.db.query("scoringModels").collect())).toEqual([]);
+  const result = goodResult();
+  const runId = await t.run((ctx) => recordScoreRun(ctx, { subjectType: "account", subjectId: accountId, icpVersionId: icpId, result }));
+  const models = await raw.run((ctx) => ctx.db.query("scoringModels").collect());
+  expect(models).toHaveLength(1);
+  const row = await raw.run((ctx) => ctx.db.get(runId));
+  expect(row).toMatchObject({ orgId, subjectId: accountId, icpVersionId: icpId, scoringModelId: models[0]._id, score: 100, tier: "S", confidence: 1 });
+  expect(row?.contributions).toEqual(result.contributions);
+  // A rescore is a new row, not a patch.
+  await t.run((ctx) => recordScoreRun(ctx, { subjectType: "account", subjectId: accountId, icpVersionId: icpId, result }));
+  expect(await raw.run((ctx) => ctx.db.query("scoreRuns").collect())).toHaveLength(2);
+  expect(await raw.run((ctx) => ctx.db.query("scoringModels").collect())).toHaveLength(1);
+});
+
+test("recordScoreRun refuses results that could not have come from computeScore, and foreign rows", async () => {
+  const { accountId, icpId } = await seed();
+  const call = (result: ScoreResult, over: Partial<Parameters<typeof recordScoreRun>[1]> = {}) =>
+    t.run((ctx) => recordScoreRun(ctx, { subjectType: "account", subjectId: accountId, icpVersionId: icpId, result, ...over }));
+  const good = goodResult();
+  await expect(call({ ...good, score: NaN })).rejects.toThrow(/result\.score/);
+  await expect(call({ ...good, confidence: 1.5 })).rejects.toThrow(/result\.confidence/);
+  await expect(call({ ...good, tier: "Bogus" as never })).rejects.toThrow(/tier/);
+  await expect(call({ ...good, tier: "A" })).rejects.toThrow(/does not match score and confidence/);
+  await expect(call({ ...good, score: 99 })).rejects.toThrow(/sum of its contributions/);
+  await expect(call({ ...good, contributions: [...good.contributions, { factor: "dataQuality", input: 0, weight: 0, contributed: 0 }] })).rejects.toThrow(/data quality/);
+  await expect(call({ ...good, contributions: [] })).rejects.toThrow(/contributions/);
+  await expect(call(good, { subjectId: "nope" })).rejects.toThrow(/invalid subject id/);
+  const other = await raw.run((ctx) => ctx.db.insert("orgs", { name: "Org 2", createdAt: 0 }));
+  const foreign = await raw.run((ctx) => ctx.db.insert("accounts", { orgId: other, fields: [], display: {} }));
+  await expect(call(good, { subjectId: foreign })).rejects.toThrow(/subject not found/);
+  expect(await raw.run((ctx) => ctx.db.query("scoreRuns").collect())).toEqual([]);
+});
+
+test("scoring code never patches or deletes a score run, and no function declares an orgId argument", async () => {
+  const sources = import.meta.glob("./*.ts", { query: "?raw", import: "default", eager: true }) as Record<string, string>;
+  for (const [file, text] of Object.entries(sources)) {
+    if (file.endsWith(".test.ts") || file.endsWith("schema.ts")) continue; // schema.ts declares the stored column, not an argument
+    expect(text, file).not.toMatch(/db\.(patch|replace|delete)\(/);
+    expect(text, file).not.toMatch(/orgId:\s*v\./);
+  }
+});

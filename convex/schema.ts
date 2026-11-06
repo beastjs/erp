@@ -5,6 +5,7 @@ import { sources, candidates, columnMappings, importChunks, importRejections } f
 import { discoveryRuns } from "./runs/schema";
 import { signals } from "./signals/schema";
 import { icpDefinitions, scoringModels } from "./icp/schema";
+import { scoreRuns } from "./scoring/schema";
 import { accounts, contacts, contactKeys, identityLinks } from "./projections/schema";
 
 export default defineSchema({
@@ -26,4 +27,5 @@ export default defineSchema({
   signals,
   icpDefinitions,
   scoringModels,
+  scoreRuns,
 });

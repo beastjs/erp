@@ -38,6 +38,8 @@ test("DEFAULT_SCORING_MODEL matches the spec: 35/20/45, ceilings 1.0/0.7/0.5", (
   expect(d.decayHalfLives).toEqual({ high: 90 * DAY, medium: 45 * DAY, low: 14 * DAY });
   expect(d.claimHalfLifeMs).toBe(365 * DAY);
   expect(d.failedVerificationFactor).toBe(0.5);
+  expect(d.claimFreshnessFloor).toBe(0.5);
+  expect(d.sizeOverlapCredit).toBe(0.5);
   const band = (tier: string) => d.tierBands.find((b) => b.tier === tier);
   expect([band("S"), band("A"), band("B"), band("C"), band("Reject")]).toEqual([
     { tier: "S", min: 90, max: 100 },
@@ -69,6 +71,10 @@ test("createScoringModel rejects non-finite or out-of-range ceilings, floors, st
     [/methodCeilings\.extracted/, { methodCeilings: { observed: 1, extracted: NaN, inferred: 0.5 } }],
     [/methodCeilings\.inferred/, { methodCeilings: { observed: 1, extracted: 0.7, inferred: 0 } }],
     [/strengthWeights\.low/, { strengthWeights: { high: 1, medium: 0.6, low: -0.1 } }],
+    [/claimFreshnessFloor/, { claimFreshnessFloor: -0.1 }],
+    [/claimFreshnessFloor/, { claimFreshnessFloor: NaN }],
+    [/sizeOverlapCredit/, { sizeOverlapCredit: 1.1 }],
+    [/sizeOverlapCredit/, { sizeOverlapCredit: Infinity }],
     [/claimHalfLifeMs/, { claimHalfLifeMs: 0 }],
     [/claimHalfLifeMs/, { claimHalfLifeMs: Infinity }],
     [/failedVerificationFactor/, { failedVerificationFactor: 0 }],

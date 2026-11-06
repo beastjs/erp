@@ -192,6 +192,26 @@ test("two model versions with different freshness half-lives give different conf
   expect(old({ ...model, claimHalfLifeMs: NaN })).toBe(0.5);
 });
 
+test("two models with different size-overlap credits give different company-fit contributions for the same range", () => {
+  const overlapping = { account: { fields: fields({ ...perfectAccount, size: "201-1,000" }) } }; // overlaps 50-500, not inside
+  const size = (m: typeof model) => computeScore(input({ ...overlapping, model: m })).contributions.find((c) => c.factor === "company.size");
+  expect(size(model)).toEqual({ factor: "company.size", input: 0.5, weight: 8.75, contributed: 4.375 });
+  expect(size({ ...model, sizeOverlapCredit: 0.2 })?.input).toBe(0.2);
+  expect(size({ ...model, sizeOverlapCredit: 1 })?.input).toBe(1);
+  expect(size({ ...model, sizeOverlapCredit: NaN })?.input).toBe(0);
+  // Fully inside / fully outside are unaffected by the credit.
+  const inside = computeScore(input({ model: { ...model, sizeOverlapCredit: 0 } })).contributions.find((c) => c.factor === "company.size");
+  expect(inside?.input).toBe(1);
+});
+
+test("two models with different freshness floors give different confidence for a very old claim", () => {
+  const ancient = (m: typeof model) => computeScore(input({ model: m, account: { fields: fields(perfectAccount, "observed", 1, NOW - 100000 * DAY) }, contact: { fields: fields(perfectContact, "observed", 1, NOW - 100000 * DAY) } })).confidence;
+  expect(ancient(model)).toBeCloseTo(0.5, 12);
+  expect(ancient({ ...model, claimFreshnessFloor: 0.9 })).toBeCloseTo(0.9, 12);
+  expect(ancient({ ...model, claimFreshnessFloor: 0 })).toBeCloseTo(0, 12);
+  expect(ancient({ ...model, claimFreshnessFloor: NaN })).toBe(0);
+});
+
 test("the failed-verification factor comes from the model", () => {
   const failed: VerificationResult[] = [{ kind: "email", outcome: "fail", checkedAt: NOW }];
   expect(computeScore(input({ verifications: failed, model: { ...model, failedVerificationFactor: 0.2 } })).confidence).toBe(0.2);

@@ -35,7 +35,7 @@ export type ScoreInput = {
   icp: Pick<IcpDefinition, "criteria">;
   model: Pick<
     ScoringModel,
-    "weights" | "tierBands" | "confidenceFloors" | "methodCeilings" | "strengthWeights" | "decayHalfLives" | "claimHalfLifeMs" | "failedVerificationFactor"
+    "weights" | "tierBands" | "confidenceFloors" | "methodCeilings" | "strengthWeights" | "decayHalfLives" | "claimHalfLifeMs" | "failedVerificationFactor" | "claimFreshnessFloor" | "sizeOverlapCredit"
   >;
   /** Epoch ms. Explicit so the function stays pure: decay and claim age are measured against it. */
   now: number;
@@ -44,12 +44,11 @@ export type ScoreInput = {
 /*
  * CONFIDENCE (a proposal of this task; the spec fixes the inputs, not the formula).
  *   evidence  = mean over every projected field of  min(claim.confidence, methodCeiling) x freshness
- *   freshness = 0.5 + 0.5 x 0.5^(age / model.claimHalfLifeMs): a stale claim loses at most half its weight.
+ *   freshness = floor + (1 - floor) x 0.5^(age / model.claimHalfLifeMs), floor = model.claimFreshnessFloor.
  *   verified  = evidence x model.failedVerificationFactor per failed verification kind (latest result per kind); pass/unknown are neutral.
  * No verifications means no factor, so populating the list later only ever lowers confidence for subjects
  * that actually fail a check. No fields at all is confidence 0.
  */
-const COMPANY_PARTIAL_SIZE_CREDIT = 0.5;
 
 const finite = (n: unknown): n is number => typeof n === "number" && Number.isFinite(n);
 /** Total clamp into [lo, hi]: anything unusable (NaN, Infinity) becomes lo. */
@@ -71,14 +70,14 @@ export function parseSize(text: string): { lo: number; hi: number } | null {
   return { lo, hi };
 }
 
-function sizeMatch(text: string | undefined, min: number | undefined, max: number | undefined): number {
+function sizeMatch(text: string | undefined, min: number | undefined, max: number | undefined, overlapCredit: number): number {
   if (text === undefined) return 0;
   const r = parseSize(text);
   if (!r) return 0;
   const floor = min ?? 0;
   const ceil = max ?? Infinity;
   if (r.lo >= floor && r.hi <= ceil) return 1;
-  if (r.lo <= ceil && r.hi >= floor) return COMPANY_PARTIAL_SIZE_CREDIT;
+  if (r.lo <= ceil && r.hi >= floor) return clamp(overlapCredit, 0, 1); // unusable credit fails closed to 0
   return 0;
 }
 
@@ -106,13 +105,17 @@ function evidenceConfidence(input: ScoreInput): number {
   const ceilings = input.model.methodCeilings;
   const halfLife = input.model.claimHalfLifeMs;
   // Fail closed on an unusable half-life: treat every claim as fully aged rather than dividing by it.
+  const rawFloor = input.model.claimFreshnessFloor;
+  // Unusable floor fails closed to 0: an old claim counts for nothing rather than for an invented amount.
+  const floorUsable = Number.isFinite(rawFloor);
+  const freshFloor = floorUsable ? clamp(rawFloor, 0, 1) : 0;
   const usable = Number.isFinite(halfLife) && halfLife > 0;
   let sum = 0;
   for (const f of fields) {
     const ceiling = clamp(ceilings[f.method as ClaimMethod], 0, 1);
     const claimed = finite(f.confidence) && f.confidence > 0 && f.confidence <= 1 ? f.confidence : 0;
     const age = finite(f.observedAt) ? Math.max(0, input.now - f.observedAt) : Infinity;
-    const freshness = usable && Number.isFinite(age) ? 0.5 + 0.5 * Math.pow(0.5, age / halfLife) : 0.5;
+    const freshness = floorUsable && usable && Number.isFinite(age) ? freshFloor + (1 - freshFloor) * Math.pow(0.5, age / halfLife) : freshFloor;
     sum += Math.min(claimed, ceiling) * freshness;
   }
   return clamp(sum / fields.length, 0, 1);
@@ -164,7 +167,7 @@ export function computeScore(input: ScoreInput): ScoreResult {
     dims.push(["company.technologies", listMatch(c.technologies, got)]);
   }
   if (c.employeeMin !== undefined || c.employeeMax !== undefined) {
-    dims.push(["company.size", sizeMatch(str(fieldValue(a, "size")), c.employeeMin, c.employeeMax)]);
+    dims.push(["company.size", sizeMatch(str(fieldValue(a, "size")), c.employeeMin, c.employeeMax, model.sizeOverlapCredit)]);
   }
   // An ICP that asks for nothing matches nothing: fail closed with one explicit zero factor.
   if (dims.length === 0) add("company.criteria", 0, wCompany);

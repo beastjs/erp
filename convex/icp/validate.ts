@@ -36,6 +36,9 @@ export function validateScoringConfig(c: ScoringConfig): void {
   if (!(finite(c.failedVerificationFactor) && c.failedVerificationFactor > 0 && c.failedVerificationFactor <= 1)) {
     throw new Error("failedVerificationFactor must be a finite number in (0, 1]");
   }
+  for (const k of ["claimFreshnessFloor", "sizeOverlapCredit"] as const) {
+    if (!unit(c[k])) throw new Error(`${k} must be a finite number in [0, 1]`);
+  }
 
   let previousFloor = Infinity;
   for (const t of TIERS) {

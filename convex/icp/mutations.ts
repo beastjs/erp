@@ -62,6 +62,8 @@ export async function createScoringModel(
     decayHalfLives: args.decayHalfLives,
     claimHalfLifeMs: args.claimHalfLifeMs,
     failedVerificationFactor: args.failedVerificationFactor,
+    claimFreshnessFloor: args.claimFreshnessFloor,
+    sizeOverlapCredit: args.sizeOverlapCredit,
   };
   validateScoringConfig(config);
   const version = checkChain(await latestScoringModel(ctx, {}), supersedesId);

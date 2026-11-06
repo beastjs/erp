@@ -49,6 +49,10 @@ export const scoringConfig = {
   claimHalfLifeMs: v.number(),
   /** Multiplier on confidence for each verification kind whose latest result failed. In (0, 1]. */
   failedVerificationFactor: v.number(),
+  /** Lowest freshness multiplier an arbitrarily old claim reaches, in [0, 1]. */
+  claimFreshnessFloor: v.number(),
+  /** Company-size credit in [0, 1] when the company's range overlaps the ICP range without fitting inside it. */
+  sizeOverlapCredit: v.number(),
 };
 
 export type ScoringConfig = {
@@ -60,6 +64,8 @@ export type ScoringConfig = {
   decayHalfLives: { high: number; medium: number; low: number };
   claimHalfLifeMs: number;
   failedVerificationFactor: number;
+  claimFreshnessFloor: number;
+  sizeOverlapCredit: number;
 };
 
 /**

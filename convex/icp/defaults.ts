@@ -22,4 +22,6 @@ export const DEFAULT_SCORING_MODEL: ScoringConfig = {
   decayHalfLives: { high: 90 * DAY_MS, medium: 45 * DAY_MS, low: 14 * DAY_MS },
   claimHalfLifeMs: 365 * DAY_MS,
   failedVerificationFactor: 0.5,
+  claimFreshnessFloor: 0.5,
+  sizeOverlapCredit: 0.5,
 };

@@ -3,6 +3,7 @@ import type { Id } from "../_generated/dataModel";
 import { mutation, type MutationCtx } from "../_generated/server";
 import { resolveOrg, withOrg } from "../_shared/org";
 import { CANDIDATE_CONTRACT_VERSION, checkContractVersion, computeDedupeHash, validateCandidate } from "./contract";
+import { candidateSuppressed } from "../privacy/suppress";
 import { lawfulBasis, sourceKind } from "./schema";
 
 export const registerSource = mutation({
@@ -30,7 +31,23 @@ export const registerSource = mutation({
  * the Collector HTTP endpoint) validate their own args and compose this. The server owns the dedupe
  * hash, derived from the validated candidate. Returns null when a PENDING candidate with that hash already exists: overlapping
  * sources make that routine, not a fault.
+ *
+ * SUPPRESSION (spec 7.3): a candidate whose person email (or that email's domain), phone, profile URL or company domain is on the
+ * org's list is REFUSED with `SuppressedCandidateError` and nothing is stored, so an erased contact re-imported inserts
+ * nothing. Fail closed: with no salt configured, or a salt that differs from the list's, this throws and nothing is stored.
  */
+/**
+ * Thrown by `insertCandidate` for a candidate that carries a suppressed identifier. A class, so a bulk caller can tell
+ * "this row may not enter" (data: reject the row, carry on) from a real fault (let it propagate). The message names no
+ * identifier: it ends up in rejection lists and logs.
+ */
+export class SuppressedCandidateError extends Error {
+  constructor() {
+    super("suppressed: an identifier on this candidate is on the suppression list");
+    this.name = "SuppressedCandidateError";
+  }
+}
+
 export async function insertCandidate(
   ctx: MutationCtx,
   args: {
@@ -54,6 +71,7 @@ export async function insertCandidate(
     const run = await ctx.db.get(args.runId);
     if (!run || run.orgId !== orgId) throw new Error("run not found");
   }
+  if (await candidateSuppressed(ctx, checked.value)) throw new SuppressedCandidateError();
   const dup = await ctx.db
     .query("candidates")
     .withIndex("by_org_and_dedupe_hash_and_status", (q) =>

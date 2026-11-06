@@ -6,6 +6,8 @@ import { getScoringModel, latestIcp, latestScoringModel } from "../icp/queries";
 import { decayedWeight } from "../signals/decay";
 import { MAX_SIGNALS } from "../signals/mutations";
 import { MAX_PROJECTED_FIELDS } from "../scoring/assemble";
+import { leadIsErased, assertNotErased } from "../privacy/erased";
+import { anySuppressed, leadIdentifiers } from "../privacy/suppress";
 import { checkDistributability, dispositionFor, DEFAULT_FRESHNESS_WINDOW_DAYS } from "../qualify/distributability";
 import { DISPOSITIONS, INVENTORY_STATES, type Disposition, type InventoryState } from "./schema";
 
@@ -112,9 +114,20 @@ async function permissionsDocumented(ctx: QueryCtx, orgId: Id<"orgs">, fields: D
 }
 
 /**
+ * `suppressed` used to be an argument. It is gone: a caller-supplied verdict is a bypass, and the live lookup replaces
+ * it. A stale caller (or one built around the types) that still passes it is refused, not ignored, so nobody
+ * believes they are overriding a check that no longer takes their word.
+ */
+function refuseSuppliedSuppression(args: object): void {
+  if ("suppressed" in args) throw new Error("suppressed is no longer an argument: suppression is looked up live");
+}
+
+/**
  * Snapshots a scored account+contact into an immutable `leads` row. A plain helper (the org comes from the
- * auth identity; nothing here accepts one). `suppressed` is required, not defaulted: Task 13 replaces the
- * argument with a live `isSuppressed` lookup, and until then the caller must decide, visibly.
+ * auth identity; nothing here accepts one). Suppression is a LIVE lookup of the person's and company's identifiers
+ * on the org's suppression list, made here and never supplied by a caller: there is no argument to forge, and a
+ * lookup that cannot be answered (no salt, a changed salt) throws rather than reading as "not suppressed".
+ * A subject that has been erased is refused outright.
  *
  * The lead is `ReadyForDistribution` only when the gate passes; otherwise `Held` with the failing criteria
  * recorded, and its tier is untouched. A Reject-tier score is refused: there is nothing to ship or hold.
@@ -125,12 +138,12 @@ async function permissionsDocumented(ctx: QueryCtx, orgId: Id<"orgs">, fields: D
  */
 export async function packageLead(
   ctx: MutationCtx,
-  args: { accountId: Id<"accounts">; contactId: Id<"contacts">; scoreRunId: Id<"scoreRuns">; suppressed: boolean; freshnessWindowDays?: number },
+  args: { accountId: Id<"accounts">; contactId: Id<"contacts">; scoreRunId: Id<"scoreRuns">; freshnessWindowDays?: number },
 ): Promise<Id<"leads">> {
   const { orgId } = await resolveOrg(ctx);
   const windowDays = args.freshnessWindowDays ?? DEFAULT_FRESHNESS_WINDOW_DAYS;
   if (!(Number.isFinite(windowDays) && windowDays > 0)) throw new Error("freshnessWindowDays must be a finite number > 0");
-  if (typeof args.suppressed !== "boolean") throw new Error("suppressed must be a boolean");
+  refuseSuppliedSuppression(args);
 
   const account = await ctx.db.get(args.accountId);
   if (!account || account.orgId !== orgId) throw new Error("account not found");
@@ -138,6 +151,8 @@ export async function packageLead(
   if (!contact || contact.orgId !== orgId) throw new Error("contact not found");
   const scoreRun = await ctx.db.get(args.scoreRunId);
   if (!scoreRun || scoreRun.orgId !== orgId) throw new Error("scoreRun not found");
+  await assertNotErased(ctx, orgId, "contact", contact._id);
+  await assertNotErased(ctx, orgId, "account", account._id);
   if (scoreRun.subjectType !== "contact" || scoreRun.subjectId !== contact._id) throw new Error("scoreRun does not score this contact");
   const employer = contact.fields.find((f) => f.field === "accountId")?.value;
   if (employer === undefined) throw new Error("contact has no accountId claim; cannot tie it to an account");
@@ -153,13 +168,14 @@ export async function packageLead(
   if (already) throw new Error("this scoreRun is already packaged");
 
   const now = Date.now();
+  const suppressed = await anySuppressed(ctx, leadIdentifiers(account, contact));
   const gate = checkDistributability({
     account,
     contact,
     scoreRun,
     now,
     freshnessWindowDays: windowDays,
-    suppressed: args.suppressed,
+    suppressed,
     duplicateChecked: await duplicatesChecked(ctx, orgId, account, contact),
     permissionsDocumented: (await permissionsDocumented(ctx, orgId, account.fields)) && (await permissionsDocumented(ctx, orgId, contact.fields)),
   });
@@ -180,7 +196,7 @@ export async function packageLead(
       account: structuredClone({ fields: account.fields, display: account.display }),
       contact: structuredClone({ fields: contact.fields, display: contact.display }),
     },
-    distributability: { ok: gate.ok, failed: gate.failed, freshnessWindowDays: windowDays, suppressed: args.suppressed, checkedAt: now },
+    distributability: { ok: gate.ok, failed: gate.failed, freshnessWindowDays: windowDays, suppressed, checkedAt: now },
     inventoryState: "Available",
     disposition: dispositionFor(scoreRun.tier, gate),
     packagedAt: now,
@@ -205,7 +221,7 @@ const RECHECKED_DISPOSITIONS: readonly Disposition[] = ["ReadyForDistribution", 
  */
 const BUYER_OUTCOMES: readonly Disposition[] = ["Accepted", "Converted"];
 /** Delivery is recorded in either field; Accepted and Converted are themselves reachable only after it, so they count as proof. */
-const hasBeenDelivered = (lead: Doc<"leads">) =>
+export const hasBeenDelivered = (lead: Doc<"leads">) =>
   lead.inventoryState === "Delivered" || lead.disposition === "Delivered" || lead.disposition === "Accepted" || lead.disposition === "Converted";
 
 async function loadLead(ctx: MutationCtx, leadId: Id<"leads">): Promise<Doc<"leads">> {
@@ -223,10 +239,12 @@ async function loadLead(ctx: MutationCtx, leadId: Id<"leads">): Promise<Doc<"lea
  * Re-check was chosen over invalidating the row because ageing is a function of the clock and suppression is
  * an external event; only the transition itself observes both with no window, and nothing has to sweep.
  * A failure throws and writes nothing; the persisted verdict is left as the record of packaging.
- * `suppressed` is required, not defaulted: Task 13 replaces the argument with a live `isSuppressed` lookup.
+ * Suppression is looked up LIVE over the snapshot's identifiers (what the customer would receive), never passed in.
+ * An erased lead is refused first: its snapshot has been redacted, so the gate would fail anyway, but "this lead was
+ * erased" is the reason a person needs, and it must not depend on which criterion happens to fail.
  */
-async function assertStillDistributable(ctx: MutationCtx, lead: Doc<"leads">, suppressed: boolean, what: string): Promise<void> {
-  if (typeof suppressed !== "boolean") throw new Error("suppressed must be a boolean");
+async function assertStillDistributable(ctx: MutationCtx, lead: Doc<"leads">, what: string): Promise<void> {
+  if (leadIsErased(lead)) throw new Error(`a lead whose subject was erased cannot be ${what}`);
   if (!lead.distributability.ok) throw new Error(`a lead that failed distributability cannot be ${what}`);
   const scoreRun = await ctx.db.get(lead.scoreRunId);
   if (!scoreRun || scoreRun.orgId !== lead.orgId) throw new Error("scoreRun not found");
@@ -237,7 +255,7 @@ async function assertStillDistributable(ctx: MutationCtx, lead: Doc<"leads">, su
     scoreRun,
     now: Date.now(),
     freshnessWindowDays: lead.distributability.freshnessWindowDays,
-    suppressed,
+    suppressed: await anySuppressed(ctx, leadIdentifiers(account, contact)),
     duplicateChecked: await duplicatesChecked(ctx, lead.orgId, { _id: lead.accountId, display: account.display }, { _id: lead.contactId, display: contact.display }),
     permissionsDocumented: (await permissionsDocumented(ctx, lead.orgId, account.fields)) && (await permissionsDocumented(ctx, lead.orgId, contact.fields)),
   });
@@ -245,24 +263,26 @@ async function assertStillDistributable(ctx: MutationCtx, lead: Doc<"leads">, su
 }
 
 /** One of exactly two writes to an existing lead. Touches `inventoryState` and nothing else. */
-export async function setInventoryState(ctx: MutationCtx, args: { leadId: Id<"leads">; state: InventoryState; suppressed: boolean }): Promise<void> {
+export async function setInventoryState(ctx: MutationCtx, args: { leadId: Id<"leads">; state: InventoryState }): Promise<void> {
+  refuseSuppliedSuppression(args);
   if (!INVENTORY_STATES.includes(args.state)) throw new Error("not an inventory state");
   const lead = await loadLead(ctx, args.leadId);
   if (SHIPPING_INVENTORY.includes(args.state) && !lead.distributability.ok) {
     throw new Error("a lead that failed distributability cannot be reserved, sold or delivered");
   }
-  if (RECHECKED_INVENTORY.includes(args.state)) await assertStillDistributable(ctx, lead, args.suppressed, "reserved, sold or delivered");
+  if (RECHECKED_INVENTORY.includes(args.state)) await assertStillDistributable(ctx, lead, "reserved, sold or delivered");
   await ctx.db.patch(lead._id, { inventoryState: args.state });
 }
 
 /** The other of exactly two writes to an existing lead. Touches `disposition` and nothing else. */
-export async function setDisposition(ctx: MutationCtx, args: { leadId: Id<"leads">; disposition: Disposition; suppressed: boolean }): Promise<void> {
+export async function setDisposition(ctx: MutationCtx, args: { leadId: Id<"leads">; disposition: Disposition }): Promise<void> {
+  refuseSuppliedSuppression(args);
   if (!DISPOSITIONS.includes(args.disposition)) throw new Error("not a disposition");
   const lead = await loadLead(ctx, args.leadId);
   if (SHIPPING_DISPOSITIONS.includes(args.disposition) && !lead.distributability.ok) {
     throw new Error("a lead that failed distributability cannot be released");
   }
-  if (RECHECKED_DISPOSITIONS.includes(args.disposition)) await assertStillDistributable(ctx, lead, args.suppressed, "released");
+  if (RECHECKED_DISPOSITIONS.includes(args.disposition)) await assertStillDistributable(ctx, lead, "released");
   if (BUYER_OUTCOMES.includes(args.disposition) && !hasBeenDelivered(lead)) {
     throw new Error(`a lead that has not been delivered cannot be ${args.disposition}`);
   }

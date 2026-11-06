@@ -218,7 +218,7 @@ describe("new evidence", () => {
 
   test("a rescore leaves a lead that is already reserved alone", async () => {
     const s = await packaged();
-    await t.run((ctx) => setInventoryState(ctx, { leadId: s.first.leadId!, state: "Reserved", suppressed: false }));
+    await t.run((ctx) => setInventoryState(ctx, { leadId: s.first.leadId!, state: "Reserved" }));
     await t.mutation(api.claims.mutations.appendClaim, { subjectType: "contact", subjectId: s.contactId, field: "department", value: "Engineering", sourceId: s.sourceId, method: "observed", confidence: 1, observedAt: Date.now() });
     await drain();
     expect((await lead(s.first.leadId!)).inventoryState).toBe("Reserved");

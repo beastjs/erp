@@ -16,6 +16,8 @@ import { rebuildProjection } from "../projections/build";
 import { matchCandidate } from "../projections/identity";
 import { bumpRun, type RunCounter } from "../runs/mutations";
 import { withOrg, withTrustedOrgForInternalOnly } from "../_shared/org";
+import { candidateSuppressed } from "../privacy/suppress";
+import { redactCandidate } from "../privacy/redact";
 import { checkContractVersion, validateCandidate, type NormalizedCandidate } from "./contract";
 
 /** Per-mutation cap: each candidate costs ~30 document writes, and a mutation may write 16k. */
@@ -147,6 +149,12 @@ export async function ingestCandidate(ctx: MutationCtx, orgId: Id<"orgs">, candi
   if (!source || source.orgId !== orgId) throw new Error("source not found");
 
   const candidate = checked.value;
+  // A candidate staged BEFORE its identifier was suppressed (a pending row, a queued import chunk) is caught here, and
+  // its payload is destroyed rather than left rejected-but-readable.
+  if (await candidateSuppressed(ctx, candidate)) {
+    await redactCandidate(ctx, row, "suppressed");
+    return { outcome: "rejected", reason: "suppressed" };
+  }
   const plan = planClaims(candidate);
   const method: "observed" | "extracted" = source.kind === "crawler" ? "extracted" : "observed";
   const confidence = CONFIDENCE[method];
@@ -206,7 +214,8 @@ export async function ingestCandidate(ctx: MutationCtx, orgId: Id<"orgs">, candi
     }
   }
 
-  await ctx.db.patch(row._id, { status: "consumed" });
+  // Remember whose data this payload became, so erasure can find and redact it.
+  await ctx.db.patch(row._id, { status: "consumed", contactId: contactId ?? undefined, accountId: accountId ?? undefined });
   return { outcome: "consumed" };
 }
 

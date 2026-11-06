@@ -3,6 +3,7 @@ import type { MutationCtx } from "../_generated/server";
 import { resolveOrg } from "../_shared/org";
 import { loadClaimsForField, loadClaimsForSubject } from "../claims/queries";
 import type { Claim, SubjectType } from "../claims/schema";
+import { findErasure } from "../privacy/erased";
 import { resolveField, type SourceTrust } from "./resolve";
 import type { ProjectedField } from "./schema";
 
@@ -66,6 +67,16 @@ async function store(
 }
 
 /**
+ * The projection of an erased subject: nothing. This is what the pure function (claims + rules) yields when every
+ * claim is redacted, written directly so erasure does not have to read a subject's claims to empty it (and so it
+ * works for a subject with more claims than a rebuild may read). Erasure's only entry to this module.
+ */
+export async function storeEmptyProjection(ctx: MutationCtx, orgId: Id<"orgs">, type: SubjectType, subjectId: string): Promise<void> {
+  const subject = await loadSubject(ctx, orgId, { subjectType: type, subjectId });
+  await store(ctx, orgId, subject, type, []);
+}
+
+/**
  * Trust map for exactly the sources the claims cite. A source that is missing or
  * belongs to another org is left out, which `resolveField` treats as trust 0.
  */
@@ -98,12 +109,17 @@ export async function applyClaimToProjection(
   ) {
     throw new Error("claim not found for subject");
   }
+  // An erased subject projects to nothing, whichever claim arrives.
+  if (await findErasure(ctx, orgId, args.subjectType, subject.id)) return await store(ctx, orgId, subject, args.subjectType, []);
   // Deliberately not caught: claimsForField throws past MAX_CLAIMS rather than truncate.
-  const claims: Claim[] = await loadClaimsForField(ctx, orgId, {
-    subjectType: args.subjectType,
-    subjectId: subject.id,
-    field: claim.field,
-  });
+  // A redacted claim has no value left to assert, so it takes no part in resolution (presence of redactedAt, never its time).
+  const claims: Claim[] = (
+    await loadClaimsForField(ctx, orgId, {
+      subjectType: args.subjectType,
+      subjectId: subject.id,
+      field: claim.field,
+    })
+  ).filter((c) => c.redactedAt === undefined);
   const resolved = resolveField(claims, await trustFor(ctx, orgId, claims));
   const others = subject.fields.filter((f) => f.field !== claim.field);
   await store(ctx, orgId, subject, args.subjectType, resolved ? [...others, toProjectedField(resolved.winner)] : others);
@@ -113,11 +129,14 @@ export async function applyClaimToProjection(
 export async function rebuildProjection(ctx: MutationCtx, args: SubjectArgs): Promise<void> {
   const { orgId } = await resolveOrg(ctx);
   const subject = await loadSubject(ctx, orgId, args);
+  if (await findErasure(ctx, orgId, args.subjectType, subject.id)) return await store(ctx, orgId, subject, args.subjectType, []);
   // Deliberately not caught: claimsForSubject throws past MAX_CLAIMS rather than truncate.
-  const claims: Claim[] = await loadClaimsForSubject(ctx, orgId, {
-    subjectType: args.subjectType,
-    subjectId: subject.id,
-  });
+  const claims: Claim[] = (
+    await loadClaimsForSubject(ctx, orgId, {
+      subjectType: args.subjectType,
+      subjectId: subject.id,
+    })
+  ).filter((c) => c.redactedAt === undefined);
   const trust = await trustFor(ctx, orgId, claims);
   const byField = new Map<string, Claim[]>();
   for (const c of claims) {

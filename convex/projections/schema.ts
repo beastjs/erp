@@ -49,8 +49,8 @@ export const contacts = defineTable({
  * "any" for email (a mailbox identifies one person wherever they were seen) and the account id (or
  * "none") for profileUrl/phone/name, which only identify someone within a company. `value` is always
  * the output of the shared normalizers. Derived data: written only by ingest.
- * TASK 13 (erasure) MUST delete an erased contact's keys: a stale key lets the contact be re-found and
- * re-attached to new claims after erasure. There is no rebuild path or uniqueness enforcement yet.
+ * Erasure (privacy/redact.ts) DELETES an erased contact's keys through `by_contact`: a stale key would let the
+ * contact be re-found and re-attached to new claims. There is no rebuild path or uniqueness enforcement yet.
  */
 export const contactKeys = defineTable({
   orgId: v.id("orgs"),
@@ -58,7 +58,9 @@ export const contactKeys = defineTable({
   kind: v.union(v.literal("email"), v.literal("profile"), v.literal("phone"), v.literal("name")),
   value: v.string(),
   contactId: v.id("contacts"),
-}).index("by_key", ["orgId", "scope", "kind", "value"]);
+})
+  .index("by_key", ["orgId", "scope", "kind", "value"])
+  .index("by_contact", ["orgId", "contactId"]);
 
 /*
  * A reversible record that `mergedFromId` is the same entity as `subjectId`.

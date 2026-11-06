@@ -12,6 +12,7 @@ import { rebuildProjection } from "../projections/build";
 import { appendSignal } from "../signals/mutations";
 import { scoreLead } from "../scoring/assemble";
 import schema from "../schema";
+import { addSuppression } from "../privacy/suppress";
 import { packageLead, setDisposition, setInventoryState } from "./mutations";
 import { getLead, leadsByDisposition } from "./queries";
 
@@ -29,7 +30,7 @@ beforeEach(async () => {
   t = raw.withIdentity({ subject: "u1", orgId });
 });
 
-type Seed = { accountId: Id<"accounts">; contactId: Id<"contacts">; sourceId: Id<"sources">; icpId: Id<"icpDefinitions"> };
+type Seed = { accountId: Id<"accounts">; contactId: Id<"contacts">; sourceId: Id<"sources">; icpId: Id<"icpDefinitions">; email: string };
 
 /** A fully shippable subject: observed fields a day old, a registered email key, a strong signal. */
 async function seed(opts: { industry?: string; withKey?: boolean; noEmployer?: boolean; org?: Id<"orgs">; observedAt?: number } = {}): Promise<Seed> {
@@ -54,7 +55,7 @@ async function seed(opts: { industry?: string; withKey?: boolean; noEmployer?: b
     if (opts.withKey !== false) await ctx.db.insert("contactKeys", { orgId: org, scope: "any", kind: "email", value: email, contactId });
     await appendSignal(ctx, { subjectType: "account", subjectId: accountId, kind: "funding", strength: "high", confidence: 1, observedAt: Date.now() - DAY });
     const icpId = (await latestIcp(ctx, {}))?._id ?? (await createIcpVersion(ctx, { name: "ICP", criteria }));
-    return { accountId, contactId, sourceId, icpId };
+    return { accountId, contactId, sourceId, icpId, email };
   });
 }
 const score = (s: Seed) => t.run((ctx) => scoreLead(ctx, { accountId: s.accountId, contactId: s.contactId }));
@@ -62,8 +63,13 @@ const scored = async (s: Seed) => {
   const id = await score(s);
   return (await raw.run((ctx) => ctx.db.get(id)))!;
 };
-const pkg = (s: Seed, scoreRunId: Id<"scoreRuns">, over: { suppressed?: boolean; freshnessWindowDays?: number } = {}) =>
-  t.run((ctx) => packageLead(ctx, { accountId: s.accountId, contactId: s.contactId, scoreRunId, suppressed: false, ...over }));
+/** Puts the subject's address on the org's suppression list, the real way. */
+const suppress = (s: Seed) => t.run((ctx) => addSuppression(ctx, { identifier: s.email, reason: "opt_out" }));
+/** `suppressed: true` puts the subject on the list BEFORE packaging; packageLead then finds it by its own lookup. */
+const pkg = async (s: Seed, scoreRunId: Id<"scoreRuns">, over: { suppressed?: boolean; freshnessWindowDays?: number } = {}) => {
+  if (over.suppressed) await suppress(s);
+  return await t.run((ctx) => packageLead(ctx, { accountId: s.accountId, contactId: s.contactId, scoreRunId, freshnessWindowDays: over.freshnessWindowDays }));
+};
 const lead = (id: Id<"leads">) => raw.run((ctx) => ctx.db.get(id)) as Promise<Doc<"leads">>;
 
 describe("packaging", () => {
@@ -71,7 +77,7 @@ describe("packaging", () => {
     const s = await seed();
     const l = await lead(await pkg(s, await score(s)));
     expect(l).toMatchObject({ orgId, accountId: s.accountId, contactId: s.contactId, tier: "S", inventoryState: "Available", disposition: "ReadyForDistribution" });
-    expect(l.distributability).toMatchObject({ ok: true, failed: [], freshnessWindowDays: 90, suppressed: false });
+    expect(l.distributability).toMatchObject({ ok: true, failed: [], freshnessWindowDays: 90 });
   });
 
   test("a tier S lead failing a criterion is Held, not downgraded", async () => {
@@ -207,7 +213,7 @@ describe("packaging", () => {
     const a = await seed();
     const b = await seed();
     const run = await score(a);
-    await expect(t.run((ctx) => packageLead(ctx, { accountId: b.accountId, contactId: a.contactId, scoreRunId: run, suppressed: false }))).rejects.toThrow("contact does not belong to this account");
+    await expect(t.run((ctx) => packageLead(ctx, { accountId: b.accountId, contactId: a.contactId, scoreRunId: run }))).rejects.toThrow("contact does not belong to this account");
     const orphan = await seed({ noEmployer: true });
     const orphanRun = await score(orphan);
     await expect(pkg(orphan, orphanRun)).rejects.toThrow("contact has no accountId claim");
@@ -224,9 +230,9 @@ describe("packaging", () => {
 
     const foreignOrg = await raw.run((ctx) => ctx.db.insert("orgs", { name: "Org 2", createdAt: 0 }));
     const f = await seed({ org: foreignOrg });
-    await expect(t.run((ctx) => packageLead(ctx, { accountId: f.accountId, contactId: f.contactId, scoreRunId: run, suppressed: false }))).rejects.toThrow("account not found");
+    await expect(t.run((ctx) => packageLead(ctx, { accountId: f.accountId, contactId: f.contactId, scoreRunId: run }))).rejects.toThrow("account not found");
     await expect(pkg(s, run, { freshnessWindowDays: NaN })).rejects.toThrow("freshnessWindowDays");
-    await expect(t.run((ctx) => packageLead(ctx, { accountId: s.accountId, contactId: s.contactId, scoreRunId: run, suppressed: undefined as never }))).rejects.toThrow("suppressed must be a boolean");
+    await expect(t.run((ctx) => packageLead(ctx, { accountId: s.accountId, contactId: s.contactId, scoreRunId: run, suppressed: false } as never))).rejects.toThrow("suppressed is no longer an argument");
 
     // A Reject-tier score has nothing to ship or hold.
     const rejecting = await seed({ industry: "Mining" });
@@ -241,14 +247,14 @@ describe("state axes", () => {
     const s = await seed();
     const id = await pkg(s, await score(s));
     const before = await lead(id);
-    await t.run((ctx) => setInventoryState(ctx, { leadId: id, state: "Delivered", suppressed: false }));
+    await t.run((ctx) => setInventoryState(ctx, { leadId: id, state: "Delivered" }));
     let l = await lead(id);
     expect(l).toEqual({ ...before, inventoryState: "Delivered" });
-    await t.run((ctx) => setDisposition(ctx, { leadId: id, disposition: "Accepted", suppressed: false }));
+    await t.run((ctx) => setDisposition(ctx, { leadId: id, disposition: "Accepted" }));
     l = await lead(id);
     // Delivered inventory + Accepted disposition: neither write disturbed the other, or anything else.
     expect(l).toEqual({ ...before, inventoryState: "Delivered", disposition: "Accepted" });
-    await t.run((ctx) => setInventoryState(ctx, { leadId: id, state: "Replaced", suppressed: false }));
+    await t.run((ctx) => setInventoryState(ctx, { leadId: id, state: "Replaced" }));
     expect((await lead(id)).disposition).toBe("Accepted");
     const found = await t.run((ctx) => leadsByDisposition(ctx, { disposition: "Accepted", limit: 10 }));
     expect(found.map((x) => x._id)).toEqual([id]);
@@ -259,24 +265,24 @@ describe("state axes", () => {
     const s = await seed();
     const id = await pkg(s, await score(s), { suppressed: true });
     for (const disposition of ["ReadyForDistribution", "Delivered", "Accepted", "Converted"] as const) {
-      await expect(t.run((ctx) => setDisposition(ctx, { leadId: id, disposition, suppressed: false }))).rejects.toThrow("failed distributability");
+      await expect(t.run((ctx) => setDisposition(ctx, { leadId: id, disposition }))).rejects.toThrow("failed distributability");
     }
     for (const state of ["Reserved", "Sold", "Delivered"] as const) {
-      await expect(t.run((ctx) => setInventoryState(ctx, { leadId: id, state, suppressed: false }))).rejects.toThrow("failed distributability");
+      await expect(t.run((ctx) => setInventoryState(ctx, { leadId: id, state }))).rejects.toThrow("failed distributability");
     }
     // Moving it somewhere that does not ship is fine.
-    await t.run((ctx) => setDisposition(ctx, { leadId: id, disposition: "Closed", suppressed: false }));
-    await t.run((ctx) => setInventoryState(ctx, { leadId: id, state: "Expired", suppressed: false }));
+    await t.run((ctx) => setDisposition(ctx, { leadId: id, disposition: "Closed" }));
+    await t.run((ctx) => setInventoryState(ctx, { leadId: id, state: "Expired" }));
     expect(await lead(id)).toMatchObject({ disposition: "Closed", inventoryState: "Expired", tier: "S" });
   });
 
   test("setters refuse unknown vocabulary, unknown leads and other orgs' leads", async () => {
     const s = await seed();
     const id = await pkg(s, await score(s));
-    await expect(t.run((ctx) => setInventoryState(ctx, { leadId: id, state: "Accepted" as never, suppressed: false }))).rejects.toThrow("not an inventory state");
-    await expect(t.run((ctx) => setDisposition(ctx, { leadId: id, disposition: "Sold" as never, suppressed: false }))).rejects.toThrow("not a disposition");
+    await expect(t.run((ctx) => setInventoryState(ctx, { leadId: id, state: "Accepted" as never }))).rejects.toThrow("not an inventory state");
+    await expect(t.run((ctx) => setDisposition(ctx, { leadId: id, disposition: "Sold" as never }))).rejects.toThrow("not a disposition");
     const other = raw.withIdentity({ subject: "u9", orgId: await raw.run((ctx) => ctx.db.insert("orgs", { name: "Org 2", createdAt: 0 })) });
-    await expect(other.run((ctx) => setDisposition(ctx, { leadId: id, disposition: "Closed", suppressed: false }))).rejects.toThrow("lead not found");
+    await expect(other.run((ctx) => setDisposition(ctx, { leadId: id, disposition: "Closed" }))).rejects.toThrow("lead not found");
     await expect(other.run((ctx) => getLead(ctx, { leadId: id }))).rejects.toThrow("lead not found");
     await expect(t.run((ctx) => leadsByDisposition(ctx, { disposition: "Held", limit: 0 }))).rejects.toThrow("limit must be");
     await expect(t.run((ctx) => leadsByDisposition(ctx, { disposition: "Held", limit: 201 }))).rejects.toThrow("limit must be");
@@ -397,8 +403,7 @@ describe("the gate is re-checked when a lead is released", () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(Date.now() + days * DAY);
   };
-  const reserve = (id: Id<"leads">, over: { suppressed?: boolean } = {}) =>
-    t.run((ctx) => setInventoryState(ctx, { leadId: id, state: "Reserved", suppressed: false, ...over }));
+  const reserve = (id: Id<"leads">) => t.run((ctx) => setInventoryState(ctx, { leadId: id, state: "Reserved" }));
 
   test("a lead that ages out of its freshness window after packaging cannot be reserved, sold or delivered", async () => {
     const s = await seed();
@@ -406,26 +411,28 @@ describe("the gate is re-checked when a lead is released", () => {
     expect((await lead(id)).distributability.ok).toBe(true);
     ageBy(100); // fields were observed 1 day before packaging; the window is 90 days
     for (const state of ["Reserved", "Sold", "Delivered"] as const) {
-      await expect(t.run((ctx) => setInventoryState(ctx, { leadId: id, state, suppressed: false }))).rejects.toThrow(
+      await expect(t.run((ctx) => setInventoryState(ctx, { leadId: id, state }))).rejects.toThrow(
         `lead no longer passes distributability (within_freshness_window)`,
       );
     }
-    await expect(t.run((ctx) => setDisposition(ctx, { leadId: id, disposition: "Delivered", suppressed: false }))).rejects.toThrow("within_freshness_window");
+    await expect(t.run((ctx) => setDisposition(ctx, { leadId: id, disposition: "Delivered" }))).rejects.toThrow("within_freshness_window");
     // Nothing was written, and the persisted verdict is still the record of packaging.
     expect(await lead(id)).toMatchObject({ inventoryState: "Available", disposition: "ReadyForDistribution", distributability: { ok: true, failed: [] } });
     // Taking it off the shelf is not shipping, and is always allowed.
-    await t.run((ctx) => setInventoryState(ctx, { leadId: id, state: "Expired", suppressed: false }));
+    await t.run((ctx) => setInventoryState(ctx, { leadId: id, state: "Expired" }));
     expect((await lead(id)).inventoryState).toBe("Expired");
   });
 
   test("a lead suppressed after packaging cannot be reserved", async () => {
     const s = await seed();
     const id = await pkg(s, await score(s));
-    await expect(reserve(id, { suppressed: true })).rejects.toThrow("lead no longer passes distributability (duplicate_checked)");
+    await reserve(id); // clean at this point
+    await t.run((ctx) => setInventoryState(ctx, { leadId: id, state: "Available" }));
+    await suppress(s);
+    await expect(reserve(id)).rejects.toThrow("lead no longer passes distributability (duplicate_checked)");
     expect((await lead(id)).inventoryState).toBe("Available");
-    await expect(reserve(id, { suppressed: undefined as never })).rejects.toThrow("suppressed must be a boolean");
-    await reserve(id);
-    expect((await lead(id)).inventoryState).toBe("Reserved");
+    // The old caller-supplied verdict is refused, not ignored: nobody may believe they are overriding the lookup.
+    await expect(t.run((ctx) => setInventoryState(ctx, { leadId: id, state: "Reserved", suppressed: false } as never))).rejects.toThrow("no longer an argument");
   });
 
   test("a source that loses its lawful basis after packaging stops the lead", async () => {
@@ -440,35 +447,33 @@ describe("the gate is re-checked when a lead is released", () => {
     const id = await pkg(s, await score(s));
     await reserve(id);
     ageBy(100);
-    await expect(t.run((ctx) => setInventoryState(ctx, { leadId: id, state: "Sold", suppressed: false }))).rejects.toThrow("within_freshness_window");
+    await expect(t.run((ctx) => setInventoryState(ctx, { leadId: id, state: "Sold" }))).rejects.toThrow("within_freshness_window");
     expect((await lead(id)).inventoryState).toBe("Reserved");
   });
 
   test("a delivered lead can still be accepted and converted after it ages: buyer outcomes read the persisted verdict only", async () => {
     const s = await seed();
     const id = await pkg(s, await score(s));
-    await t.run((ctx) => setInventoryState(ctx, { leadId: id, state: "Delivered", suppressed: false }));
-    await t.run((ctx) => setDisposition(ctx, { leadId: id, disposition: "Delivered", suppressed: false }));
+    await t.run((ctx) => setInventoryState(ctx, { leadId: id, state: "Delivered" }));
+    await t.run((ctx) => setDisposition(ctx, { leadId: id, disposition: "Delivered" }));
     ageBy(400);
-    await t.run((ctx) => setDisposition(ctx, { leadId: id, disposition: "Accepted", suppressed: false }));
-    await t.run((ctx) => setDisposition(ctx, { leadId: id, disposition: "Converted", suppressed: false }));
+    await t.run((ctx) => setDisposition(ctx, { leadId: id, disposition: "Accepted" }));
+    await t.run((ctx) => setDisposition(ctx, { leadId: id, disposition: "Converted" }));
     expect((await lead(id)).disposition).toBe("Converted");
   });
 });
 
 describe("Accepted and Converted follow delivery", () => {
-  const release = (id: Id<"leads">, disposition: "Accepted" | "Converted", over: { suppressed?: boolean } = {}) =>
-    t.run((ctx) => setDisposition(ctx, { leadId: id, disposition, suppressed: false, ...over }));
+  const release = (id: Id<"leads">, disposition: "Accepted" | "Converted") => t.run((ctx) => setDisposition(ctx, { leadId: id, disposition }));
 
   test("a lead that was never delivered cannot be Accepted or Converted, however the caller labels it", async () => {
     const s = await seed();
     const id = await pkg(s, await score(s));
     for (const disposition of ["Accepted", "Converted"] as const) {
       await expect(release(id, disposition)).rejects.toThrow("has not been delivered");
-      await expect(release(id, disposition, { suppressed: true })).rejects.toThrow("has not been delivered");
     }
     // Reserved and Sold are on the way to a buyer, not in their hands.
-    await t.run((ctx) => setInventoryState(ctx, { leadId: id, state: "Reserved", suppressed: false }));
+    await t.run((ctx) => setInventoryState(ctx, { leadId: id, state: "Reserved" }));
     await expect(release(id, "Accepted")).rejects.toThrow("has not been delivered");
     expect((await lead(id)).disposition).toBe("ReadyForDistribution");
   });
@@ -483,14 +488,14 @@ describe("Accepted and Converted follow delivery", () => {
   test("delivery by either record unlocks the buyer outcomes, and they stay reachable afterwards", async () => {
     const byInventory = await seed();
     const a = await pkg(byInventory, await score(byInventory));
-    await t.run((ctx) => setInventoryState(ctx, { leadId: a, state: "Delivered", suppressed: false }));
+    await t.run((ctx) => setInventoryState(ctx, { leadId: a, state: "Delivered" }));
     await release(a, "Accepted");
     await release(a, "Converted"); // Accepted is itself proof of delivery
     expect((await lead(a)).disposition).toBe("Converted");
 
     const byDisposition = await seed();
     const b = await pkg(byDisposition, await score(byDisposition));
-    await t.run((ctx) => setDisposition(ctx, { leadId: b, disposition: "Delivered", suppressed: false }));
+    await t.run((ctx) => setDisposition(ctx, { leadId: b, disposition: "Delivered" }));
     await release(b, "Accepted");
     expect((await lead(b)).disposition).toBe("Accepted");
   });

@@ -4,6 +4,7 @@ import type { Doc, Id } from "../_generated/dataModel";
 import { mutation, query, type MutationCtx, type QueryCtx } from "../_generated/server";
 import { resolveOrg, withOrg } from "../_shared/org";
 import { subjectType as subjectTypeValidator, type SubjectType } from "../claims/schema";
+import { assertNotErased } from "../privacy/erased";
 import { advance, findState } from "./stages";
 import { STAGES, reasonCode as reasonCodeValidator, stage as stageValidator, stageIndex, type ReasonCode, type Stage } from "./schema";
 
@@ -87,6 +88,7 @@ export async function resumeDeadLettered(ctx: MutationCtx, args: { subjectType: 
   const { orgId } = await resolveOrg(ctx);
   const state = await findState(ctx, orgId, args.subjectType, args.subjectId);
   if (!state) throw new Error("pipeline not started for this subject");
+  await assertNotErased(ctx, orgId, args.subjectType, state.subjectId);
   if (args.fromStage !== undefined && !STAGES.includes(args.fromStage)) throw new Error("not a pipeline stage");
   if (state.status === "active" && args.fromStage === undefined) {
     await advance(ctx, { subjectType: args.subjectType, subjectId: args.subjectId });

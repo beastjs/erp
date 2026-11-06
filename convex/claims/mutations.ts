@@ -4,6 +4,7 @@ import { mutation, type MutationCtx } from "../_generated/server";
 import { resolveOrg } from "../_shared/org";
 import { scoringConfigForRead } from "../icp/queries";
 import { markScoreStale } from "../pipeline/stages";
+import { assertNotErased } from "../privacy/erased";
 import { claimMethod, subjectType, type ClaimMethod, type SubjectType } from "./schema";
 
 export type AppendClaimArgs = {
@@ -36,6 +37,8 @@ export async function appendClaimRecord(ctx: MutationCtx, args: AppendClaimArgs)
   // or belong to another org rather than leaving junk that can never project.
   const subject = await ctx.db.get(subjectId);
   if (!subject || subject.orgId !== orgId) throw new Error("subject not found");
+  // An erased subject takes no new claims: they would put the personal data straight back.
+  await assertNotErased(ctx, orgId, args.subjectType, subjectId);
   const source = await ctx.db.get(args.sourceId);
   if (!source || source.orgId !== orgId) throw new Error("source not found");
   if (args.runId) {

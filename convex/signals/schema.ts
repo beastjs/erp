@@ -32,10 +32,13 @@ export const signals = defineTable({
    * identity, so those events count twice; the two identities are never reconciled.
    */
   externalId: v.optional(v.string()),
+  /** Set by erasure alone (privacy/redact.ts), which also clears `externalId`. Event metadata survives; see there. */
+  redactedAt: v.optional(v.number()),
 })
   .index("by_subject_observed", ["orgId", "subjectType", "subjectId", "observedAt"])
   // Idempotency lookups. Both end in an exact key, so `.first()` decides existence with no bound to truncate at.
   .index("by_subject_external", ["orgId", "subjectType", "subjectId", "kind", "sourceId", "externalId"])
   .index("by_subject_event", ["orgId", "subjectType", "subjectId", "kind", "observedAt", "sourceId", "externalId"])
   // Recorded-at order (the implicit _creationTime), so staleness can ask "any signal since the score?" in one read.
-  .index("by_subject_created", ["orgId", "subjectType", "subjectId"]);
+  .index("by_subject_created", ["orgId", "subjectType", "subjectId"])
+  .index("by_subject_redacted", ["orgId", "subjectType", "subjectId", "redactedAt"]);

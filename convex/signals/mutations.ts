@@ -5,6 +5,7 @@ import { resolveOrg, withOrg } from "../_shared/org";
 import { scoringConfigForRead, getScoringModel } from "../icp/queries";
 import { subjectType, type SubjectType } from "../claims/schema";
 import { markScoreStale } from "../pipeline/stages";
+import { assertNotErased } from "../privacy/erased";
 import { decayedWeight, signalContribution } from "./decay";
 import { signalStrength, type Signal, type SignalStrength } from "./schema";
 
@@ -64,6 +65,7 @@ export async function appendSignal(ctx: MutationCtx, args: AppendSignalArgs): Pr
   if (!subjectId) throw new Error("invalid subject id");
   const subject = await ctx.db.get(subjectId);
   if (!subject || subject.orgId !== orgId) throw new Error("subject not found");
+  await assertNotErased(ctx, orgId, args.subjectType, subjectId);
   if (args.sourceId) {
     const source = await ctx.db.get(args.sourceId);
     if (!source || source.orgId !== orgId) throw new Error("source not found");

@@ -48,9 +48,16 @@ export const candidates = defineTable({
   /** The version the PRODUCER declared (Core's own for in-process sources), not the consumer's. */
   contractVersion: v.string(),
   candidate: v.any(), // validated by validateCandidate at the write boundary
+  /** Stamped by ingest when it consumes the candidate, so erasure can find the raw payloads of a subject it erases. */
+  contactId: v.optional(v.id("contacts")),
+  accountId: v.optional(v.id("accounts")),
+  /** Set by erasure or by a suppression hit: `candidate` is then null and `dedupeHash` is the literal "redacted". */
+  redactedAt: v.optional(v.number()),
 })
   .index("by_org_and_dedupe_hash_and_status", ["orgId", "dedupeHash", "status"])
-  .index("by_org_and_run_and_status", ["orgId", "runId", "status"]);
+  .index("by_org_and_run_and_status", ["orgId", "runId", "status"])
+  .index("by_org_and_contact_and_redacted", ["orgId", "contactId", "redactedAt"])
+  .index("by_org_and_account_and_redacted", ["orgId", "accountId", "redactedAt"]);
 
 /**
  * Header -> target field, saved per org. Stored as pairs, not a record: spreadsheet headers are

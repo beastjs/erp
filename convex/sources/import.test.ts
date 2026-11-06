@@ -7,6 +7,7 @@ import type { Id } from "../_generated/dataModel";
 import schema from "../schema";
 import { CANDIDATE_CONTRACT_VERSION, checkContractVersion } from "./contract";
 import { MAX_IMPORT_BYTES, MAX_IMPORT_ROWS } from "./import";
+import { addSuppression } from "../privacy/suppress";
 import { insertCandidate } from "./mutations";
 
 const modules = import.meta.glob("/convex/**/*.ts");
@@ -67,6 +68,17 @@ test("importRows maps columns and inserts candidates", async () => {
   expect(c.candidate.person).toMatchObject({ email: "Jane+news@Acme.com", fullName: "Jane Doe", jobTitle: "CTO" });
   expect(out.candidateIds).toEqual([c._id]);
   expect(await getRun()).toMatchObject({ rowsProcessed: 1, candidatesInserted: 1, duplicates: 0, rowsRejected: 0 });
+});
+
+test("importRows turns a suppressed row away as DATA: that row is rejected unnamed, the rest of the chunk goes in", async () => {
+  await t.run((ctx) => addSuppression(ctx, { identifier: "jane@acme.com", reason: "erasure" }));
+  const other = { ...jane(), Email: "joe@acme.com", Name: "Joe Doe" };
+  const out = await t.mutation(api.sources.import.importRows, { runId, mappingId, rows: [jane(), other] });
+  expect(out.inserted).toBe(1);
+  expect(out.rejected).toEqual([{ row: 0, errors: ["suppressed: an identifier on this candidate is on the suppression list"] }]);
+  expect(JSON.stringify(out)).not.toContain("jane");
+  expect((await all("candidates")).map((c) => c.dedupeHash)).toEqual(["email:joe@acme.com"]);
+  expect((await getRun())).toMatchObject({ rowsProcessed: 2, candidatesInserted: 1, rowsRejected: 1 });
 });
 
 test("importRows reports per-row errors without aborting the batch", async () => {

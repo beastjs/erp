@@ -8,7 +8,7 @@ import { checkContractVersion, validateCandidate } from "./contract";
 import { parseCsv } from "./csv";
 import { INGEST_BATCH, ingestCandidate } from "./ingest";
 import { missingColumns, rowToCandidate, validateMapping, type ColumnPair } from "./mapping";
-import { insertCandidate } from "./mutations";
+import { SuppressedCandidateError, insertCandidate } from "./mutations";
 import { parseXlsx, sniffFormat } from "./xlsx";
 
 /**
@@ -95,9 +95,15 @@ async function importChunk(
       rejected.push({ row: offset + i, errors: mapped.errors });
       continue;
     }
-    const id = await insertCandidate(ctx, { candidate: mapped.candidate, sourceId: run.sourceId, runId: run._id });
-    if (id) candidateIds.push(id);
-    else duplicates++;
+    try {
+      const id = await insertCandidate(ctx, { candidate: mapped.candidate, sourceId: run.sourceId, runId: run._id });
+      if (id) candidateIds.push(id);
+      else duplicates++;
+    } catch (e) {
+      // A suppressed row is data, like any other row that may not enter; nothing was stored for it.
+      if (!(e instanceof SuppressedCandidateError)) throw e;
+      rejected.push({ row: offset + i, errors: [e.message] });
+    }
   }
   await bumpRun(ctx, run, {
     rowsProcessed: rows.length,
@@ -422,14 +428,19 @@ export const submitCandidates = mutation({
         rejected.push({ row: i, errors: checked.errors });
         continue;
       }
-      const id = await insertCandidate(ctx, {
-        candidate: checked.value,
-        sourceId: args.sourceId,
-        runId: args.runId,
-        contractVersion: args.contractVersion,
-      });
-      if (id) candidateIds.push(id);
-      else duplicates++;
+      try {
+        const id = await insertCandidate(ctx, {
+          candidate: checked.value,
+          sourceId: args.sourceId,
+          runId: args.runId,
+          contractVersion: args.contractVersion,
+        });
+        if (id) candidateIds.push(id);
+        else duplicates++;
+      } catch (e) {
+        if (!(e instanceof SuppressedCandidateError)) throw e;
+        rejected.push({ row: i, errors: [e.message] });
+      }
     }
     if (run) {
       await bumpRun(ctx, run, {

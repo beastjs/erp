@@ -56,7 +56,9 @@ const criterion = v.union(
 /**
  * A FROZEN package (Spec §3.1, §12): everything a customer sees is copied here at packaging time, so no later
  * claim, rescore or projection rebuild can change a delivered lead. APPEND-ONLY apart from exactly two
- * fields, `inventoryState` and `disposition`, which only `setInventoryState` / `setDisposition` write.
+ * fields, `inventoryState` and `disposition`, which only `setInventoryState` / `setDisposition` write, and ONE
+ * lawful override: erasure (spec 7.3) redacts a side of `snapshot` in place and stamps `contactErasedAt` /
+ * `accountErasedAt`, written only by privacy/redact.ts (a guard test pins all three writers).
  * `tier` is the commercial worth and is never changed by the gate: a Held lead keeps its tier.
  */
 export const leads = defineTable({
@@ -89,7 +91,15 @@ export const leads = defineTable({
   inventoryState,
   disposition,
   packagedAt: v.number(),
+  /**
+   * Set by erasure alone. The matching side of `snapshot` has then been overwritten: every field value is null (its
+   * provenance survives) and `display` is empty. The lead can no longer be reserved, sold or delivered.
+   */
+  contactErasedAt: v.optional(v.number()),
+  accountErasedAt: v.optional(v.number()),
 })
   .index("by_org_and_score_run", ["orgId", "scoreRunId"])
   .index("by_org_and_contact", ["orgId", "contactId"])
-  .index("by_org_and_disposition", ["orgId", "disposition"]);
+  .index("by_org_and_disposition", ["orgId", "disposition"])
+  .index("by_org_and_contact_and_erased", ["orgId", "contactId", "contactErasedAt"])
+  .index("by_org_and_account_and_erased", ["orgId", "accountId", "accountErasedAt"]);

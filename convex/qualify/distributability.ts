@@ -29,7 +29,7 @@ export type DistributabilityInput = {
   /** Epoch ms, explicit so the gate stays pure. */
   now: number;
   freshnessWindowDays: number;
-  /** Task 13 owns the suppression list; the live call site passes `isSuppressed(...)`. This function never looks it up. */
+  /** The answer of a LIVE lookup on the org's suppression list (privacy/suppress.ts `anySuppressed`), made by packageLead and by the release re-check. This pure function never looks it up and nothing a client sends reaches it. */
   suppressed: boolean;
   /**
    * Caller-supplied facts the projections cannot carry (they live in other tables), computed by packageLead.

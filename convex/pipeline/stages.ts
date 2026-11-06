@@ -8,6 +8,7 @@ import { subjectType as subjectTypeValidator, type SubjectType } from "../claims
 import { ensureActiveScoringModel } from "../icp/mutations";
 import { latestIcp } from "../icp/queries";
 import { packageLead, setInventoryState, staleReason } from "../leads/mutations";
+import { ERASED_REASON, assertNotErased } from "../privacy/erased";
 import { rebuildProjection } from "../projections/build";
 import { trySpendCredits } from "../runs/mutations";
 import { scoreLead } from "../scoring/assemble";
@@ -421,13 +422,13 @@ export const stageHandlers: Record<Stage, StageHandler> = {
     if (existing) return { kind: "done", output: { leadId: existing._id } };
     const stale = await staleReason(ctx, orgId, scoreRun, { accountId: state.accountId, contactId }, Date.now());
     if (stale) return { kind: "rewind", reason: stale };
-    // TASK 13 replaces `suppressed: false` with a live isSuppressed(...) lookup. Until then nothing is ever suppressed here.
-    const leadId = await packageLead(ctx, { accountId: state.accountId, contactId, scoreRunId: scoreRun._id, suppressed: false });
+    // packageLead looks suppression up itself (live, fail closed); there is nothing to pass.
+    const leadId = await packageLead(ctx, { accountId: state.accountId, contactId, scoreRunId: scoreRun._id });
     // A rescore supersedes the lead it replaces. One that has not been reserved or sold must stop being offered.
     const prior = await ctx.db.query("leads").withIndex("by_org_and_contact", (q) => q.eq("orgId", orgId).eq("contactId", contactId)).take(MAX_PRIOR_LEADS + 1);
     if (prior.length > MAX_PRIOR_LEADS) throw new Error(`contact ${contactId} has more than ${MAX_PRIOR_LEADS} leads; refusing a partial read`);
     for (const p of prior) {
-      if (p._id !== leadId && p.inventoryState === "Available") await setInventoryState(ctx, { leadId: p._id, state: "Replaced", suppressed: false });
+      if (p._id !== leadId && p.inventoryState === "Available") await setInventoryState(ctx, { leadId: p._id, state: "Replaced" });
     }
     return { kind: "done", output: { leadId } };
   },
@@ -452,6 +453,8 @@ export async function enqueueSubject(
   const id = ctx.db.normalizeId(tableFor(args.subjectType), args.subjectId);
   const row = id && (await ctx.db.get(id));
   if (!id || !row || row.orgId !== orgId) throw new Error("subject not found");
+  // An erased subject is never processed again: its state is terminal, and this is the door a restart would come through.
+  await assertNotErased(ctx, orgId, args.subjectType, id);
   const existing = await findState(ctx, orgId, args.subjectType, id);
   if (existing) {
     if (existing.status === "done") {
@@ -501,6 +504,8 @@ const accountFanouts = new WeakMap<object, Set<string>>();
 const REWIND_PAGE = 50;
 
 async function rewindToResolve(ctx: MutationCtx, state: Doc<"pipelineState">): Promise<void> {
+  // An erased subject stays stopped: an account-level change fans out to every contact at it, erased ones included.
+  if (state.finishedReason === ERASED_REASON) return;
   // Nothing past `resolve` has completed for a subject still at or before it; its hashes will see the new evidence on their own.
   if (state.status === "deadlettered" || (state.status === "active" && stageIndex(state.stage) <= stageIndex("resolve"))) return;
   await ctx.db.patch(state._id, { stage: "resolve", status: "active", attempt: 0, finishedReason: undefined, updatedAt: Date.now() });

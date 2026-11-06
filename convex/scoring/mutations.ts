@@ -2,6 +2,7 @@ import type { Id } from "../_generated/dataModel";
 import type { MutationCtx } from "../_generated/server";
 import { withOrg } from "../_shared/org";
 import type { SubjectType } from "../claims/schema";
+import { hasActiveInboundLink } from "../projections/identity";
 import { ensureActiveScoringModel } from "../icp/mutations";
 import { getIcpVersion, getScoringModel } from "../icp/queries";
 import { TIERS } from "../icp/schema";
@@ -82,6 +83,11 @@ export async function recordScoreRun(
     icpVersionId: Id<"icpDefinitions">;
     scoringModelId?: Id<"scoringModels">;
     result: ScoreResult;
+    /**
+     * Other subjects whose signals fed this score (a lead scores a contact but reads its account's signals
+     * too). Each is checked for an active inbound identityLink along with the scored subject.
+     */
+    alsoSignalSubjects?: Array<{ subjectType: SubjectType; subjectId: string }>;
   },
 ): Promise<Id<"scoreRuns">> {
   const { orgId } = await withOrg(ctx, args);
@@ -92,6 +98,20 @@ export async function recordScoreRun(
   const icp = await getIcpVersion(ctx, { id: args.icpVersionId });
   const model = args.scoringModelId ? await getScoringModel(ctx, { id: args.scoringModelId }) : await ensureActiveScoringModel(ctx);
   validateResult(args.result, model);
+  const linked: Array<Id<"accounts"> | Id<"contacts">> = [subjectId];
+  for (const s of args.alsoSignalSubjects ?? []) {
+    const id = ctx.db.normalizeId(s.subjectType === "account" ? "accounts" : "contacts", s.subjectId);
+    const row = id && (await ctx.db.get(id));
+    if (!id || !row || row.orgId !== orgId) throw new Error("signal subject not found");
+    linked.push(id);
+  }
+  let intentMayBeStranded = false;
+  for (const id of linked) {
+    if (await hasActiveInboundLink(ctx, { orgId, subjectId: id })) {
+      intentMayBeStranded = true;
+      break;
+    }
+  }
   const r = args.result;
   return await ctx.db.insert("scoreRuns", {
     orgId,
@@ -105,6 +125,7 @@ export async function recordScoreRun(
     confidence: r.confidence,
     priority: r.priority,
     tier: r.tier,
+    intentMayBeStranded,
     contributions: r.contributions.map((c) => ({ factor: c.factor, input: c.input, weight: c.weight, contributed: c.contributed })),
     scoredAt: Date.now(),
   });

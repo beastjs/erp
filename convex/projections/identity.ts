@@ -1,5 +1,5 @@
 import type { Id } from "../_generated/dataModel";
-import type { MutationCtx } from "../_generated/server";
+import type { MutationCtx, QueryCtx } from "../_generated/server";
 import { withOrg } from "../_shared/org";
 import {
   emailDomain,
@@ -132,4 +132,30 @@ export async function unlinkIdentity(
   if (!link || link.orgId !== orgId) throw new Error("link not found");
   if (link.reversedAt !== undefined) return;
   await ctx.db.patch(args.linkId, { reversedAt: Date.now() });
+}
+
+/** Most links read to decide "is there an active one"; past it the answer is unknowable without scanning, so refuse. */
+export const MAX_LINKS_SCANNED = 200;
+
+/**
+ * True when some ACTIVE (not reversed) link names `subjectId` as the survivor, i.e. another subject was
+ * merged into it. `activeSignals` does not follow links, so such a subject's intent can be understated
+ * (the merged-away subject's signals are stranded); scoring records this so the score says so.
+ * `by_pair` is walked on its (orgId, subjectId) prefix, stopping at the first active link; if only
+ * reversed links fill the cap the answer is unknown and this throws instead of guessing "no".
+ */
+export async function hasActiveInboundLink(
+  ctx: Pick<QueryCtx, "db">,
+  args: { orgId: Id<"orgs">; subjectId: Id<"accounts"> | Id<"contacts"> },
+): Promise<boolean> {
+  let seen = 0;
+  for await (const link of ctx.db
+    .query("identityLinks")
+    .withIndex("by_pair", (q) => q.eq("orgId", args.orgId).eq("subjectId", args.subjectId))) {
+    if (link.reversedAt === undefined) return true;
+    if (++seen > MAX_LINKS_SCANNED) {
+      throw new Error(`subject ${args.subjectId} has more than ${MAX_LINKS_SCANNED} reversed links and no active one found (limit ${MAX_LINKS_SCANNED}); refusing to guess`);
+    }
+  }
+  return false;
 }

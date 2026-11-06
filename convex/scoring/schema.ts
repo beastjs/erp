@@ -28,5 +28,11 @@ export const scoreRuns = defineTable({
   priority: v.number(),
   tier,
   contributions: v.array(contribution),
+  /**
+   * True when a scored subject has an active inbound identityLink. `activeSignals` does not follow
+   * links, so the merged-away subject's signals were not counted and `intent` (and the tier built on it)
+   * may be understated. Recorded rather than silently baked in; link traversal itself is unowned.
+   */
+  intentMayBeStranded: v.boolean(),
   scoredAt: v.number(),
 }).index("by_subject", ["orgId", "subjectType", "subjectId", "scoredAt"]);

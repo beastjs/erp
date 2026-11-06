@@ -35,7 +35,7 @@ const criteria = { industries: ["software"], geographies: [], technologies: [], 
 const makeIcp = () => t.run(async (ctx) => (await latestIcp(ctx, {}))?._id ?? (await createIcpVersion(ctx, { name: "ICP", criteria })));
 /** Everything scheduled runs, with NO auth identity, exactly as in production. */
 const drain = () => raw.finishAllScheduledFunctions(vi.runAllTimers);
-const all = <T extends "claims" | "signals" | "leads" | "scoreRuns" | "pipelineState" | "accounts" | "contacts">(table: T) => raw.run((ctx) => ctx.db.query(table).collect());
+const all = <T extends "claims" | "signals" | "leads" | "scoreRuns" | "pipelineState" | "accounts" | "contacts" | "verifications">(table: T) => raw.run((ctx) => ctx.db.query(table).collect());
 const state = async (contactId: Id<"contacts">) => (await t.query(api.pipeline.stages.pipelineStatus, { subjectType: "contact", subjectId: contactId }))!;
 
 /** A real candidate through the real ingest path, so the subjects, claims, keys and source are what production produces. */
@@ -83,18 +83,21 @@ describe("end to end", () => {
     expect(leads[0]!.snapshot.contact.display.email).toBe("jo@acme.com");
   });
 
-  test("verify (and enrich) are declared pass-throughs: the chain traverses them and nothing is written", async () => {
+  test("enrich is a declared pass-through and verify writes only verifications: the chain traverses both, and no claim or signal is written by either", async () => {
     const { contactId, accountId, sourceId } = await ingestLead();
     await makeIcp();
     await funding(accountId, sourceId);
     const seen: string[] = [];
+    const written: Record<string, number> = {};
     const trace = (stage: "enrich" | "verify") => {
       const body = stageHandlers[stage];
       stageHandlers[stage] = async (ctx, subject) => {
-        const before = [(await ctx.db.query("claims").collect()).length, (await ctx.db.query("signals").collect()).length];
+        const count = async () => [(await ctx.db.query("claims").collect()).length, (await ctx.db.query("signals").collect()).length, (await ctx.db.query("verifications").collect()).length] as const;
+        const [claimsBefore, signalsBefore, verificationsBefore] = await count();
         const result = await body(ctx, subject);
-        const after = [(await ctx.db.query("claims").collect()).length, (await ctx.db.query("signals").collect()).length];
-        expect(after).toEqual(before);
+        const [claimsAfter, signalsAfter, verificationsAfter] = await count();
+        expect([claimsAfter, signalsAfter]).toEqual([claimsBefore, signalsBefore]);
+        written[stage] = verificationsAfter - verificationsBefore;
         seen.push(stage);
         return result;
       };
@@ -104,6 +107,7 @@ describe("end to end", () => {
     await start(contactId);
     await drain();
     expect(seen).toEqual(["enrich", "verify"]);
+    expect(written).toEqual({ enrich: 0, verify: 1 }); // the manual lead carries an email and no phone
     const st = await state(contactId);
     expect(st.status).toBe("done");
     expect(st.inputHashes.verify).toBeDefined();

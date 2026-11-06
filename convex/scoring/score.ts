@@ -30,7 +30,7 @@ export type ScoreInput = {
   contact: Fielded;
   /** Extra annotations from `activeSignals` are tolerated and ignored: intent is recomputed here from the model. */
   signals: Signal[];
-  /** Defaults to none until structural verification exists; an empty list must score exactly as before it did. */
+  /** The verdicts on the contact's CURRENT email and phone (verify/mutations.ts). None recorded means none counted: an empty list scores exactly as if verification did not exist. */
   verifications?: VerificationResult[];
   icp: Pick<IcpDefinition, "criteria">;
   model: Pick<
@@ -245,7 +245,7 @@ export function computeScore(input: ScoreInput): ScoreResult {
   });
 
   const evidence = evidenceConfidence(input);
-  // Snapped like its factors: the product can sit one ULP under a tier floor too (dormant until verifications exist).
+  // Snapped like its factors: the product can sit one ULP under a tier floor too (a failed verification multiplies it).
   const confidence = snap(clamp(evidence * verificationFactor(input.verifications ?? [], model.failedVerificationFactor), 0, 1));
 
   // No claims at all means nothing is known, whatever signals say: score 0, confidence 0, Reject.

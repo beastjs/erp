@@ -297,6 +297,9 @@ describe("every store: nothing identifying the person survives", () => {
     // Non-vacuous: the data really is spread over these stores.
     const before = await tablesHolding(PII);
     for (const table of ["candidates", "claims", "contactKeys", "contacts", "leads"]) expect(before, table).toContain(table);
+    // `verifications` holds NO personal data by construction, so it is not in the list above; but the sweep must be
+    // iterating real rows there, not an empty table (Task 13 H-2): the world really is verified.
+    expect(((await dump("verifications")) as Doc<"verifications">[]).filter((r) => r.subjectId === w.contactId).map((r) => r.kind).sort()).toEqual(["email", "phone"]);
 
     await erase("contact", w.contactId);
     expect(await tablesHolding(PII)).toEqual([]);
@@ -870,5 +873,68 @@ describe("audit log: populated, append-only, and holding none of the subject's d
     await raw.mutation(internal.privacy.sweep.sweepStalledErasures, {});
     await drain();
     expect((await auditRows()).filter((r) => r.action === "erasure.completed")).toHaveLength(1);
+  });
+});
+
+/*
+ * VERIFICATIONS (Task 15): the third new table in this plan that could have become an un-erasable store of personal data.
+ * It is content-free by construction (verify/schema.ts: ids, literals and numbers only, no string column), so there is
+ * nothing for erasure to redact, and this proves it against a POPULATED table: the real pipeline writes a verdict for
+ * the person's email and phone, the all-tables sweep reads those rows, and after erasure it still finds none of the
+ * person. Structural coverage is not data coverage (Task 13 H-2); this is the data.
+ */
+describe("verifications: populated by the real pipeline, content-free, and the sweep is not vacuous for them", () => {
+  const rows = async () => ((await dump("verifications")) as Doc<"verifications">[]).filter((r) => r.orgId === orgId);
+
+  test("the world really verified the person's email and phone, and the sweep can see those rows", async () => {
+    const w = await world({ pipeline: true });
+    const before = await rows();
+    expect(before.map((r) => `${r.kind}:${r.outcome}:${r.provider}`).sort()).toEqual(["email:pass:structural", "phone:pass:structural"]);
+    expect(before.every((r) => r.subjectId === w.contactId)).toBe(true);
+    // The sweep's scanner reads this table: a needle that really is in a row (the subject's own id) is found by it.
+    expect(await tablesHolding([w.contactId.toLowerCase()])).toContain("verifications");
+    // ...and the person's identifying strings are in none of those rows, before erasure either.
+    expect(await tablesHolding(PII)).not.toContain("verifications");
+    expect(JSON.stringify(before).toLowerCase()).not.toMatch(/bobby|tables|acme|5550104242|bob\./);
+  });
+
+  test("after erasure the rows survive as metadata and the all-table sweep still finds nothing, the verifications included", async () => {
+    const w = await world({ pipeline: true });
+    const before = await rows();
+    expect(before).toHaveLength(2);
+    await erase("contact", w.contactId);
+    expect(await tablesHolding(PII)).toEqual([]);
+    // Like a claim's metadata they stay: the fact that the value was checked, which of the closed outcomes it got, when.
+    expect(await rows()).toEqual(before);
+  });
+
+  test("the sweep WOULD find a value written into the table: the schema is what keeps it out, and refuses", async () => {
+    const w = await world({ pipeline: true });
+    const [row] = await rows();
+    const { _id, _creationTime, ...good } = row!;
+    for (const poisoned of [{ ...good, value: "bob.tables@acme.com" }, { ...good, reason: "bob.tables@acme.com" }, { ...good, kind: "5550104242" }]) {
+      await expect(raw.run((ctx) => ctx.db.insert("verifications", poisoned as never))).rejects.toThrow();
+    }
+    expect(await rows()).toHaveLength(2); // the refused inserts left nothing behind
+    expect(await tablesHolding(PII)).not.toContain("verifications");
+    expect(w.leadId).not.toBeNull();
+  });
+
+  test("an erased contact can no longer be verified, and reads as having no verdicts (its projection is empty)", async () => {
+    const w = await world({ pipeline: true });
+    const emailClaim = (await claimsOf("contact", w.contactId)).find((c) => c.field === "email")!;
+    await erase("contact", w.contactId);
+    const { recordVerification, verificationsForSubject } = await import("../verify/mutations");
+    const { verifyEmailStructure } = await import("../verify/structural");
+    await expect(t.run((ctx) => recordVerification(ctx, { subjectType: "contact", subjectId: w.contactId, claimId: emailClaim._id, result: verifyEmailStructure("a@b.co"), provider: "structural" }))).rejects.toThrow(/erased/);
+    expect(await t.run((ctx) => verificationsForSubject(ctx, { subjectType: "contact", subjectId: w.contactId }))).toEqual([]);
+    expect(await rows()).toHaveLength(2); // nothing added
+  });
+
+  test("a restarted pipeline for the erased contact writes no verdict (enqueue refuses it before verify can run)", async () => {
+    const w = await world({ pipeline: true });
+    await erase("contact", w.contactId);
+    await expect(t.run((ctx) => enqueueSubject(ctx, { subjectType: "contact", subjectId: w.contactId }))).rejects.toThrow(/erased/);
+    expect(await rows()).toHaveLength(2);
   });
 });

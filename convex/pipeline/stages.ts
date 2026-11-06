@@ -13,6 +13,8 @@ import { rebuildProjection } from "../projections/build";
 import { trySpendCredits } from "../runs/mutations";
 import { scoreLead } from "../scoring/assemble";
 import { MAX_SIGNALS, activeSignals } from "../signals/mutations";
+import { verificationsForSubject, verifySubject } from "../verify/mutations";
+import { structuralLogic } from "../verify/structural";
 import { requireRole, systemActor } from "../_shared/authz";
 import { writeAudit } from "../audit/log";
 import { stageInputHash } from "./hash";
@@ -72,12 +74,15 @@ export type StageRunResult = {
 /**
  * Bump a stage's version when its LOGIC changes (a resolver fix): the version is part of the stage's input hash, so
  * the fix invalidates every recorded completion and a replay re-runs the stage instead of being skipped as a no-op.
+ * `verify` is 2: version 1 was the pass-through, so every subject that already completed it must run the real one.
+ * Its DATA-shaped logic (the disposable and role lists) needs no bump: `inputHashFor` folds a fingerprint of the
+ * lists into the verify hash itself, so editing a list invalidates it with nobody remembering to touch this table.
  */
 export const STAGE_LOGIC_VERSION: Record<Stage, number> = {
   ingest: 1,
   resolve: 1,
   enrich: 1,
-  verify: 1,
+  verify: 2,
   signals: 1,
   score: 1,
   qualify: 1,
@@ -178,17 +183,29 @@ export async function inputHashFor(ctx: MutationCtx, orgId: Id<"orgs">, state: D
   // changing merely because scoring ran, which would make the first score look like new input forever after.
   const scoringModelId = stage === "score" || stage === "qualify" ? (await ensureActiveScoringModel(ctx))._id : null;
   const version = `logic:${STAGE_LOGIC_VERSION[stage]}`;
+  // What the scorer takes from verify: ONLY a failed verdict moves a score (`verificationFactor`: pass and unknown are
+  // neutral), so only failures are inputs. Hashing pass/unknown too would rescore, and replace the Available lead of,
+  // every contact whose role-list edit turned a pass into an unknown, for an identical score. A test pins that
+  // coupling (verify.test.ts: "pass and unknown score identically"), so a scorer that starts reading `unknown`
+  // cannot leave this hash blind to it.
+  const verdicts = async () => {
+    if (state.subjectType !== "contact" || !ctx.db.normalizeId("contacts", state.subjectId)) return [];
+    const rows = await verificationsForSubject(ctx, { subjectType: state.subjectType, subjectId: state.subjectId });
+    return rows.filter((r) => r.outcome === "fail").map((r) => `verification:${r.kind}:fail`);
+  };
   switch (stage) {
     case "ingest":
       return stageInputHash({ claimIds: ownIds, icpVersionId: null, scoringModelId: null, extra: [version] });
     case "resolve":
     case "enrich":
-    case "verify":
       return stageInputHash({ claimIds: [...ownIds, ...(await accountClaimIds())], icpVersionId: null, scoringModelId: null, extra: [version] });
+    case "verify":
+      // The lists are logic: their fingerprint is an input, so a list edit forces a re-run rather than a skip.
+      return stageInputHash({ claimIds: [...ownIds, ...(await accountClaimIds())], icpVersionId: null, scoringModelId: null, extra: [version, `rules:${structuralLogic().hash}`] });
     case "signals":
       return stageInputHash({ claimIds: [], icpVersionId: null, scoringModelId: null, extra: [version, ...(await signals())] });
     case "score":
-      return stageInputHash({ claimIds: [...ownIds, ...(await accountClaimIds())], icpVersionId, scoringModelId, extra: [version, ...(await signals())] });
+      return stageInputHash({ claimIds: [...ownIds, ...(await accountClaimIds())], icpVersionId, scoringModelId, extra: [version, ...(await signals()), ...(await verdicts())] });
     case "qualify":
       return stageInputHash({ claimIds: [], icpVersionId, scoringModelId, extra: [version, `scoreRun:${state.scoreRunId ?? "none"}`] });
     case "package":
@@ -350,9 +367,8 @@ export const step = internalMutation({
 const MAX_PRIOR_LEADS = 100;
 
 /**
- * The stage bodies. `enrich` and `verify` are DECLARED PASS-THROUGHS: they sit in the chain so it is complete and
- * every subject's state moves through them, but they do nothing until a provider exists (verification: Task 15).
- * The registry is a plain object so a stage's body is replaced in one place without touching the runner.
+ * The stage bodies. `enrich` is a DECLARED PASS-THROUGH: it sits in the chain so it is complete and every subject's
+ * state moves through it, but it does nothing until an enrichment provider exists. The registry is a plain object so a stage's body is replaced in one place without touching the runner.
  */
 export const stageHandlers: Record<Stage, StageHandler> = {
   async ingest(ctx, { orgId, state }) {
@@ -384,8 +400,9 @@ export const stageHandlers: Record<Stage, StageHandler> = {
     return { kind: "done" };
   },
 
-  // Declared pass-through until Task 15 replaces this body with real verification.
-  async verify() {
+  // Structural verification of the email and phone the projection carries (no network: a mutation, not an action).
+  async verify(ctx, { state }) {
+    await verifySubject(ctx, { subjectType: state.subjectType, subjectId: state.subjectId });
     return { kind: "done" };
   },
 

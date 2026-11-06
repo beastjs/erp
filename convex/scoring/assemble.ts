@@ -4,6 +4,7 @@ import { resolveOrg } from "../_shared/org";
 import { activeIcp, getIcpVersion } from "../icp/queries";
 import { ensureActiveScoringModel } from "../icp/mutations";
 import { activeSignals } from "../signals/mutations";
+import { verificationsForSubject } from "../verify/mutations";
 import { recordScoreRun } from "./mutations";
 import { computeScore } from "./score";
 
@@ -54,7 +55,10 @@ export async function scoreLead(
     ...(await activeSignals(ctx, { subjectType: "contact", subjectId: contact._id, now, scoringModelId: model._id })),
     ...(await activeSignals(ctx, { subjectType: "account", subjectId: account._id, now, scoringModelId: model._id })),
   ];
-  const result = computeScore({ account, contact, signals, icp, model, claimRecordedAt, now });
+  // The verdicts on the email and phone as they are projected NOW (the verify stage ran before this one). None
+  // recorded means none counted: an unverified lead scores exactly as it did before verification existed.
+  const verifications = await verificationsForSubject(ctx, { subjectType: "contact", subjectId: contact._id });
+  const result = computeScore({ account, contact, signals, verifications, icp, model, claimRecordedAt, now });
   return await recordScoreRun(ctx, {
     subjectType: "contact",
     subjectId: contact._id,

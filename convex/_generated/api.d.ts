@@ -56,6 +56,9 @@ import type * as sources_ingest from "../sources/ingest.js";
 import type * as sources_mapping from "../sources/mapping.js";
 import type * as sources_mutations from "../sources/mutations.js";
 import type * as sources_xlsx from "../sources/xlsx.js";
+import type * as verify_lists from "../verify/lists.js";
+import type * as verify_mutations from "../verify/mutations.js";
+import type * as verify_structural from "../verify/structural.js";
 
 import type {
   ApiFromModules,
@@ -112,6 +115,9 @@ declare const fullApi: ApiFromModules<{
   "sources/mapping": typeof sources_mapping;
   "sources/mutations": typeof sources_mutations;
   "sources/xlsx": typeof sources_xlsx;
+  "verify/lists": typeof verify_lists;
+  "verify/mutations": typeof verify_mutations;
+  "verify/structural": typeof verify_structural;
 }>;
 
 /**

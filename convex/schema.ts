@@ -12,6 +12,7 @@ import { accounts, contacts, contactKeys, identityLinks } from "./projections/sc
 import { auditLog } from "./audit/schema";
 import { memberships } from "./members/schema";
 import { erasureSnapshotRefs, erasures, suppressions } from "./privacy/schema";
+import { verifications } from "./verify/schema";
 
 export default defineSchema({
   claims,
@@ -40,4 +41,5 @@ export default defineSchema({
   erasureSnapshotRefs,
   memberships,
   auditLog,
+  verifications,
 });

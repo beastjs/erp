@@ -5,7 +5,7 @@ import type { Id } from "../_generated/dataModel";
  * identical inputs always agree and that a changed input all but never collides, at 2^-128 odds.
  * Synchronous and dependency-free so it behaves identically in a mutation, a test and the edge runtime.
  */
-function cyrb128(str: string): string {
+export function cyrb128(str: string): string {
   let h1 = 1779033703, h2 = 3144134277, h3 = 1013904242, h4 = 2773480762;
   for (let i = 0; i < str.length; i++) {
     const k = str.charCodeAt(i);

@@ -8,6 +8,16 @@ import type { NormalizedCandidate } from "./contract";
  */
 export const CELL_ERROR_PREFIX = "#cell_error: ";
 
+/**
+ * The machine code at the front of a parser's cell-error reason (`invalid_number`, `invalid_date`...). The rest of the
+ * reason can QUOTE the cell (`holds a non-numeric value "Bobby Tables"`), and a rejection is stored for good, so only
+ * the code survives into it. Anything that is not a plain code becomes `unreadable_cell`.
+ */
+export function cellErrorCode(reason: string): string {
+  const code = reason.split(":", 1)[0]!.trim();
+  return /^[a-z][a-z_]{0,40}$/.test(code) ? code : "unreadable_cell";
+}
+
 export type ColumnPair = { column: string; target: string };
 
 /** Every target a column may map to: `block.field` for each field the contract defines. */
@@ -63,7 +73,8 @@ export function rowToCandidate(
     const text = (row[column] ?? "").trim();
     if (text === "") continue;
     if (text.startsWith(CELL_ERROR_PREFIX)) {
-      errors.push(`${target}: ${text.slice(CELL_ERROR_PREFIX.length)} (column "${column}")`);
+      // Rejections are persisted and outlive the file: name the column and a code, never the cell's text.
+      errors.push(`${target}: ${cellErrorCode(text.slice(CELL_ERROR_PREFIX.length))} (column "${column}")`);
       continue;
     }
     const [block, field] = target.split(".") as ["person" | "company" | "acquisition", string];
@@ -71,7 +82,7 @@ export function rowToCandidate(
       blocks.company.techStack = text.split(/[,;|]/).map((s) => s.trim()).filter(Boolean);
     } else if (target === "acquisition.acquiredAt") {
       const at = parseAcquiredAt(text);
-      if (at === null) errors.push(`acquisition.acquiredAt: cannot read "${text}" as a date or epoch ms (column "${column}")`);
+      if (at === null) errors.push(`acquisition.acquiredAt: unreadable_date (column "${column}")`);
       else blocks.acquisition.acquiredAt = at;
     } else blocks[block][field] = text;
   }

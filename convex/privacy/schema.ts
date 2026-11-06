@@ -28,6 +28,13 @@ export const suppressions = defineTable({
  * and it survives as the proof that the erasure happened. One row per subject. `completedAt` absent = still in
  * progress (a subject with more rows than one transaction handles is erased across several calls).
  * Who requested it is NOT recorded here: that belongs to Task 14's audit log.
+ *
+ * LIVENESS. An in-progress erasure is carried by a self-scheduled chain, and a scheduled mutation that throws is NOT
+ * retried by the platform, so the chain can die with the person half-erased. `resumeAt` is therefore the time before
+ * which nobody need look: every successful call pushes it forward, and the sweeper (privacy/sweep.ts, driven by a
+ * cron) re-runs any row that is incomplete and past it. A transaction that throws rolls its own writes back, so
+ * `resumeAt` is by construction the time of the last call that COMMITTED, plus the grace period. `attempts`,
+ * `lastError` and `failedAt` are written only by the caller that caught a failure; a successful call clears them.
  */
 export const erasures = defineTable({
   orgId: v.id("orgs"),
@@ -35,10 +42,33 @@ export const erasures = defineTable({
   subjectId: v.string(),
   requestedAt: v.number(),
   completedAt: v.optional(v.number()),
+  resumeAt: v.optional(v.number()),
+  attempts: v.optional(v.number()),
+  lastError: v.optional(v.string()),
+  failedAt: v.optional(v.number()),
   claimsRedacted: v.number(),
   contactKeysDeleted: v.number(),
   candidatesRedacted: v.number(),
   signalsRedacted: v.number(),
   leadsRedacted: v.number(),
   suppressionsAdded: v.number(),
-}).index("by_subject", ["orgId", "subjectType", "subjectId"]);
+})
+  .index("by_subject", ["orgId", "subjectType", "subjectId"])
+  .index("by_org_and_completed_and_resume", ["orgId", "completedAt", "resumeAt"]);
+
+/**
+ * Raw crawl snapshots (R2) that the redacted claims pointed at. They live OUTSIDE this database and hold the same
+ * personal data as the claim values erasure just overwrote, so the references are recorded here, durably and in the
+ * same transaction as the redaction, for whatever deletes the objects. A child table, not an array on `erasures`: a
+ * subject can have thousands. `deletedAt` is for that deleter to stamp; nothing in Core sets it.
+ * The reference itself is an opaque storage key and must not carry personal data.
+ */
+export const erasureSnapshotRefs = defineTable({
+  orgId: v.id("orgs"),
+  erasureId: v.id("erasures"),
+  ref: v.string(),
+  recordedAt: v.number(),
+  deletedAt: v.optional(v.number()),
+})
+  .index("by_org_and_erasure_and_ref", ["orgId", "erasureId", "ref"])
+  .index("by_org_and_deleted", ["orgId", "deletedAt"]);

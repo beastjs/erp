@@ -2,7 +2,7 @@ import { v } from "convex/values";
 import type { Id } from "../_generated/dataModel";
 import { mutation, type MutationCtx } from "../_generated/server";
 import { resolveOrg, withOrg } from "../_shared/org";
-import { CANDIDATE_CONTRACT_VERSION, checkContractVersion, computeDedupeHash, validateCandidate } from "./contract";
+import { CANDIDATE_CONTRACT_VERSION, checkContractVersion, candidatePersonKey, computeDedupeHash, validateCandidate } from "./contract";
 import { candidateSuppressed } from "../privacy/suppress";
 import { lawfulBasis, sourceKind } from "./schema";
 
@@ -84,6 +84,7 @@ export async function insertCandidate(
     sourceId: args.sourceId,
     runId: args.runId,
     dedupeHash,
+    personKey: candidatePersonKey(checked.value) ?? undefined,
     status: "pending",
     contractVersion,
     candidate: checked.value,

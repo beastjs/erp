@@ -48,6 +48,8 @@ export const candidates = defineTable({
   /** The version the PRODUCER declared (Core's own for in-process sources), not the consumer's. */
   contractVersion: v.string(),
   candidate: v.any(), // validated by validateCandidate at the write boundary
+  /** The strong person identifier (`email:`/`profile:`/`phone:` + normalized value) the candidate is keyed by; cleared on redaction. Lets erasure find a pending candidate the person has no email for. */
+  personKey: v.optional(v.string()),
   /** Stamped by ingest when it consumes the candidate, so erasure can find the raw payloads of a subject it erases. */
   contactId: v.optional(v.id("contacts")),
   accountId: v.optional(v.id("accounts")),
@@ -56,6 +58,7 @@ export const candidates = defineTable({
 })
   .index("by_org_and_dedupe_hash_and_status", ["orgId", "dedupeHash", "status"])
   .index("by_org_and_run_and_status", ["orgId", "runId", "status"])
+  .index("by_org_and_person_key_and_status", ["orgId", "personKey", "status"])
   .index("by_org_and_contact_and_redacted", ["orgId", "contactId", "redactedAt"])
   .index("by_org_and_account_and_redacted", ["orgId", "accountId", "redactedAt"]);
 
@@ -72,7 +75,9 @@ export const columnMappings = defineTable({
 /**
  * A parsed CSV slice waiting for its turn in the self-scheduling import chain. Cells are positional
  * (aligned with `columns`) because headers are free-form and cannot all be record keys. Deleted in
- * the same transaction that imports it, so what remains for a run is exactly what is still to do.
+ * the same transaction that imports it, so what remains for a run is exactly what is still to do. These are the RAW
+ * file (names, emails, phones verbatim), so they are also purged when the run ends any other way (failed, closed by
+ * hand): see `purgeStagedChunks` in runs/mutations.ts. Erasure cannot find them, so they must not outlive the run.
  */
 export const importChunks = defineTable({
   orgId: v.id("orgs"),
@@ -85,7 +90,11 @@ export const importChunks = defineTable({
   rows: v.array(v.array(v.string())),
 }).index("by_run_and_seq", ["runId", "seq"]);
 
-/** Rows a chunked import turned away, kept because the chain has no caller to return them to. */
+/**
+ * Rows a chunked import turned away, kept because the chain has no caller to return them to. `errors` carry the
+ * target, a CODE and the column name, never the cell text (a misaligned column would otherwise write a person's name
+ * into a permanent row): see `rowToCandidate`. The row number and codes identify no one.
+ */
 export const importRejections = defineTable({
   orgId: v.id("orgs"),
   runId: v.id("discoveryRuns"),

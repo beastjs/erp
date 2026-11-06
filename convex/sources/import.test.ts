@@ -8,6 +8,7 @@ import schema from "../schema";
 import { CANDIDATE_CONTRACT_VERSION, checkContractVersion } from "./contract";
 import { MAX_IMPORT_BYTES, MAX_IMPORT_ROWS } from "./import";
 import { addSuppression } from "../privacy/suppress";
+import { rowToCandidate } from "./mapping";
 import { insertCandidate } from "./mutations";
 
 const modules = import.meta.glob("/convex/**/*.ts");
@@ -114,6 +115,22 @@ test("a date in the acquiredAt column is parsed; a bad one is a row error", asyn
   expect(out.rejected).toHaveLength(1);
   expect(out.rejected[0]!.errors.join(" ")).toContain("acquiredAt");
   expect((await all("candidates"))[0]!.candidate.acquisition.acquiredAt).toBe(Date.parse("2025-03-01T00:00:00Z"));
+});
+
+test("a rejection names the column and a code, never the cell text (a misaligned column must not write a person into an error row)", async () => {
+  const id = await t.mutation(api.sources.import.saveMapping, { name: "dated3", columns: { ...COLUMNS, Seen: "acquisition.acquiredAt" } });
+  const out = await t.mutation(api.sources.import.importRows, { runId, mappingId: id, rows: [{ ...jane(), Seen: "Bobby Tables" }] });
+  expect(out.rejected).toEqual([{ row: 0, errors: ['acquisition.acquiredAt: unreadable_date (column "Seen")'] }]);
+  expect(JSON.stringify(out)).not.toMatch(/bobby/i);
+});
+
+test("a parser's cell error keeps its CODE and drops the text it quotes", () => {
+  const r = rowToCandidate(
+    { Email: "a@b.com", When: "#cell_error: invalid_number: cell F2 holds a non-numeric value \"Bobby Tables\"" },
+    [{ column: "Email", target: "person.email" }, { column: "When", target: "acquisition.acquiredAt" }],
+    1,
+  );
+  expect(r).toEqual({ ok: false, errors: ['acquisition.acquiredAt: invalid_number (column "When")'] });
 });
 
 test("importRows on an empty row set returns inserted 0 and no error", async () => {
@@ -727,7 +744,7 @@ test("a bad cell in a mapped column rejects that row only; a bad cell in an unma
     expect(rejections).toHaveLength(1);
     expect(rejections[0]!.row).toBe(0);
     expect(rejections[0]!.errors).toEqual([
-      'acquisition.acquiredAt: invalid_date: cell F2 holds 60, which is not a real calendar date (Excel serial 60 is its fictional 1900-02-29) (column "Acquired")',
+      'acquisition.acquiredAt: invalid_date (column "Acquired")',
     ]);
   }));
 
@@ -752,8 +769,8 @@ test("a staged chunk whose mapping is gone fails the run instead of leaving it r
     expect(run.finishedAt).toBeDefined();
     // The chain stopped at the bad chunk: nothing was imported and nothing was skipped past.
     expect(run.chunksProcessed).toBe(0);
-    expect(await all("importChunks")).toHaveLength(3);
-    expect(await all("candidates")).toHaveLength(0);
+    expect(await all("importChunks")).toHaveLength(0); // purged on failure: raw rows must not outlive a dead run
+    expect(await all("candidates")).toHaveLength(0); // and nothing was skipped past or imported
     // A failed run is terminal: it cannot be resumed, and finishing it does not turn it into a success.
     await expect(t.mutation(api.sources.import.resumeImport, { runId })).rejects.toThrow("run_not_active");
     await t.mutation(api.runs.mutations.finishRun, { runId });
@@ -772,3 +789,45 @@ test("a staged chunk that went missing fails the run at the end of the chain", (
     expect(run.status).toBe("failed");
     expect(run.failureReason).toBe("chunks_missing: 2 of 3 staged chunks were imported");
   }), 120_000);
+
+test("raw staged rows do not outlive a FAILED run: a lost mapping purges the chunks the chain could not reach", () =>
+  withFakeTimers(async () => {
+    await t.action(api.sources.import.importCsv, { runId, mappingId, storageId: await store(csvOf(1001)) });
+    expect(await all("importChunks")).toHaveLength(3);
+    await raw.run((ctx) => ctx.db.delete(mappingId));
+    await drain();
+    expect((await getRun()).status).toBe("failed");
+    expect(await all("importChunks")).toHaveLength(0);
+    expect(JSON.stringify(await raw.run((ctx) => ctx.db.query("importRejections").collect()))).not.toMatch(/user\d/i);
+  }), 120_000);
+
+test("raw staged rows do not outlive a run closed by hand, or failed for any other reason", () =>
+  withFakeTimers(async () => {
+    await t.action(api.sources.import.importCsv, { runId, mappingId, storageId: await store(csvOf(1001)) });
+    expect(await all("importChunks")).toHaveLength(3);
+    await t.mutation(api.runs.mutations.finishRun, { runId });
+    expect(await all("importChunks")).toHaveLength(0);
+    await drain();
+    expect(await all("candidates")).toHaveLength(0); // the chain found nothing left to do
+  }), 120_000);
+
+test("a RUNNING run's staged rows are never purged, however the purge is called", () =>
+  withFakeTimers(async () => {
+    await t.action(api.sources.import.importCsv, { runId, mappingId, storageId: await store(csvOf(1001)) });
+    await raw.mutation(internal.sources.import.purgeStagedChunks, { orgId, runId });
+    expect(await all("importChunks")).toHaveLength(3);
+  }), 120_000);
+
+test("a terminal run with more staged chunks than one purge transaction removes is purged in full, by continuation", () =>
+  withFakeTimers(async () => {
+    const { PURGE_CHUNKS_PER_TXN } = await import("../runs/mutations");
+    await raw.run(async (ctx) => {
+      for (let seq = 0; seq < PURGE_CHUNKS_PER_TXN * 2 + 3; seq++) {
+        await ctx.db.insert("importChunks", { orgId, runId, mappingId, seq, rowOffset: seq, columns: ["Name"], rows: [["Bobby Tables"]] });
+      }
+    });
+    await t.mutation(api.runs.mutations.finishRun, { runId });
+    expect(await all("importChunks")).toHaveLength(PURGE_CHUNKS_PER_TXN + 3); // one transaction's worth gone, the rest is not forgotten
+    await drain();
+    expect(await all("importChunks")).toHaveLength(0);
+  }));

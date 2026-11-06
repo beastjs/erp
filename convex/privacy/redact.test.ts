@@ -15,7 +15,8 @@ import { appendSignal } from "../signals/mutations";
 import { markScoreStale } from "../pipeline/stages";
 import { enqueueSubject } from "../pipeline/stages";
 import { resumeDeadLettered } from "../pipeline/deadletter";
-import { eraseSubject } from "./redact";
+import crons from "../crons";
+import { ERASE_STALL_MS, eraseSubject, erasureRetryDelay } from "./redact";
 import { addSuppression, isSuppressed } from "./suppress";
 
 const modules = import.meta.glob("/convex/**/*.ts");
@@ -114,6 +115,22 @@ describe("claims: redaction, not deletion", () => {
       expect(typeof a.redactedAt).toBe("number");
       expect({ ...a, value: b.value, redactedAt: undefined }).toEqual({ ...b, redactedAt: undefined }); // every other column identical
     }
+  });
+
+  test("outside erasure nothing touches a claim: the whole pipeline, delivery and acceptance leave every existing claim byte-identical", async () => {
+    // The runtime half of the claims append-only guard (redact.guard.test.ts): a lexical net can be aliased past, this cannot.
+    const w = await world();
+    const before = JSON.stringify(await claimsOf("contact", w.contactId));
+    expect(JSON.parse(before).length).toBeGreaterThan(5);
+    await t.run(async (ctx) => (await latestIcp(ctx, {}))?._id ?? (await createIcpVersion(ctx, { name: "ICP", criteria })));
+    await t.mutation(api.pipeline.stages.startPipeline, { subjectType: "contact", subjectId: w.contactId });
+    await drain();
+    const leadId = (await raw.run((ctx) => ctx.db.query("leads").first()))!._id;
+    await t.run((ctx) => setInventoryState(ctx, { leadId, state: "Delivered" }));
+    await t.run((ctx) => setDisposition(ctx, { leadId, disposition: "Delivered" }));
+    await t.run((ctx) => setDisposition(ctx, { leadId, disposition: "Accepted" }));
+    const after = (await claimsOf("contact", w.contactId)).filter((c) => JSON.parse(before).some((b: Doc<"claims">) => b._id === c._id));
+    expect(JSON.stringify(after)).toBe(before);
   });
 
   test("the account's claims are untouched when a contact is erased", async () => {
@@ -242,6 +259,29 @@ describe("leads.snapshot: the copy a customer receives", () => {
     expect(await lead(w.leadId!)).toMatchObject({ inventoryState: "Expired", disposition: "Closed" });
   });
 
+  test.each([
+    ["contact", "Accepted"],
+    ["contact", "Converted"],
+    ["account", "Accepted"],
+    ["account", "Converted"],
+  ] as const)("a lead delivered BEFORE its %s was erased cannot be marked %s (ageing is exempt, erasure is not)", async (side, disposition) => {
+    const w = await world({ pipeline: true });
+    await t.run((ctx) => setInventoryState(ctx, { leadId: w.leadId!, state: "Delivered" }));
+    await t.run((ctx) => setDisposition(ctx, { leadId: w.leadId!, disposition: "Delivered" }));
+    await erase(side, side === "contact" ? w.contactId : w.accountId);
+    await expect(t.run((ctx) => setDisposition(ctx, { leadId: w.leadId!, disposition }))).rejects.toThrow(/erased/);
+    expect((await lead(w.leadId!)).disposition).toBe("Delivered");
+  });
+
+  test("ageing is still exempt for Accepted: a delivered, un-erased lead past its freshness window can be accepted", async () => {
+    const w = await world({ pipeline: true });
+    await t.run((ctx) => setInventoryState(ctx, { leadId: w.leadId!, state: "Delivered" }));
+    await t.run((ctx) => setDisposition(ctx, { leadId: w.leadId!, disposition: "Delivered" }));
+    vi.setSystemTime(Date.now() + 400 * DAY);
+    await t.run((ctx) => setDisposition(ctx, { leadId: w.leadId!, disposition: "Accepted" }));
+    expect((await lead(w.leadId!)).disposition).toBe("Accepted");
+  });
+
   test("an erased subject cannot be packaged", async () => {
     const w = await world({ pipeline: true });
     const l = await lead(w.leadId!);
@@ -293,15 +333,30 @@ describe("every store: nothing identifying the person survives", () => {
     expect(await tablesHolding(["robert", ...PII])).toEqual([]);
   });
 
-  test("candidates: a pending candidate staged BEFORE the suppression is destroyed when ingest meets it", async () => {
+  test.each([
+    ["phone", { phone: "+1 555 010 4242", fullName: "B Tables" }],
+    ["profile", { profileUrl: "https://www.linkedin.com/in/bobby-tables/", fullName: "B Tables" }],
+  ] as const)("candidates: a PENDING candidate keyed by %s (no email, any company domain) is redacted and rejected by erasure itself", async (_kind, p) => {
     const w = await world();
-    // A phone-only person: nothing the email path can find, so erasure leaves it pending.
     const pending = await t.run((ctx) =>
-      insertCandidate(ctx, { candidate: { person: { phone: "+1 555 010 4242", fullName: "B Tables" }, company, acquisition: { acquiredAt: 5 } }, sourceId: w.sourceId }),
+      insertCandidate(ctx, { candidate: { person: p, company: { name: "Other", domain: "other.example" }, acquisition: { acquiredAt: 5 } }, sourceId: w.sourceId }),
+    );
+    expect(pending).not.toBeNull();
+    expect((await raw.run((ctx) => ctx.db.get(pending!)))!.dedupeHash).toMatch(/^domain:other\.example\|(phone|profile):/);
+    const res = await erase("contact", w.contactId);
+    expect(res.candidatesRedacted).toBe(2);
+    expect(await raw.run((ctx) => ctx.db.get(pending!))).toMatchObject({ candidate: null, dedupeHash: "redacted", status: "rejected", rejectionReason: "erased" });
+    expect(await tablesHolding(["b tables", ...PII])).toEqual([]);
+  });
+
+  test("candidates: a pending candidate keyed by a DIFFERENT person key but carrying the erased phone is destroyed when ingest meets it", async () => {
+    const w = await world();
+    // Keyed by its own email, so the sweep by the erased contact's identifiers does not reach it: the ingest backstop does.
+    const pending = await t.run((ctx) =>
+      insertCandidate(ctx, { candidate: { person: { email: "other.person@elsewhere.example", phone: "+1 555 010 4242" }, company, acquisition: { acquiredAt: 5 } }, sourceId: w.sourceId }),
     );
     await erase("contact", w.contactId);
-    const row = (await raw.run((ctx) => ctx.db.get(pending!)))!;
-    expect(row.status).toBe("pending"); // still waiting: erasure could not find it by an identifier it indexes
+    expect((await raw.run((ctx) => ctx.db.get(pending!)))!.status).toBe("pending");
     const res = await t.run((ctx) => ingestCandidate(ctx, orgId, pending!));
     expect(res).toEqual({ outcome: "rejected", reason: "suppressed" });
     expect(await raw.run((ctx) => ctx.db.get(pending!))).toMatchObject({ candidate: null, dedupeHash: "redacted", status: "rejected" });
@@ -528,6 +583,140 @@ describe("idempotent and resumable", () => {
     });
     const res = await erase("contact", w.contactId);
     expect(res.snapshotRefs).toEqual(["r2://crawl/abc123"]);
+  });
+});
+
+describe("liveness: a stalled erasure is DETECTED and resumed, not merely resumable", () => {
+  const MIN = 60 * 1000;
+  const erasureRows = () => dump("erasures") as Promise<Doc<"erasures">[]>;
+  const tick = () => raw.mutation(internal.privacy.sweep.sweepStalledErasures, {});
+
+  test("a cron is registered for the sweeper", () => {
+    const jobs = (crons as unknown as { crons: Record<string, { name: string; schedule: unknown }> }).crons;
+    expect(Object.keys(jobs)).toEqual(["resume stalled erasures"]);
+    expect(jobs["resume stalled erasures"]).toMatchObject({ name: "privacy/sweep:sweepStalledErasures", schedule: { type: "interval", minutes: 5 } });
+  });
+
+  test("an erasure whose chain died is found by the sweep and finished; a fresh one is left alone", async () => {
+    const w = await world({ pipeline: true });
+    // One call, then nobody calls again: exactly the shape of a scheduled continuation that threw.
+    expect((await erase("contact", w.contactId, { budget: 1 })).complete).toBe(false);
+    expect((await erasureRows())[0]!.completedAt).toBeUndefined();
+    expect((await erasureRows())[0]!.resumeAt).toEqual(expect.any(Number));
+    expect(await tablesHolding(PII)).not.toEqual([]);
+
+    // Inside the grace period the chain may simply be slow: the sweep must not pile a second runner onto it.
+    await tick();
+    await drain();
+    expect((await erasureRows())[0]!.completedAt).toBeUndefined();
+    expect(await tablesHolding(PII)).not.toEqual([]);
+
+    vi.setSystemTime(Date.now() + ERASE_STALL_MS + MIN);
+    await tick();
+    await drain();
+    const [done] = await erasureRows();
+    expect(done!.completedAt).toEqual(expect.any(Number));
+    expect([done!.resumeAt, done!.attempts, done!.lastError]).toEqual([undefined, undefined, undefined]);
+    expect(await tablesHolding(PII)).toEqual([]);
+    expect(await t.run((ctx) => isSuppressed(ctx, { identifier: "bob.tables@acme.com" }))).toBe(true);
+  });
+
+  test("a step that throws is recorded on the row, backs off, and is retried once the cause is gone", async () => {
+    const w = await world({ pipeline: true });
+    await erase("contact", w.contactId, { budget: 1 });
+    vi.stubEnv("SUPPRESSION_SALT", ""); // the salt is gone between calls
+    const res = await raw.mutation(internal.privacy.redact.runErasure, { orgId, subjectType: "contact", subjectId: w.contactId });
+    expect(res).toEqual({ complete: false });
+    const [failed] = await erasureRows();
+    expect(failed!.completedAt).toBeUndefined();
+    expect(failed).toMatchObject({ attempts: 1, lastError: expect.stringMatching(/salt/), failedAt: expect.any(Number) });
+    expect(failed!.resumeAt).toBe(failed!.failedAt! + erasureRetryDelay(1));
+    expect(erasureRetryDelay(2)).toBeGreaterThan(erasureRetryDelay(1)); // it backs off
+
+    // Still failing: the sweep records another attempt and does not throw.
+    vi.setSystemTime(Date.now() + erasureRetryDelay(1) + MIN);
+    await tick();
+    await drain();
+    expect((await erasureRows())[0]!.completedAt).toBeUndefined();
+    expect((await erasureRows())[0]!.attempts).toBe(2);
+
+    vi.unstubAllEnvs();
+    vi.setSystemTime(Date.now() + erasureRetryDelay(2) + MIN);
+    await tick();
+    await drain();
+    const [fin] = await erasureRows();
+    expect(fin!.completedAt).toEqual(expect.any(Number));
+    expect([fin!.attempts, fin!.lastError, fin!.failedAt]).toEqual([undefined, undefined, undefined]);
+    expect(await tablesHolding(PII)).toEqual([]);
+  });
+
+  test("one erasure that can never run does not stop the others: failures are isolated per row", async () => {
+    const bad = await world({ person: { ...person, email: "gone@acme.com", phone: "+1 555 010 9999", profileUrl: "https://www.linkedin.com/in/gone", fullName: "Gone Person", firstName: "Gone", lastName: "Person" } });
+    const good = await world();
+    await erase("contact", bad.contactId, { budget: 1 });
+    await erase("contact", good.contactId, { budget: 1 });
+    await raw.run(async (ctx) => {
+      // the subject vanishes: every future step for it throws "subject not found"
+      for (const k of await ctx.db.query("contactKeys").collect()) if (k.contactId === bad.contactId) await ctx.db.delete(k._id);
+      await ctx.db.delete(bad.contactId);
+    });
+    vi.setSystemTime(Date.now() + ERASE_STALL_MS + MIN);
+    await tick();
+    await drain();
+    const rows = await erasureRows();
+    expect(rows.find((r) => r.subjectId === good.contactId)!.completedAt).toEqual(expect.any(Number));
+    const stuck = rows.find((r) => r.subjectId === bad.contactId)!;
+    expect(stuck.completedAt).toBeUndefined();
+    expect(stuck).toMatchObject({ attempts: 1, lastError: expect.stringMatching(/subject not found/) });
+  });
+
+  test("more stalled erasures than one pass handles are all picked up, none dropped", async () => {
+    const { SWEEP_BATCH } = await import("./sweep");
+    const ids: string[] = [];
+    await raw.run(async (ctx) => {
+      for (let i = 0; i < SWEEP_BATCH + 3; i++) {
+        const contactId = await ctx.db.insert("contacts", { orgId, fields: [], display: {} });
+        ids.push(contactId);
+        await ctx.db.insert("erasures", { orgId, subjectType: "contact", subjectId: contactId, requestedAt: 0, resumeAt: 1, claimsRedacted: 0, contactKeysDeleted: 0, candidatesRedacted: 0, signalsRedacted: 0, leadsRedacted: 0, suppressionsAdded: 0 });
+      }
+    });
+    await tick();
+    await drain();
+    const rows = await erasureRows();
+    expect(rows).toHaveLength(SWEEP_BATCH + 3);
+    expect(rows.every((r) => typeof r.completedAt === "number")).toBe(true);
+  });
+});
+
+describe("snapshot references (R2): recorded durably, not handed to a caller that drops them", () => {
+  test("the runner's references land in erasureSnapshotRefs, once each, against the erasure", async () => {
+    const w = await world();
+    await raw.run(async (ctx) => {
+      const mine = (await ctx.db.query("claims").collect()).filter((c) => c.subjectId === w.contactId);
+      await ctx.db.patch(mine[0]!._id, { snapshotRef: "r2://crawl/abc123" });
+      await ctx.db.patch(mine[1]!._id, { snapshotRef: "r2://crawl/abc123" }); // shared
+      await ctx.db.patch(mine[2]!._id, { snapshotRef: "r2://crawl/def456" });
+    });
+    // through the RUNNER, in small steps, as production does: the old runner returned only { complete }
+    let res = await raw.mutation(internal.privacy.redact.runErasure, { orgId, subjectType: "contact", subjectId: w.contactId });
+    expect(res.complete).toBe(true);
+    const refs = (await dump("erasureSnapshotRefs")) as Doc<"erasureSnapshotRefs">[];
+    const erasure = (await dump("erasures"))[0]!;
+    expect(refs.map((r) => r.ref).sort()).toEqual(["r2://crawl/abc123", "r2://crawl/def456"]);
+    expect(refs.every((r) => r.erasureId === erasure._id && r.orgId === orgId && r.deletedAt === undefined)).toBe(true);
+    res = await raw.mutation(internal.privacy.redact.runErasure, { orgId, subjectType: "contact", subjectId: w.contactId });
+    expect(await dump("erasureSnapshotRefs")).toHaveLength(2); // idempotent
+  });
+
+  test("references recorded across several small calls are all kept", async () => {
+    const w = await world();
+    await raw.run(async (ctx) => {
+      const mine = (await ctx.db.query("claims").collect()).filter((c) => c.subjectId === w.contactId);
+      for (const [i, c] of mine.entries()) await ctx.db.patch(c._id, { snapshotRef: `r2://crawl/${i}` });
+    });
+    let res = await erase("contact", w.contactId, { budget: 2 });
+    while (!res.complete) res = await erase("contact", w.contactId, { budget: 2 });
+    expect(await dump("erasureSnapshotRefs")).toHaveLength((await claimsOf("contact", w.contactId)).length);
   });
 });
 

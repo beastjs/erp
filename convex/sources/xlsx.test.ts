@@ -420,7 +420,7 @@ test("data beyond the column cap in an unmapped column is still the file's probl
   expect(message(() => parse(z, { columns: ["Name"] }))).toBe(`too_many_columns: data beyond column ${MAX_XLSX_COLUMNS} (cell AMK2)`);
 });
 
-test("a marker rejects its row with a reason naming the cell, for any target, and never imports a value", () => {
+test("a marker rejects its row with the column and a code, for any target, and never imports a value or quotes one", () => {
   const { headers, rows } = parse(badCells(), { columns: ["Name", "Email", "Notes", "When"] });
   const rec = (r: string[]) => Object.fromEntries(headers.map((h, i) => [h, r[i] ?? ""]));
   const pairs = [
@@ -433,8 +433,8 @@ test("a marker rejects its row with a reason naming the cell, for any target, an
   expect(bad).toEqual({
     ok: false,
     errors: [
-      `person.jobTitle: error_value: cell C2 holds the Excel error #N/A (column "Notes")`,
-      `acquisition.acquiredAt: invalid_date: cell D2 holds 60, which is not a real calendar date (Excel serial 60 is its fictional 1900-02-29) (column "When")`,
+      `person.jobTitle: error_value (column "Notes")`,
+      `acquisition.acquiredAt: invalid_date (column "When")`,
     ],
   });
   expect(rowToCandidate(rec(rows[1]!), pairs, 0)).toMatchObject({ ok: true, candidate: { acquisition: { acquiredAt: Date.UTC(2025, 0, 1) } } });

@@ -286,5 +286,10 @@ export async function setDisposition(ctx: MutationCtx, args: { leadId: Id<"leads
   if (BUYER_OUTCOMES.includes(args.disposition) && !hasBeenDelivered(lead)) {
     throw new Error(`a lead that has not been delivered cannot be ${args.disposition}`);
   }
+  // Erasure is a different question from ageing: a buyer may accept a lead that has aged, but not one whose subject has
+  // since been erased. Asked here, independently of the gate re-check, so those two stay exempt from ageing.
+  if (BUYER_OUTCOMES.includes(args.disposition) && leadIsErased(lead)) {
+    throw new Error(`a lead whose subject was erased cannot be ${args.disposition}`);
+  }
   await ctx.db.patch(lead._id, { disposition: args.disposition });
 }

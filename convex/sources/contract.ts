@@ -180,6 +180,17 @@ function personKey(p: Person | undefined): string | null {
 }
 
 /**
+ * The strong person identifier a candidate is keyed by (`email:`, `profile:` or `phone:` + the normalized value), or
+ * null. A name is not an identifier (two people share one), so it is never returned. Stored on the candidate row so
+ * erasure can find a pending candidate by an exact index read: `dedupeHash` carries the company domain in front of
+ * a phone or profile and so cannot be looked up from the identifier alone.
+ */
+export function candidatePersonKey(candidate: NormalizedCandidate): string | null {
+  const key = personKey(candidate.person);
+  return key !== null && !key.startsWith("name:") ? key : null;
+}
+
+/**
  * Deterministic dedupe key from NORMALIZED identifiers, so the same lead from two sources collides.
  * - A person with an email: `email:<normalized email>` (+tags stripped).
  * - Otherwise `domain:<normalized company domain>|<person key>`, where the person key is the first

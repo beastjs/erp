@@ -87,6 +87,11 @@ export type KindedIdentifier = { kind: IdentifierKind; value: string };
  * Whether ANY of these identifiers is on the org's list. Fail closed: a missing or changed salt, or an identifier
  * that cannot be normalized, THROWS; nothing here ever answers "not suppressed" because it could not tell. An exact
  * indexed read per identifier, so there is no bound to truncate at.
+ *
+ * Two limits of that, stated plainly. The salt is verified against the ledger by sampling ONE row (see
+ * `assertSaltMatchesLedger`), and that check runs even for an EMPTY list. An empty list answers `false` (vacuously:
+ * there is nothing to match), having still required a configured salt; it does not mean "checked and clear". A caller
+ * that expects identifiers must supply them, since a lead or candidate that yields none is not vouched for by this answer.
  */
 export async function anySuppressed(ctx: Pick<QueryCtx, "db" | "auth"> & Parameters<typeof resolveOrg>[0], identifiers: KindedIdentifier[]): Promise<boolean> {
   const { orgId } = await resolveOrg(ctx);

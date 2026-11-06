@@ -33,6 +33,12 @@ export const ERASE_BATCH = 200;
 /** Documents one call may rewrite. Past it the call returns `complete: false` and is simply called again. */
 export const ERASE_BUDGET = 2000;
 export const REDACTED_HASH = "redacted";
+/** How long an in-progress erasure may go without a committed call before the sweeper takes it for stalled. */
+export const ERASE_STALL_MS = 10 * 60 * 1000;
+const ERASE_RETRY_BASE_MS = 60 * 1000;
+const ERASE_RETRY_MAX_MS = 60 * 60 * 1000;
+/** Back-off after `attempts` consecutive failures: 1, 2, 4 ... minutes, capped at an hour. Never gives up: the obligation does not lapse. */
+export const erasureRetryDelay = (attempts: number): number => Math.min(ERASE_RETRY_BASE_MS * 2 ** Math.min(Math.max(attempts, 0), 20), ERASE_RETRY_MAX_MS);
 
 type Tally = {
   claimsRedacted: number;
@@ -83,25 +89,34 @@ export async function redactCandidate(ctx: MutationCtx, row: Doc<"candidates">, 
   await ctx.db.patch(row._id, {
     candidate: null,
     dedupeHash: REDACTED_HASH,
+    personKey: undefined,
     redactedAt: Date.now(),
     ...(row.status === "pending" || rejectWith !== undefined ? { status: "rejected" as const, rejectionReason: rejectWith ?? "erased" } : {}),
   });
 }
 
-/** Redacts every candidate whose dedupe key is this email, in every status. False when the budget ran out first. */
-async function redactCandidatesForEmail(ctx: MutationCtx, orgId: Id<"orgs">, email: string, budget: Budget, tally: Tally): Promise<boolean> {
-  const dedupeHash = `email:${email}`;
+/**
+ * Redacts every candidate keyed by this identifier, in every status. An email is also found by `dedupeHash`
+ * (`email:<addr>`, which older rows carry without a `personKey`); a phone or profile only by `personKey`, because
+ * its dedupeHash is `domain:<company>|phone:<v>` and the company is not known here. False when the budget ran out first.
+ */
+async function redactCandidatesFor(ctx: MutationCtx, orgId: Id<"orgs">, ident: KindedIdentifier, budget: Budget, tally: Tally): Promise<boolean> {
+  const key = `${ident.kind}:${ident.value}`;
   for (const status of ["pending", "consumed", "rejected"] as const) {
-    const done = await drain(
-      budget,
-      (n) => ctx.db.query("candidates").withIndex("by_org_and_dedupe_hash_and_status", (q) => q.eq("orgId", orgId).eq("dedupeHash", dedupeHash).eq("status", status)).take(n),
-      async (rows) => {
+    const lookups: Array<(n: number) => Promise<Doc<"candidates">[]>> = [
+      (n) => ctx.db.query("candidates").withIndex("by_org_and_person_key_and_status", (q) => q.eq("orgId", orgId).eq("personKey", key).eq("status", status)).take(n),
+    ];
+    if (ident.kind === "email") {
+      lookups.push((n) => ctx.db.query("candidates").withIndex("by_org_and_dedupe_hash_and_status", (q) => q.eq("orgId", orgId).eq("dedupeHash", key).eq("status", status)).take(n));
+    }
+    for (const fetch of lookups) {
+      const done = await drain(budget, fetch, async (rows) => {
         for (const row of rows) await redactCandidate(ctx, row);
         tally.candidatesRedacted += rows.length;
         return true;
-      },
-    );
-    if (!done) return false;
+      });
+      if (!done) return false;
+    }
   }
   return true;
 }
@@ -122,7 +137,7 @@ async function releaseIdentifier(
   const key = `${ident.kind}:${ident.value}`;
   if (seen.has(key)) return true;
   if ((await addSuppression(ctx, { identifier: ident.value, kind: ident.kind, reason: "erasure" })).created) tally.suppressionsAdded++;
-  if (ident.kind === "email" && !(await redactCandidatesForEmail(ctx, orgId, ident.value, budget, tally))) return false;
+  if (ident.kind !== "domain" && !(await redactCandidatesFor(ctx, orgId, ident, budget, tally))) return false;
   seen.add(key);
   return true;
 }
@@ -164,6 +179,22 @@ async function redactLeadSide(ctx: MutationCtx, lead: Doc<"leads">, side: "conta
 }
 
 /**
+ * Records the raw-snapshot references of the claims this call redacted, against the erasure. Idempotent per
+ * (erasure, ref): two claims may share a snapshot. Runs in the SAME transaction as the redaction, so a claim is never
+ * redacted without its reference being kept: the claim's own `snapshotRef` is the only other place it lives, and
+ * that is not erased, but nothing should depend on it.
+ */
+async function recordSnapshotRefs(ctx: MutationCtx, orgId: Id<"orgs">, erasureId: Id<"erasures">, refs: Set<string>, now: number): Promise<void> {
+  for (const ref of refs) {
+    const have = await ctx.db
+      .query("erasureSnapshotRefs")
+      .withIndex("by_org_and_erasure_and_ref", (q) => q.eq("orgId", orgId).eq("erasureId", erasureId).eq("ref", ref))
+      .first();
+    if (!have) await ctx.db.insert("erasureSnapshotRefs", { orgId, erasureId, ref, recordedAt: now });
+  }
+}
+
+/**
  * Erases one subject. A plain helper (no role check: Task 14), and IDEMPOTENT and RESUMABLE: if the subject has more
  * rows than one transaction may rewrite it returns `complete: false` having made progress, and is called again;
  * a completed erasure returns its totals and writes nothing. Everything is scoped by the caller's org.
@@ -192,7 +223,14 @@ export async function eraseSubject(
   const now = Date.now();
   let record = await findErasure(ctx, orgId, args.subjectType, id);
   if (!record) {
-    const recordId = await ctx.db.insert("erasures", { orgId, subjectType: args.subjectType, subjectId: id, requestedAt: now, ...zero() });
+    const recordId = await ctx.db.insert("erasures", {
+      orgId,
+      subjectType: args.subjectType,
+      subjectId: id,
+      requestedAt: now,
+      resumeAt: now + ERASE_STALL_MS,
+      ...zero(),
+    });
     record = (await ctx.db.get(recordId))!;
   }
   const finished = (): ErasureResult => ({
@@ -319,6 +357,7 @@ export async function eraseSubject(
       },
     ));
 
+  await recordSnapshotRefs(ctx, orgId, record._id, snapshotRefs, now);
   await ctx.db.patch(record._id, {
     claimsRedacted: record.claimsRedacted + tally.claimsRedacted,
     contactKeysDeleted: record.contactKeysDeleted + tally.contactKeysDeleted,
@@ -326,23 +365,59 @@ export async function eraseSubject(
     signalsRedacted: record.signalsRedacted + tally.signalsRedacted,
     leadsRedacted: record.leadsRedacted + tally.leadsRedacted,
     suppressionsAdded: record.suppressionsAdded + tally.suppressionsAdded,
-    ...(leadsDone ? { completedAt: now } : {}),
+    // A call that got this far COMMITTED: whatever failed before it is over, and the clock for "stalled" restarts.
+    attempts: undefined,
+    lastError: undefined,
+    failedAt: undefined,
+    ...(leadsDone ? { completedAt: now, resumeAt: undefined } : { resumeAt: now + ERASE_STALL_MS }),
   });
   record = (await ctx.db.get(record._id))!;
   return { ...finished(), snapshotRefs: [...snapshotRefs] };
 }
 
 /**
- * Runs an erasure to completion across as many transactions as it needs. INTERNAL: it takes the org as an argument
- * because scheduled work carries no identity, so it cannot be called by a client. There is deliberately NO public
- * erasure endpoint yet: anyone who could call one could destroy an org's data, and role checks are Task 14's.
+ * One transaction's worth of erasure. INTERNAL (the org is an argument: scheduled work carries no identity). Called
+ * only by `runErasure`, as a nested mutation, so that a throw here rolls back THIS work and leaves the caller free
+ * to record that it failed.
  */
-export const runErasure = internalMutation({
+export const erasureStep = internalMutation({
   args: { orgId: v.id("orgs"), subjectType: subjectTypeValidator, subjectId: v.string() },
   handler: async (rawCtx, args): Promise<{ complete: boolean }> => {
     const ctx = withTrustedOrgForInternalOnly(rawCtx, args.orgId);
     const result = await eraseSubject(ctx, { subjectType: args.subjectType, subjectId: args.subjectId });
-    if (!result.complete) await ctx.scheduler.runAfter(0, internal.privacy.redact.runErasure, args);
     return { complete: result.complete };
+  },
+});
+
+const MAX_ERROR_CHARS = 500;
+const describeError = (e: unknown): string => (e instanceof Error ? e.message : String(e)).slice(0, MAX_ERROR_CHARS);
+
+/**
+ * Runs an erasure to completion across as many transactions as it needs. INTERNAL: it takes the org as an argument
+ * because scheduled work carries no identity, so it cannot be called by a client. There is deliberately NO public
+ * erasure endpoint yet: anyone who could call one could destroy an org's data, and role checks are Task 14's.
+ *
+ * A scheduled mutation that throws is not retried by the platform, so a thrown step would end the chain with the
+ * person half-erased and nothing the wiser. The step therefore runs NESTED: when it throws, its writes roll back,
+ * this function records the failure on the `erasures` row (attempts, last error, and a back-off in `resumeAt`) and
+ * returns normally. Either way the row stays incomplete and the sweeper (privacy/sweep.ts) will call this again.
+ * A failure that precedes the `erasures` row (an unknown subject, a missing salt on the very first call) has
+ * nothing to record against and propagates: no erasure was ever accepted.
+ */
+export const runErasure = internalMutation({
+  args: { orgId: v.id("orgs"), subjectType: subjectTypeValidator, subjectId: v.string() },
+  handler: async (ctx, args): Promise<{ complete: boolean }> => {
+    try {
+      const result: { complete: boolean } = await ctx.runMutation(internal.privacy.redact.erasureStep, args);
+      if (!result.complete) await ctx.scheduler.runAfter(0, internal.privacy.redact.runErasure, args);
+      return result;
+    } catch (e) {
+      const record = await findErasure(ctx, args.orgId, args.subjectType, args.subjectId);
+      if (!record || record.completedAt !== undefined) throw e;
+      const now = Date.now();
+      const attempts = (record.attempts ?? 0) + 1;
+      await ctx.db.patch(record._id, { attempts, lastError: describeError(e), failedAt: now, resumeAt: now + erasureRetryDelay(attempts) });
+      return { complete: false };
+    }
   },
 });

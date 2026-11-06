@@ -3,7 +3,7 @@ import { api, internal } from "../_generated/api";
 import type { Doc, Id } from "../_generated/dataModel";
 import { action, internalMutation, mutation, query, type MutationCtx } from "../_generated/server";
 import { withOrg, withTrustedOrgForInternalOnly } from "../_shared/org";
-import { bumpRun, failRun, loadRun, settleRun } from "../runs/mutations";
+import { bumpRun, failRun, loadRun, purgeStagedChunks as purgeStagedChunksFor, settleRun } from "../runs/mutations";
 import { checkContractVersion, validateCandidate } from "./contract";
 import { parseCsv } from "./csv";
 import { INGEST_BATCH, ingestCandidate } from "./ingest";
@@ -228,6 +228,20 @@ export const resumeImport = mutation({
     const next = await ctx.db.query("importChunks").withIndex("by_run_and_seq", (q) => q.eq("runId", run._id)).first();
     if (next) await ctx.scheduler.runAfter(0, internal.sources.import.processStagedChunk, { orgId, runId: run._id, seq: next.seq });
     return { resumedAt: next?.seq ?? null, rearmedCandidates: pending.length };
+  },
+});
+
+/**
+ * Finishes purging a terminal run's staged rows when they did not fit one transaction (see `purgeStagedChunks`).
+ * Refuses a run that is still running: those rows are still to be imported.
+ */
+export const purgeStagedChunks = internalMutation({
+  args: { orgId: v.id("orgs"), runId: v.id("discoveryRuns") },
+  handler: async (ctx, args): Promise<null> => {
+    const run = await ctx.db.get(args.runId);
+    if (!run || run.orgId !== args.orgId || run.status === "running") return null;
+    if (!(await purgeStagedChunksFor(ctx, run))) await ctx.scheduler.runAfter(0, internal.sources.import.purgeStagedChunks, args);
+    return null;
   },
 });
 

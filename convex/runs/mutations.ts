@@ -1,4 +1,5 @@
 import { v } from "convex/values";
+import { internal } from "../_generated/api";
 import type { Doc, Id } from "../_generated/dataModel";
 import { mutation, type MutationCtx } from "../_generated/server";
 import { withOrg } from "../_shared/org";
@@ -11,6 +12,37 @@ export type RunCounter =
   | "candidatesConsumed"
   | "candidatesRejected"
   | "chunksProcessed";
+
+/**
+ * Staged chunks removed per transaction. A chunk is at most ~512 KB and a transaction may read 16 MiB, so this bounds
+ * the read; a run with more is finished by a scheduled continuation, never abandoned.
+ */
+export const PURGE_CHUNKS_PER_TXN = 16;
+
+/**
+ * Deletes a TERMINAL run's staged import rows. A chunk is the raw grid of the file (names, emails, phones, verbatim),
+ * deleted as the chain consumes it; what is left when a run ends any other way (failed, closed by hand) would sit
+ * there for good and erasure cannot find it (no index from an identifier to a chunk). So the end of a run is the
+ * moment they go. Refuses a run that is still running. Returns true when none are left; the caller schedules
+ * `purgeStagedChunks` for the rest otherwise.
+ */
+export async function purgeStagedChunks(ctx: MutationCtx, run: Doc<"discoveryRuns">): Promise<boolean> {
+  if (run.status === "running") throw new Error("a running run's staged rows are still to be imported");
+  const chunks = await ctx.db.query("importChunks").withIndex("by_run_and_seq", (q) => q.eq("runId", run._id)).take(PURGE_CHUNKS_PER_TXN + 1);
+  for (const chunk of chunks.slice(0, PURGE_CHUNKS_PER_TXN)) {
+    if (chunk.orgId === run.orgId) await ctx.db.delete(chunk._id);
+  }
+  return chunks.length <= PURGE_CHUNKS_PER_TXN;
+}
+
+/** Runs once, in the transaction that ends a run: purge the staged rows, and schedule the rest if they do not fit. */
+async function onRunTerminal(ctx: MutationCtx, runId: Id<"discoveryRuns">): Promise<void> {
+  const run = await ctx.db.get(runId);
+  if (!run || run.status === "running") return;
+  if (!(await purgeStagedChunks(ctx, run))) {
+    await ctx.scheduler.runAfter(0, internal.sources.import.purgeStagedChunks, { orgId: run.orgId, runId });
+  }
+}
 
 /** Loads a run in the caller's org. Pass `active: true` to also refuse a finished run. */
 export async function loadRun(
@@ -56,6 +88,7 @@ export async function settleRun(ctx: MutationCtx, runId: Id<"discoveryRuns">): P
     run.candidatesConsumed + run.candidatesRejected >= run.candidatesInserted
   ) {
     await ctx.db.patch(runId, { status: "completed", finishedAt: Date.now() });
+    await onRunTerminal(ctx, runId);
   }
 }
 
@@ -68,6 +101,7 @@ export async function failRun(ctx: MutationCtx, runId: Id<"discoveryRuns">, reas
   const run = await ctx.db.get(runId);
   if (!run || run.status !== "running") return;
   await ctx.db.patch(runId, { status: "failed", failureReason: reason, finishedAt: Date.now() });
+  await onRunTerminal(ctx, runId);
 }
 
 /**
@@ -154,6 +188,7 @@ export const finishRun = mutation({
     // A failed run stays failed: completing it would erase the only signal that it died.
     if (run.status !== "running") return null;
     await ctx.db.patch(run._id, { status: "completed", finishedAt: Date.now() });
+    await onRunTerminal(ctx, run._id);
     return null;
   },
 });

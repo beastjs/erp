@@ -46,6 +46,10 @@ export async function scoreLead(
     claimRecordedAt[f.claimId] = claim._creationTime;
   }
 
+  // CONVENTION: a real-world event is attached to exactly ONE subject (the account for company events, the
+  // contact for personal ones). Contact and account signals are concatenated WITHOUT dedupe and intent is a
+  // noisy-or, so the same event logged on both subjects counts twice. Two contacts at one account each
+  // inheriting the account's signals is correct and per-lead. Pinned by a test in leads/package.test.ts.
   const signals = [
     ...(await activeSignals(ctx, { subjectType: "contact", subjectId: contact._id, now, scoringModelId: model._id })),
     ...(await activeSignals(ctx, { subjectType: "account", subjectId: account._id, now, scoringModelId: model._id })),

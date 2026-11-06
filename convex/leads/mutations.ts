@@ -79,6 +79,10 @@ async function permissionsDocumented(ctx: QueryCtx, orgId: Id<"orgs">, fields: D
  *
  * The lead is `ReadyForDistribution` only when the gate passes; otherwise `Held` with the failing criteria
  * recorded, and its tier is untouched. A Reject-tier score is refused: there is nothing to ship or hold.
+ * A company with no contacts can never be packaged: `required_fields` demands a contactable person, and the
+ * pairing check below demands a contact asserted to work there. That is intended for a lead product.
+ * The contact must belong to the account: its projected `accountId` field (an ingest claim, with provenance)
+ * must equal `args.accountId`; absent or different is refused, so a missing relation fails closed.
  */
 export async function packageLead(
   ctx: MutationCtx,
@@ -96,6 +100,9 @@ export async function packageLead(
   const scoreRun = await ctx.db.get(args.scoreRunId);
   if (!scoreRun || scoreRun.orgId !== orgId) throw new Error("scoreRun not found");
   if (scoreRun.subjectType !== "contact" || scoreRun.subjectId !== contact._id) throw new Error("scoreRun does not score this contact");
+  const employer = contact.fields.find((f) => f.field === "accountId")?.value;
+  if (employer === undefined) throw new Error("contact has no accountId claim; cannot tie it to an account");
+  if (employer !== account._id) throw new Error("contact does not belong to this account");
   if (account.fields.length > MAX_PROJECTED_FIELDS || contact.fields.length > MAX_PROJECTED_FIELDS) {
     throw new Error(`projection has more than ${MAX_PROJECTED_FIELDS} fields; refusing to package a partial read`);
   }

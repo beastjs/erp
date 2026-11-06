@@ -32,7 +32,7 @@ beforeEach(async () => {
 type Seed = { accountId: Id<"accounts">; contactId: Id<"contacts">; sourceId: Id<"sources">; icpId: Id<"icpDefinitions"> };
 
 /** A fully shippable subject: observed fields a day old, a registered email key, a strong signal. */
-async function seed(opts: { industry?: string; withKey?: boolean; org?: Id<"orgs">; observedAt?: number } = {}): Promise<Seed> {
+async function seed(opts: { industry?: string; withKey?: boolean; noEmployer?: boolean; org?: Id<"orgs">; observedAt?: number } = {}): Promise<Seed> {
   const org = opts.org ?? orgId;
   const tt = org === orgId ? t : raw.withIdentity({ subject: "u2", orgId: org });
   return await tt.run(async (ctx) => {
@@ -47,6 +47,7 @@ async function seed(opts: { industry?: string; withKey?: boolean; org?: Id<"orgs
     await claim("account", accountId, "domain", email.split("@")[1]);
     await claim("account", accountId, "industry", opts.industry ?? "Software");
     await claim("contact", contactId, "name", "Jo Doe");
+    if (opts.noEmployer !== true) await claim("contact", contactId, "accountId", accountId);
     await claim("contact", contactId, "email", email);
     await rebuildProjection(ctx, { subjectType: "account", subjectId: accountId });
     await rebuildProjection(ctx, { subjectType: "contact", subjectId: contactId });
@@ -202,6 +203,17 @@ describe("packaging", () => {
     expect(await raw.run((ctx) => ctx.db.query("leads").collect())).toHaveLength(1);
   });
 
+  test("packageLead refuses a contact that does not belong to the account, or has no employer claim", async () => {
+    const a = await seed();
+    const b = await seed();
+    const run = await score(a);
+    await expect(t.run((ctx) => packageLead(ctx, { accountId: b.accountId, contactId: a.contactId, scoreRunId: run, suppressed: false }))).rejects.toThrow("contact does not belong to this account");
+    const orphan = await seed({ noEmployer: true });
+    const orphanRun = await score(orphan);
+    await expect(pkg(orphan, orphanRun)).rejects.toThrow("contact has no accountId claim");
+    expect(await raw.run((ctx) => ctx.db.query("leads").collect())).toHaveLength(0);
+  });
+
   test("packageLead refuses a foreign, mismatched, rejected or already-packaged score", async () => {
     const s = await seed();
     const run = await score(s);
@@ -287,6 +299,17 @@ describe("scoring seam (scoreLead)", () => {
     expect(r).toMatchObject({ subjectType: "contact", subjectId: s.contactId, icpVersionId: s.icpId, intentMayBeStranded: false, tier: "S" });
     expect(r.intent).toBeGreaterThan(90); // the account's funding signal was read
     expect(await raw.run((ctx) => ctx.db.get(r.scoringModelId))).not.toBeNull();
+  });
+
+  test("signals on both subjects are summed, not deduped: the same event on both counts twice (convention: one subject per event)", async () => {
+    const s = await seed();
+    const base = await scored(s);
+    await t.run((ctx) => appendSignal(ctx, { subjectType: "account", subjectId: s.accountId, kind: "hire", strength: "low", confidence: 1, observedAt: Date.now() - DAY }));
+    const one = await scored(s);
+    await t.run((ctx) => appendSignal(ctx, { subjectType: "contact", subjectId: s.contactId, kind: "hire", strength: "low", confidence: 1, observedAt: Date.now() - DAY }));
+    const both = await scored(s);
+    expect(one.intent).toBeGreaterThanOrEqual(base.intent);
+    expect(both.intent).toBeGreaterThan(one.intent);
   });
 
   test("scoring refuses a projection that cites a claim that does not exist", async () => {

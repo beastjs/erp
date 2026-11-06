@@ -157,7 +157,10 @@ function evidenceConfidence(input: ScoreInput): number {
     const ceiling = clamp(ceilings[f.method as ClaimMethod], 0, 1);
     const claimed = finite(f.confidence) && f.confidence > 0 && f.confidence <= 1 ? f.confidence : 0;
     const recorded = input.claimRecordedAt?.[f.claimId];
-    const observed = finite(f.observedAt) ? (finite(recorded) ? Math.min(f.observedAt, recorded) : f.observedAt) : NaN;
+    // A recorded time is also clamped to `now`: we cannot have recorded something in the future, so a claim whose
+    // record lands at or after `now` (scored in the same instant it was written) is brand new, age 0 — NOT stale.
+    // The clamp applies only to the recorded term: future-dated with NO record still earns nothing (below).
+    const observed = finite(f.observedAt) ? (finite(recorded) ? Math.min(f.observedAt, recorded, input.now) : f.observedAt) : NaN;
     // Future-dated with no record of when we saw it: no freshness credit (Infinity age = the floor).
     const age = finite(observed) && observed <= input.now ? input.now - observed : Infinity;
     const freshness = floorUsable && usable && Number.isFinite(age) ? freshFloor + (1 - freshFloor) * Math.pow(0.5, age / halfLife) : freshFloor;

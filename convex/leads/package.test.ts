@@ -294,10 +294,8 @@ describe("scoring seam (scoreLead)", () => {
     // Observed 30 days AHEAD. Clamped to its recorded time it is brand new, so evidence stays at 1; with no
     // map the scorer fails closed and gives it only the freshness floor (0.5).
     const s = await seed({ observedAt: Date.now() + 30 * DAY });
-    // A claim's recorded time carries sub-millisecond nudges (convex-test), and the scorer treats a record that is
-    // "after now" as future-dated and gives it the floor. Scoring within the same millisecond as seeding made this
-    // test a coin flip, so let the clock move on first. (A latent edge in the scorer, not in what is under test.)
-    await new Promise((resolve) => setTimeout(resolve, 5));
+    // No wait needed: the scorer clamps a claim's recorded time to `now`, so a record landing in the same
+    // millisecond as scoring is age 0, not maximally stale. (Was a coin flip before that clamp existed.)
     const r = await scored(s);
     expect(r.confidence).toBeGreaterThan(0.999);
     expect(r.confidence).toBeLessThanOrEqual(1);

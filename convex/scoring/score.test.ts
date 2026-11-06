@@ -251,6 +251,10 @@ test("a future-dated claim cannot boost freshness: age runs from min(observedAt,
   expect(conf(future)).toBe(0.5); // no record: no credit
   expect(conf(future, old)).toBe(0.75); // claim says the future, we recorded it a year ago: a year old
   expect(conf(old, NOW)).toBe(0.75); // recorded later than observed: observedAt stands
+  // A record cannot be in the future either: a future-dated claim recorded in the same instant it is scored is
+  // brand new (age 0), not maximally stale. Without the clamp to `now` this collapses to the floor, 0.5.
+  expect(conf(future, NOW + 1)).toBe(1);
+  expect(conf(future, NOW)).toBe(1);
 });
 
 test("data quality is absent from contributions", () => {

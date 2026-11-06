@@ -182,6 +182,27 @@ test("an empty verifications array scores the same as before Task 15", () => {
   expect(computeScore(input({ verifications: neutral }))).toEqual(without);
 });
 
+test("two model versions with different freshness half-lives give different confidence for the same claim", () => {
+  const old = (m: typeof model) => computeScore(input({ model: m, account: { fields: fields(perfectAccount, "observed", 1, NOW - 365 * DAY) }, contact: { fields: fields(perfectContact, "observed", 1, NOW - 365 * DAY) } })).confidence;
+  expect(old(model)).toBe(0.75);
+  expect(old({ ...model, claimHalfLifeMs: 730 * DAY })).toBeCloseTo(0.5 + 0.5 * Math.SQRT1_2, 12);
+  expect(old({ ...model, claimHalfLifeMs: 30 * DAY })).toBeCloseTo(0.5 + 0.5 * Math.pow(0.5, 365 / 30), 12);
+  // An unusable half-life fails closed to fully aged instead of dividing by it.
+  expect(old({ ...model, claimHalfLifeMs: 0 })).toBe(0.5);
+  expect(old({ ...model, claimHalfLifeMs: NaN })).toBe(0.5);
+});
+
+test("the failed-verification factor comes from the model", () => {
+  const failed: VerificationResult[] = [{ kind: "email", outcome: "fail", checkedAt: NOW }];
+  expect(computeScore(input({ verifications: failed, model: { ...model, failedVerificationFactor: 0.2 } })).confidence).toBe(0.2);
+  expect(computeScore(input({ verifications: failed, model: { ...model, failedVerificationFactor: NaN } })).confidence).toBe(0);
+});
+
+test("ten weak signals approach 1 under noisy-or (documented modelling choice)", () => {
+  const r = computeScore(input({ signals: Array.from({ length: 10 }, () => signal({ confidence: 0.2 })) }));
+  expect(r.intent).toBeCloseTo(100 * (1 - Math.pow(0.8, 10)), 9);
+});
+
 test("claim age lowers confidence by at most half", () => {
   const year = 365 * DAY;
   const aged = (age: number) => computeScore(input({ account: { fields: fields(perfectAccount, "observed", 1, NOW - age) }, contact: { fields: fields(perfectContact, "observed", 1, NOW - age) } })).confidence;

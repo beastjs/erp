@@ -45,6 +45,10 @@ export const scoringConfig = {
   strengthWeights: perStrength,
   /** Milliseconds for a signal's weight to halve. */
   decayHalfLives: perStrength,
+  /** Milliseconds for a claim's weight in confidence to fall halfway to its floor (0.5). */
+  claimHalfLifeMs: v.number(),
+  /** Multiplier on confidence for each verification kind whose latest result failed. In (0, 1]. */
+  failedVerificationFactor: v.number(),
 };
 
 export type ScoringConfig = {
@@ -54,6 +58,8 @@ export type ScoringConfig = {
   methodCeilings: { observed: number; extracted: number; inferred: number };
   strengthWeights: { high: number; medium: number; low: number };
   decayHalfLives: { high: number; medium: number; low: number };
+  claimHalfLifeMs: number;
+  failedVerificationFactor: number;
 };
 
 /**

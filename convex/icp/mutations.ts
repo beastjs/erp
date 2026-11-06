@@ -60,6 +60,8 @@ export async function createScoringModel(
     methodCeilings: args.methodCeilings,
     strengthWeights: args.strengthWeights,
     decayHalfLives: args.decayHalfLives,
+    claimHalfLifeMs: args.claimHalfLifeMs,
+    failedVerificationFactor: args.failedVerificationFactor,
   };
   validateScoringConfig(config);
   const version = checkChain(await latestScoringModel(ctx, {}), supersedesId);

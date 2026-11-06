@@ -35,7 +35,7 @@ export type ScoreInput = {
   icp: Pick<IcpDefinition, "criteria">;
   model: Pick<
     ScoringModel,
-    "weights" | "tierBands" | "confidenceFloors" | "methodCeilings" | "strengthWeights" | "decayHalfLives"
+    "weights" | "tierBands" | "confidenceFloors" | "methodCeilings" | "strengthWeights" | "decayHalfLives" | "claimHalfLifeMs" | "failedVerificationFactor"
   >;
   /** Epoch ms. Explicit so the function stays pure: decay and claim age are measured against it. */
   now: number;
@@ -44,13 +44,11 @@ export type ScoreInput = {
 /*
  * CONFIDENCE (a proposal of this task; the spec fixes the inputs, not the formula).
  *   evidence  = mean over every projected field of  min(claim.confidence, methodCeiling) x freshness
- *   freshness = 0.5 + 0.5 x 0.5^(age / CLAIM_HALF_LIFE_MS): a stale claim loses at most half its weight.
- *   verified  = evidence x 0.5 per failed verification kind (latest result per kind); pass/unknown are neutral.
+ *   freshness = 0.5 + 0.5 x 0.5^(age / model.claimHalfLifeMs): a stale claim loses at most half its weight.
+ *   verified  = evidence x model.failedVerificationFactor per failed verification kind (latest result per kind); pass/unknown are neutral.
  * No verifications means no factor, so populating the list later only ever lowers confidence for subjects
  * that actually fail a check. No fields at all is confidence 0.
  */
-export const CLAIM_HALF_LIFE_MS = 365 * 24 * 60 * 60 * 1000;
-export const FAILED_VERIFICATION_FACTOR = 0.5;
 const COMPANY_PARTIAL_SIZE_CREDIT = 0.5;
 
 const finite = (n: unknown): n is number => typeof n === "number" && Number.isFinite(n);
@@ -106,25 +104,29 @@ function evidenceConfidence(input: ScoreInput): number {
   const fields = [...input.account.fields, ...input.contact.fields];
   if (fields.length === 0) return 0;
   const ceilings = input.model.methodCeilings;
+  const halfLife = input.model.claimHalfLifeMs;
+  // Fail closed on an unusable half-life: treat every claim as fully aged rather than dividing by it.
+  const usable = Number.isFinite(halfLife) && halfLife > 0;
   let sum = 0;
   for (const f of fields) {
     const ceiling = clamp(ceilings[f.method as ClaimMethod], 0, 1);
     const claimed = finite(f.confidence) && f.confidence > 0 && f.confidence <= 1 ? f.confidence : 0;
     const age = finite(f.observedAt) ? Math.max(0, input.now - f.observedAt) : Infinity;
-    const freshness = Number.isFinite(age) ? 0.5 + 0.5 * Math.pow(0.5, age / CLAIM_HALF_LIFE_MS) : 0.5;
+    const freshness = usable && Number.isFinite(age) ? 0.5 + 0.5 * Math.pow(0.5, age / halfLife) : 0.5;
     sum += Math.min(claimed, ceiling) * freshness;
   }
   return clamp(sum / fields.length, 0, 1);
 }
 
-function verificationFactor(verifications: VerificationResult[]): number {
+function verificationFactor(verifications: VerificationResult[], failed: number): number {
+  const penalty = Number.isFinite(failed) && failed > 0 && failed <= 1 ? failed : 0;
   const latest = new Map<string, VerificationResult>();
   for (const v of verifications) {
     const prev = latest.get(v.kind);
     if (!prev || v.checkedAt >= prev.checkedAt) latest.set(v.kind, v);
   }
   let factor = 1;
-  for (const v of latest.values()) if (v.outcome === "fail") factor *= FAILED_VERIFICATION_FACTOR;
+  for (const v of latest.values()) if (v.outcome === "fail") factor *= penalty;
   return factor;
 }
 
@@ -170,7 +172,9 @@ export function computeScore(input: ScoreInput): ScoreResult {
 
   add("contact.role", roleMatch(str(fieldValue(input.contact, "title")), c.decisionMakerRoles), wContact);
 
-  // Intent: noisy-or over signal contributions (decayed weight x confidence). Many weak signals add up,
+  // Intent: noisy-or, 1 - prod(1 - c_i): parameter-free (nothing to version), but a modelling decision: many weak
+  // signals approach 1 (ten at 0.2 give ~0.89), i.e. "lots of activity is high intent".
+  // Inputs are signal contributions (decayed weight x confidence). Many weak signals add up,
   // none can push past 1, and zero signals is exactly 0 with no division anywhere.
   let miss = 1;
   for (const s of input.signals) miss *= 1 - clamp(signalContribution(s, input.now, model), 0, 1);
@@ -178,7 +182,7 @@ export function computeScore(input: ScoreInput): ScoreResult {
   add("intent", intentInput, wIntent);
 
   const evidence = evidenceConfidence(input);
-  const confidence = clamp(evidence * verificationFactor(input.verifications ?? []), 0, 1);
+  const confidence = clamp(evidence * verificationFactor(input.verifications ?? [], model.failedVerificationFactor), 0, 1);
 
   // No claims at all means nothing is known, whatever signals say: score 0, confidence 0, Reject.
   if (input.account.fields.length + input.contact.fields.length === 0) {

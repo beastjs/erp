@@ -20,4 +20,6 @@ export const DEFAULT_SCORING_MODEL: ScoringConfig = {
   methodCeilings: { observed: 1.0, extracted: 0.7, inferred: 0.5 },
   strengthWeights: { high: 1, medium: 0.6, low: 0.25 },
   decayHalfLives: { high: 90 * DAY_MS, medium: 45 * DAY_MS, low: 14 * DAY_MS },
+  claimHalfLifeMs: 365 * DAY_MS,
+  failedVerificationFactor: 0.5,
 };

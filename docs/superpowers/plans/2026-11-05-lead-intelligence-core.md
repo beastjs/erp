@@ -848,7 +848,14 @@ Expected: FAIL — `runSummary` not exported
 
 - [ ] **Step 3: Implement the four queries and the definitions record**
 
-All four are read-only queries over existing tables; add no new tables.
+All four are read-only queries over existing tables.
+
+**Amendment (2026-11-12), added by review of Tasks 12–14 — these are in scope for this task:**
+
+- **Refused-action recording.** A refused `setMemberRole`, `requestErasure` or audit read leaves no trace, because the refusal's throw rolls back anything written in that transaction. Record refusals from **outside** the refusing transaction (an action wrapper or equivalent); never from inside it. This is the one part of the task that adds a table. It must hold no personal data, by the same declared-domain rule `auditLog` uses.
+- **Wedged work must be visible.** `pipelineHealth` also reports subjects that are `active` with no progress beyond a stated threshold, and erasures that are incomplete with `attempts > 0`. A wedged subject and a stalled erasure currently appear in no queue.
+- **`retrying` is derived**, from `attempt > 0`; it is not a persisted status.
+- Add tests: `a refused role change is recorded and the refusal still stands`, `a stale active subject is listed`, `a failing erasure is listed with its attempt count`.
 
 - [ ] **Step 4: Run the whole suite and the project check**
 
@@ -861,3 +868,121 @@ Expected: PASS, no type errors
 git add convex
 git commit -m "feat(observability): run, health, quality and cost metrics"
 ```
+
+---
+
+### Task 17: Collector service credential
+
+Added 2026-11-12 by the Task 14 review. Not in the original sixteen.
+
+**Why:** `ingestCandidates` and `submitCandidates` demand an `operator` membership, so the Collector Worker would need a membership row: a process posing as a `user` actor. `convex/_shared/actor.ts` exists to keep a person and a process different kinds of thing, and commit `781f439` removed a fabricated identity for exactly this reason.
+
+**Files:**
+- Create: `convex/http.ts`, `convex/collector/ingest.ts`, `convex/collector/auth.ts`
+- Modify: `convex/_shared/actor.ts` (add `collector_ingest` to the system processes), `convex/_shared/authz.guard.test.ts` (pin the HTTP route alongside the public-registration matrix)
+- Test: `convex/collector/ingest.test.ts`
+
+**Interfaces:**
+- Consumes: `validateCandidate`, `insertCandidate` (Task 6), `ingestBatch` (Task 7), `systemActor` (Task 14), `isSuppressed` (Task 13).
+- Produces:
+  - `POST /collector/candidates` — an `httpAction` authenticated by a deployment secret, bound to one org and one registered source.
+  - `collectorIngest` — an `internalMutation` taking `orgId`, attributing every write to `{ kind: "system", process: "collector_ingest" }`.
+
+- [ ] **Step 1: Write the failing test**
+
+```ts
+test("a request with no secret, a wrong secret or a short secret is refused", ...)
+test("an unset COLLECTOR_SECRET refuses every request rather than accepting any", ...)
+test("the secret is compared in constant time", ...)
+test("the org and source come from the credential, never from the request body", ...)
+test("an accepted batch is attributed to the collector_ingest system actor", ...)
+test("an oversized batch or body is refused before any write", ...)
+test("a suppressed identifier in a collector batch is rejected and stores nothing", ...)
+test("the collector cannot satisfy requireRole", ...)
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `bun run test convex/collector`
+Expected: FAIL — `collectorIngest` not exported
+
+- [ ] **Step 3: Implement the route, the credential check and the internal mutation**
+
+The secret comes from a Convex environment variable and fails closed when unset, like `SUPPRESSION_SALT`. The request body never names an org. Reuse the existing candidate caps; add a body-size cap. No membership row is created for the Collector, and the operator-role ingest endpoints stay for human callers.
+
+- [ ] **Step 4: Run the whole suite and the project check**
+
+Run: `bun run check:core`
+Expected: PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add convex
+git commit -m "feat(collector): authenticated ingest route for the Collector Worker"
+```
+
+---
+
+### Task 18: Snapshot object deletion for erasure
+
+Added 2026-11-12 by the Task 13 review. Not in the original sixteen.
+
+**Why:** `claims.snapshotRef` points at raw crawl snapshots in R2 that hold the same personal data the claim did. Erasure records every such ref in `erasureSnapshotRefs` but nothing deletes the objects, so a completed erasure still leaves the original pages in object storage.
+
+**Files:**
+- Create: `convex/privacy/snapshots.ts`
+- Modify: `convex/crons.ts` (schedule the sweep), `convex/privacy/schema.ts` (attempt and error fields on `erasureSnapshotRefs`), `convex/README.md` (the required environment variables)
+- Test: `convex/privacy/snapshots.test.ts`
+
+**Interfaces:**
+- Consumes: `erasureSnapshotRefs` and its `by_org_and_deleted` index (Task 13), the stalled-erasure cron pattern (Task 13).
+- Produces:
+  - `deleteSnapshotObjects` — an `internalAction` that deletes a batch of objects through an injected storage client and reports per-ref outcomes.
+  - `markSnapshotsDeleted` / `markSnapshotsFailed` — `internalMutation`s that stamp `deletedAt`, or `attempts` and `lastError`.
+  - `erasureIsFullyComplete(ctx, { erasureId }) => boolean` — true only when the row is complete **and** no ref is outstanding.
+
+- [ ] **Step 1: Write the failing test**
+
+```ts
+test("a recorded ref is deleted from storage and stamped deletedAt", ...)
+test("an object already absent counts as deleted", ...)
+test("a storage error leaves deletedAt unset, records the attempt and is retried by the next sweep", ...)
+test("one failing ref does not stop the others in its batch", ...)
+test("a ref shared by two erasures is deleted once and both rows are stamped", ...)
+test("an erasure with an outstanding ref is not reported fully complete", ...)
+test("unset storage credentials fail every deletion closed and stamp nothing", ...)
+test("lastError never contains the object key", ...)
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `bun run test convex/privacy/snapshots.test.ts`
+Expected: FAIL — `deleteSnapshotObjects` not exported
+
+- [ ] **Step 3: Implement the action, the two mutations and the cron entry**
+
+Deletion is a network call, so it is an action; the outcome is written by a separate mutation. That split is required, not incidental: a failure record cannot be written by the transaction that fails. The storage client is injected so tests use a fake. An object key can embed a URL that names a person, so errors store a code only.
+
+- [ ] **Step 4: Run the whole suite and the project check**
+
+Run: `bun run check:core`
+Expected: PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add convex
+git commit -m "feat(privacy): delete erased subjects' snapshot objects from storage"
+```
+
+---
+
+## Open decisions (not tasks)
+
+Recorded 2026-11-12. Each needs an owner's answer before the final review.
+
+1. **Pipeline auto-start.** Nothing starts the pipeline after an import; `startPipeline` is the only entry. Wiring it means real imports begin spending run budget. Whoever wires it must handle `{ refused: "budget_exhausted" }`, or an import silently processes nothing.
+2. **Half-erased subjects can ship for up to about 15 minutes.** Until the erasure's leads step stamps a lead, the erased check does not cover it; the stalled-erasure cron bounds the window. A refuse-if-an-erasure-row-exists check on the shipping paths would close it.
+3. **Staff identifiers are permanent.** `memberships.userId` and `auditLog.actor.userId` hold staff identifiers that erasure does not touch. An employee exercising their own rights has no path.
+

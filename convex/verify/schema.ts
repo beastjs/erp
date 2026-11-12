@@ -10,7 +10,7 @@ export const OUTCOMES = ["pass", "fail", "unknown"] as const;
 export const verificationOutcome = v.union(v.literal("pass"), v.literal("fail"), v.literal("unknown"));
 
 /** WHY, as a closed set. A reason never carries any part of the value it is about. */
-export const REASONS = ["ok", "empty", "not_text", "too_long", "syntax", "domain_shape", "non_ascii", "disposable", "role", "bad_length"] as const;
+export const REASONS = ["ok", "empty", "not_text", "too_long", "syntax", "domain_shape", "non_ascii", "disposable", "role", "bad_length", "ambiguous_length"] as const;
 export type VerificationReason = (typeof REASONS)[number];
 export const verificationReason = v.union(
   v.literal("ok"),
@@ -23,6 +23,7 @@ export const verificationReason = v.union(
   v.literal("disposable"),
   v.literal("role"),
   v.literal("bad_length"),
+  v.literal("ambiguous_length"),
 );
 
 /** Who judged. v1 is `structural` only; a provider-backed verifier adds its literal here. */

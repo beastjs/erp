@@ -17,7 +17,7 @@ const tableFor = (t: SubjectType) => (t === "account" ? ("accounts" as const) : 
 /** Which reasons may accompany which kind: a phone cannot be "disposable". `ok` is the only reason that passes. */
 const REASONS_FOR: Record<VerificationKind, readonly VerificationReason[]> = {
   email: ["ok", "empty", "not_text", "too_long", "syntax", "domain_shape", "non_ascii", "disposable", "role"],
-  phone: ["ok", "empty", "not_text", "too_long", "syntax", "bad_length"],
+  phone: ["ok", "empty", "not_text", "too_long", "syntax", "bad_length", "ambiguous_length"],
 };
 
 /**

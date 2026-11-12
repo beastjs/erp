@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 import { DISPOSABLE_DOMAINS, ROLE_LOCAL_PARTS } from "./lists";
 import { REASONS } from "./schema";
+import { normalizePhone } from "../_shared/normalize";
 import { STRUCTURAL_RULES_REVISION, scanEmail, scanPhone, structuralLogic, verifyEmailStructure, verifyPhoneStructure, type Probe } from "./structural";
 
 const email = (s: string) => verifyEmailStructure(s);
@@ -91,8 +92,23 @@ describe("verifyPhoneStructure", () => {
     }
     expect(phone("12345")).toMatchObject({ outcome: "fail", reason: "bad_length" });
     expect(phone("+1 555")).toMatchObject({ outcome: "fail", reason: "bad_length" });
-    expect(phone("1".repeat(16))).toMatchObject({ outcome: "fail", reason: "bad_length" });
     expect(phone("1".repeat(41))).toEqual({ kind: "phone", outcome: "fail", reason: "too_long" });
+  });
+
+  test("a bare number too long for E.164 may have its extension merged in: unknown, not fail", () => {
+    // What the pipeline actually stores: normalizePhone strips `+`, separators AND the extension marker.
+    const stored = normalizePhone("+1 555 010 4242 x12345")!;
+    expect(stored).toBe("1555010424212345"); // 16 bare digits from a perfectly valid number
+    expect(phone(stored)).toEqual({ kind: "phone", outcome: "unknown", reason: "ambiguous_length" });
+    expect(phone("1".repeat(16))).toMatchObject({ outcome: "unknown", reason: "ambiguous_length" });
+    expect(phone("1".repeat(21))).toMatchObject({ outcome: "unknown", reason: "ambiguous_length" }); // 15 + a 6-digit extension
+    // Everything unambiguous is still a failure: the checker is not blinded.
+    expect(phone("1".repeat(22))).toMatchObject({ outcome: "fail", reason: "bad_length" }); // longer than any number plus extension
+    expect(phone("+" + "1".repeat(16))).toMatchObject({ outcome: "fail", reason: "bad_length" }); // an explicit `+`: E.164 is violated
+    expect(phone("1".repeat(16) + " x12")).toMatchObject({ outcome: "fail", reason: "bad_length" }); // the extension is already marked
+    expect(phone("555 010 4242 x1234567")).toMatchObject({ outcome: "fail", reason: "syntax" });
+    expect(phone("12345")).toMatchObject({ outcome: "fail", reason: "bad_length" });
+    expect(phone("555-CALL-NOW")).toMatchObject({ outcome: "fail", reason: "syntax" });
   });
 
   test("a North American region demands 10 digits (11 with a leading 1); other regions are not judged beyond a shape", () => {

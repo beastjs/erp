@@ -125,7 +125,7 @@ export function scanEmail(s: string, probe?: Probe): EmailScan {
 }
 
 /** Bump by hand when the matching CODE changes (the lists fingerprint themselves). */
-export const STRUCTURAL_RULES_REVISION = 1;
+export const STRUCTURAL_RULES_REVISION = 2;
 
 export type LogicLists = { revision: number; disposable: readonly string[]; roles: readonly string[] };
 const currentLists = (): LogicLists => ({ revision: STRUCTURAL_RULES_REVISION, disposable: DISPOSABLE_DOMAINS, roles: ROLE_LOCAL_PARTS });
@@ -171,7 +171,7 @@ export function verifyEmailStructure(email: string): StructuralCheck {
 
 export type PhoneScan =
   | { ok: true; plus: boolean; digits: number; first: number[] }
-  | { ok: false; reason: "syntax" | "bad_length" };
+  | { ok: false; reason: "syntax" | "bad_length" | "ambiguous_length" };
 
 /**
  * One pass over a trimmed phone string: an optional leading `+`, then digits with the usual separators (space, `-`,
@@ -212,7 +212,13 @@ export function scanPhone(s: string, probe?: Probe): PhoneScan {
     }
   }
   if (ext === 0 || digits === 0) return { ok: false, reason: "syntax" }; // a marker with nothing after it, or no digit at all
-  if (digits > MAX_NATIONAL_DIGITS) return { ok: false, reason: "bad_length" };
+  if (digits > MAX_NATIONAL_DIGITS) {
+    // A stored phone is bare digits: `normalizePhone` strips the `+`, the separators AND the extension marker (and
+    // must keep doing so: suppression hashes are HMACs over its output). So with no `+` and no marker, up to
+    // 15 + 6 digits cannot be told apart from a valid number with its extension merged in. Not judgeable.
+    const mergedExtensionPossible = !plus && ext < 0 && digits <= MAX_NATIONAL_DIGITS + MAX_EXTENSION_DIGITS;
+    return { ok: false, reason: mergedExtensionPossible ? "ambiguous_length" : "bad_length" };
+  }
   return { ok: true, plus, digits, first };
 }
 
@@ -230,7 +236,8 @@ export function verifyPhoneStructure(phone: string, region?: string): Structural
   if (s.length === 0) return check("phone", "unknown", "empty");
   if (s.length > MAX_PHONE_TEXT) return check("phone", "fail", "too_long");
   const scan = scanPhone(s);
-  if (!scan.ok) return check("phone", "fail", scan.reason);
+  // `unknown`, not `fail`: a false failure halves confidence (failedVerificationFactor) on a number that may be good.
+  if (!scan.ok) return check("phone", scan.reason === "ambiguous_length" ? "unknown" : "fail", scan.reason);
   if (scan.plus) {
     if (scan.first[0] === 0) return check("phone", "fail", "syntax");
     return scan.digits >= 8 ? check("phone", "pass", "ok") : check("phone", "fail", "bad_length");

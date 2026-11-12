@@ -239,6 +239,14 @@ describe("the verify stage", () => {
     expect(await rowsFor(contactId)).toHaveLength(2);
   });
 
+  test("a valid phone with an extension is not failed once the pipeline has stored it as bare digits", async () => {
+    const { contactId } = await ingestLead({ email: "jo@acme.com", phone: "+1 555 010 4242 x12345" });
+    await makeIcp();
+    await start(contactId);
+    await drain();
+    expect((await rowsFor(contactId)).map((r) => `${r.kind}:${r.outcome}:${r.reason}`).sort()).toEqual(["email:pass:ok", "phone:unknown:ambiguous_length"]);
+  });
+
   test("a failing verdict never stops the lead: it is recorded and the chain goes on", async () => {
     const { contactId } = await ingestLead({ email: "jo@mailinator.com", phone: "12345" });
     await makeIcp();

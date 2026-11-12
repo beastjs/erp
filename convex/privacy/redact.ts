@@ -399,6 +399,8 @@ export async function eraseSubject(
     attempts: undefined,
     lastError: undefined,
     failedAt: undefined,
+    // The progress stamp: this step committed. Observability's "overdue" is judged from this alone (Task 16 L6).
+    progressAt: now,
     ...(leadsDone ? { completedAt: now, resumeAt: undefined } : { resumeAt: now + ERASE_STALL_MS }),
   });
   record = (await ctx.db.get(record._id))!;

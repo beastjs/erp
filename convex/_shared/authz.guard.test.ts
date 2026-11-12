@@ -79,9 +79,11 @@ const MATRIX: Record<string, string> = {
   "/convex/icp/api.ts": "createIcp:analyst createModel:analyst",
   "/convex/leads/api.ts": "markInventoryState:operator markDisposition:operator",
   "/convex/members/api.ts": "setMemberRole:admin(wraps setMemberRoleTxn) myRole:operator",
-  // Task 16. Operator: the role that runs discovery and works the dead-letter queue (spec 7.1). Ids, closed-set labels and
-  // counts only; nothing here is not already readable by an operator through getRun, listDeadLetters or the leads.
-  "/convex/observability/health.ts": "pipelineHealth:operator",
+  // Task 16. pipelineHealth is operator: the role that runs discovery and works the dead-letter queue (spec 7.1); ids,
+  // closed-set labels and counts of runs and pipeline subjects, which an operator reads anyway through getRun and
+  // listDeadLetters. It carries NO erasure state: erasure ids, attempts and times are NOT otherwise readable by an operator
+  // (erasure is admin-only), so they moved, on purpose, to stalledErasures at admin (Task 16 review M3).
+  "/convex/observability/health.ts": "pipelineHealth:operator stalledErasures:admin",
   "/convex/observability/quality.ts": "dataQuality:operator",
   // Task 16, on purpose: admin, because it names members (by membershipId) who tried what they may not.
   "/convex/observability/refusals.ts": "refusalCounts:admin",
@@ -94,7 +96,7 @@ const MATRIX: Record<string, string> = {
   "/convex/runs/queries.ts": "getRun:operator rejectionsForRun:operator",
   "/convex/signals/mutations.ts": "recordSignals:operator",
   "/convex/sources/import.ts":
-    "saveMapping:operator getMapping:operator importRows:operator resumeImport:operator importCsv:(delegates) addManualLead:operator submitCandidates:operator",
+    "saveMapping:operator getMapping:operator importRows:operator resumeImport:operator resumePurge:operator importCsv:(delegates) addManualLead:operator submitCandidates:operator",
   "/convex/sources/ingest.ts": "ingestCandidates:operator",
   "/convex/sources/mutations.ts": "registerSource:admin(wraps registerSourceTxn)",
 };

@@ -117,3 +117,16 @@ These seven are public **actions**, not mutations or queries, so that an authori
 actions (`useAction`, `client.action`, `npx convex run` works unchanged). `recentAudit` and `auditForTarget` are
 therefore **not reactive**: fetch again to see new entries. An authorization refusal arrives as a `ConvexError` whose
 `data` is `{ code: "forbidden", reason }`; match on `data`, not on the message text.
+
+## Observability reads take `asOf`: re-issue it on a timer
+
+`observability/health:pipelineHealth`, `observability/health:stalledErasures` and `observability/quality:dataQuality`
+take an `asOf` (epoch ms) because a Convex query must not read the clock. The value is fixed for the life of a
+subscription: a screen that subscribes once at load judges staleness against the load time forever, so **work that
+wedges after the screen opened never appears on it**, because nothing a wedged chain does changes the rows the query
+reads. A client must re-issue the query with a fresh `asOf` on a timer (once a minute is ample; every threshold is at
+least 10 minutes), e.g. keep `asOf` in state and update it from `setInterval`. A finite, non-negative value is required;
+anything else is refused.
+
+A stalled import-chunk purge (`pipelineHealth.stalledPurges`) is restarted with `sources/import:resumePurge`
+(operator); an import listed in phase `staging` is closed with `runs/mutations:finishRun`, which purges its raw rows.

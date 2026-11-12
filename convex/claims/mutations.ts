@@ -1,7 +1,8 @@
-import { v } from "convex/values";
+import { getConvexSize, v } from "convex/values";
 import type { Id } from "../_generated/dataModel";
 import { mutation, type MutationCtx } from "../_generated/server";
 import { requireRole } from "../_shared/authz";
+import { MAX_CLAIM_TEXT_CHARS, MAX_CLAIM_VALUE_BYTES } from "../_shared/limits";
 import { resolveOrg } from "../_shared/org";
 import { scoringConfigForRead } from "../icp/queries";
 import { markScoreStale } from "../pipeline/stages";
@@ -30,6 +31,14 @@ export async function appendClaimRecord(ctx: MutationCtx, args: AppendClaimArgs)
   if (!(args.confidence >= 0 && args.confidence <= 1)) {
     throw new Error("confidence must be between 0 and 1");
   }
+  // A claim age is computed from this; a NaN or infinite instant would be stored for good (the ledger is append-only).
+  if (!Number.isFinite(args.observedAt)) throw new Error("observedAt must be a finite number (epoch ms)");
+  // Size bounds (see _shared/limits.ts): a claim is read whole, so its size is bounded where it is written. Refused, never
+  // truncated. Measured as Convex measures it, so the bound is in the same unit as the platform's read limit.
+  const valueBytes = getConvexSize(args.value as Parameters<typeof getConvexSize>[0]);
+  if (!(valueBytes <= MAX_CLAIM_VALUE_BYTES)) throw new Error(`claim value is ${valueBytes} bytes; at most ${MAX_CLAIM_VALUE_BYTES} are accepted`);
+  if (args.field.length > MAX_CLAIM_TEXT_CHARS) throw new Error(`claim field must be at most ${MAX_CLAIM_TEXT_CHARS} characters`);
+  if (args.snapshotRef !== undefined && args.snapshotRef.length > MAX_CLAIM_TEXT_CHARS) throw new Error(`claim snapshotRef must be at most ${MAX_CLAIM_TEXT_CHARS} characters`);
   // subjectId is stored as a string, so canonicalize it here: a claim stored under any other
   // spelling would be invisible to its own subject's index reads and silently dropped.
   const subjectId = ctx.db.normalizeId(args.subjectType === "account" ? "accounts" : "contacts", args.subjectId);

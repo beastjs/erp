@@ -60,7 +60,9 @@ export const verifications = defineTable({
   checkedAt: v.number(),
 })
   // The latest verdict on one claim is an exact-key read, newest first.
-  .index("by_org_and_claim", ["orgId", "claimId"]);
+  .index("by_org_and_claim", ["orgId", "claimId"])
+  // Observability (Task 16 L7b): the org's first verdict under given rules, which dates when those rules went live here.
+  .index("by_org_and_logic", ["orgId", "logic", "checkedAt"]);
 
 /*
  * One row per org: how far the re-judge sweep (verify/sweep.ts) has walked under the CURRENT rules. This is what makes

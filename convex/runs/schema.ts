@@ -47,6 +47,11 @@ export const discoveryRuns = defineTable({
    * purge that removes the last of them. A value older than a few minutes means the purge chain died with raw rows left.
    */
   purgePendingSince: v.optional(v.number()),
+  /**
+   * Set by the first `stageImportChunk` (Task 16 L5): this run's file is being staged. A run with this and no
+   * `chunksExpected` whose `progressAt` ages is an import whose action died between staging and `startStagedImport`.
+   */
+  stagedAt: v.optional(v.number()),
 })
   .index("by_org_and_status", ["orgId", "status"])
   .index("by_org_and_purge_pending", ["orgId", "purgePendingSince"]);

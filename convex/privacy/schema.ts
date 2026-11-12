@@ -86,6 +86,11 @@ export const erasures = defineTable({
   attempts: v.optional(v.number()),
   lastError: v.optional(v.string()),
   failedAt: v.optional(v.number()),
+  /**
+   * When an erasure step last COMMITTED (Task 16 L6). Written only by the step itself, in the transaction that does the
+   * work, so it is always the time of the last success; observability judges "overdue" from it, never from `resumeAt`.
+   */
+  progressAt: v.optional(v.number()),
   claimsRedacted: v.number(),
   contactKeysDeleted: v.number(),
   candidatesRedacted: v.number(),

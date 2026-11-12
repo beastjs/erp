@@ -101,6 +101,14 @@ export async function latestVerificationForClaim(ctx: Pick<QueryCtx, "db">, orgI
 }
 
 /**
+ * The org's earliest verdict judged under `logic`, or null. One indexed read, `.first()` on an exact key prefix: nothing
+ * is truncated. Observability uses its time to date when those rules went live in the org (Task 16 L7b).
+ */
+export async function firstVerdictUnderLogic(ctx: Pick<QueryCtx, "db">, orgId: Id<"orgs">, logic: number): Promise<Doc<"verifications"> | null> {
+  return await ctx.db.query("verifications").withIndex("by_org_and_logic", (q) => q.eq("orgId", orgId).eq("logic", logic)).first();
+}
+
+/**
  * For each verifiable field the contact projects NOW, a verdict on its claim that FAILED after `since` and that the
  * verdict standing at `since` did not already say: a failure a score taken at `since` never counted. Returns the
  * kinds, `[]` when there are none. A fail re-judged as a fail under new rules is not news (the score already halved

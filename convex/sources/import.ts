@@ -181,6 +181,10 @@ export const stageImportChunk = internalMutation({
     const stale = await ctx.db.query("importChunks").withIndex("by_run_and_seq", (q) => q.eq("runId", run._id).eq("seq", args.seq)).first();
     if (stale) await ctx.db.delete(stale._id);
     await ctx.db.insert("importChunks", args);
+    // Mark the run as a staged import in progress, so an action that dies before `startStagedImport` leaves a run that
+    // pipelineHealth can list (phase `staging`), instead of raw rows on a `running` run that no listing names.
+    const now = Date.now();
+    await ctx.db.patch(run._id, { stagedAt: run.stagedAt ?? now, progressAt: now });
     return null;
   },
 });
@@ -227,9 +231,31 @@ export const resumeImport = mutation({
         candidateIds: pending.slice(i, i + INGEST_BATCH).map((c) => c._id),
       });
     }
-    const next = await ctx.db.query("importChunks").withIndex("by_run_and_seq", (q) => q.eq("runId", run._id)).first();
+    // A run whose size was never declared (its importing action died while staging) cannot be finished by the chain, which
+    // runs to `chunksExpected`: importing part of the file would be worse than none. finishRun closes it and purges the rows.
+    const next =
+      run.chunksExpected === undefined ? null : await ctx.db.query("importChunks").withIndex("by_run_and_seq", (q) => q.eq("runId", run._id)).first();
     if (next) await ctx.scheduler.runAfter(0, internal.sources.import.processStagedChunk, { orgId, runId: run._id, seq: next.seq });
     return { resumedAt: next?.seq ?? null, rearmedCandidates: pending.length };
+  },
+});
+
+/**
+ * Restarts the purge of a FINISHED run's staged raw rows, when its chain stopped (pipelineHealth `stalledPurges`). Role:
+ * operator, who closes runs (`finishRun`) and so already starts this purge. Refuses a running run: its rows are still to
+ * be imported. Runs the same purge as the end of a run (`purgeStagedChunks`), one transaction's worth now and a
+ * continuation for the rest. Safe to call twice, or on a run with nothing left: deleting a chunk is the only effect, a
+ * chunk is deleted at most once, and two chains over the same run simply find less to do. Returns whether rows remain.
+ */
+export const resumePurge = mutation({
+  args: { runId: v.id("discoveryRuns") },
+  handler: async (ctx, args): Promise<{ remaining: boolean }> => {
+    const { orgId } = await requireRole(ctx, "operator");
+    const run = await loadRun(ctx, orgId, args.runId);
+    if (run.status === "running") throw new Error("run_still_running: a running run's staged rows are still to be imported");
+    const done = await purgeStagedChunksFor(ctx, run);
+    if (!done) await ctx.scheduler.runAfter(0, internal.sources.import.purgeStagedChunks, { orgId, runId: run._id });
+    return { remaining: !done };
   },
 });
 

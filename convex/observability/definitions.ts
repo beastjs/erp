@@ -1,4 +1,5 @@
 import type { QueryCtx } from "../_generated/server";
+import { CONVEX_READ_LIMIT_BYTES, MAX_CLAIM_DOC_BYTES } from "../_shared/limits";
 
 /*
  * Spec 10 / TECH.md: metric definitions travel with the metrics, and an observed value is told apart from a modelled
@@ -8,6 +9,8 @@ import type { QueryCtx } from "../_generated/server";
  *   basis     observed: counted from stored rows. modelled: an estimate of a population from a declared sample.
  *   coverage  exact:       the whole population was read.
  *             lower_bound: a count over a bounded read; when the bound was hit the value says `at_least` (see Count).
+ *             upper_bound: a ratio whose denominator is such a count; exact unless that count is at_least, and then
+ *                          the value is at most this (its companion field says `at_most`).
  *             sample:      computed over a declared sample, named in the definition.
  *             listing:     a bounded list of examples; its `more` flag says when there are others.
  *
@@ -17,7 +20,7 @@ import type { QueryCtx } from "../_generated/server";
  */
 
 export type Basis = "observed" | "modelled";
-export type Coverage = "exact" | "lower_bound" | "sample" | "listing";
+export type Coverage = "exact" | "lower_bound" | "upper_bound" | "sample" | "listing";
 export type MetricDefinition = { readonly definition: string; readonly basis: Basis; readonly coverage: Coverage };
 
 /** A count that is either exact or a stated lower bound. Never a bare number that might be short. */
@@ -27,8 +30,23 @@ export type Count = { value: number; bound: "exact" | "at_least" };
 export const COUNT_CAP = 500;
 /** Example rows a listing returns; `more` says whether there are others. */
 export const LIST_CAP = 25;
-/** Newest claims the data-quality sample reads (a claim can be a few KB; this keeps the query far inside its limits). */
+/** Newest claims the data-quality sample reads at most, when its byte budget allows (see QUALITY_CLAIM_READ_BUDGET). */
 export const QUALITY_SAMPLE = 500;
+/**
+ * Bytes of claims the data-quality sample may read. Claims are read whole and a claim document can be as large as
+ * MAX_CLAIM_DOC_BYTES (668,676: see _shared/limits.ts), so a fixed count cannot be safe: QUALITY_SAMPLE + 1 claims of
+ * that size is about 335 MB against a 16 MiB read limit. The sample therefore reads page by page, each page no more
+ * claims than the budget left could hold at MAX_CLAIM_DOC_BYTES each, and stops when no further claim is sure to fit:
+ *   claims       14 MiB = 14,680,064 bytes -> at least floor(14,680,064 / 668,676) = 21 maximum-size claims; 500 ordinary ones
+ *   verdicts      1 MiB reserved for at most one verification row per sampled claim (each well under 1 KB)
+ *   everything else (membership, org): the remaining 1 MiB of CONVEX_READ_LIMIT_BYTES (16 MiB).
+ * Pinned by observability/quality.test.ts.
+ */
+export const QUALITY_CLAIM_READ_BUDGET = 14 * 1024 * 1024;
+export const QUALITY_VERDICT_RESERVE = 1024 * 1024;
+if (QUALITY_CLAIM_READ_BUDGET + QUALITY_VERDICT_RESERVE >= CONVEX_READ_LIMIT_BYTES || QUALITY_CLAIM_READ_BUDGET < MAX_CLAIM_DOC_BYTES) {
+  throw new Error("the data-quality read budget does not fit the read limit, or cannot hold one claim");
+}
 /** Pipeline rows of ONE run that a run metric reads. */
 export const RUN_SCAN_CAP = 1000;
 /** Refusal buckets one refusalCounts read returns; past that `more` is true and `total` is at_least. */
@@ -45,9 +63,13 @@ export async function countUpTo(q: { take(n: number): Promise<unknown[]> }, cap 
 /** A tally over a read that may have stopped at its cap: every count from it is a lower bound when it did. */
 export const tally = (value: number, truncated: boolean): Count => ({ value, bound: truncated ? "at_least" : "exact" });
 
-/** Median of finite numbers; 0 for an empty set (spec: never NaN). Non-finite inputs are the caller's to exclude. */
+/**
+ * Median; 0 for an empty set (spec: never NaN). Fails closed on a non-finite input instead of dropping it, so a median
+ * is always over exactly the values its caller counted (appendClaim refuses a non-finite observedAt, so none arrives).
+ */
 export function median(values: readonly number[]): number {
-  const xs = values.filter((x) => Number.isFinite(x)).sort((a, b) => a - b);
+  if (!values.every((x) => Number.isFinite(x))) throw new Error("median: every value must be a finite number");
+  const xs = [...values].sort((a, b) => a - b);
   if (xs.length === 0) return 0;
   const mid = Math.floor(xs.length / 2);
   return xs.length % 2 === 1 ? xs[mid]! : (xs[mid - 1]! + xs[mid]!) / 2;
@@ -99,16 +121,16 @@ export const METRIC_DEFINITIONS = {
     coverage: "lower_bound",
   },
   "costPerQualifiedLead.costPerLead": {
-    definition: "credits / qualified. Null when nothing qualified (never Infinity or NaN). When qualified is at_least, this is an upper bound and costBound says at_most.",
+    definition: "credits / qualified. Null when nothing qualified (never Infinity or NaN). Exact when qualified is exact; when qualified is at_least, this is an UPPER bound and costBound says at_most.",
     basis: "observed",
-    coverage: "lower_bound",
+    coverage: "upper_bound",
   },
   "costPerQualifiedLead.costBound": { definition: "exact, or at_most when qualified is a lower bound.", basis: "observed", coverage: "exact" },
 
   // ------------------------------------------------------------------------------------------------- dataQuality
   "dataQuality.asOf": { definition: "The instant ages are measured from, as the caller passed it.", basis: "observed", coverage: "exact" },
   "dataQuality.sample": {
-    definition: `What the other dataQuality numbers were computed over: the org's newest ${QUALITY_SAMPLE} claims by creation (whole_ledger when the org has no more than that), with redacted claims excluded. claimsCounted is how many remained.`,
+    definition: `What the other dataQuality numbers were computed over: the org's newest claims by creation, at most ${QUALITY_SAMPLE} and at most what a ${QUALITY_CLAIM_READ_BUDGET}-byte read budget is sure to hold (fewer when claims are large); claimsRead is how many were read. scope is whole_ledger only when the read reached the org's oldest claim, newest_sample otherwise. Redacted claims are then excluded; claimsCounted is how many remained, and every other number is over exactly those.`,
     basis: "observed",
     coverage: "exact",
   },
@@ -124,7 +146,7 @@ export const METRIC_DEFINITIONS = {
   },
   "dataQuality.verificationsJudged": { definition: "The denominator of verificationPassRate.", basis: "observed", coverage: "sample" },
   "dataQuality.medianClaimAgeDays": {
-    definition: "Median over the sample of (asOf - observedAt) in days. 0 for an empty sample. A source that dates a claim in the future gives a negative age; it is not clamped.",
+    definition: "Median over the counted claims (sample.claimsCounted, all of them: every stored observedAt is finite) of (asOf - observedAt) in days. 0 for an empty sample. A source that dates a claim in the future gives a negative age; it is not clamped.",
     basis: "modelled",
     coverage: "sample",
   },
@@ -143,27 +165,31 @@ export const METRIC_DEFINITIONS = {
     basis: "observed",
     coverage: "listing",
   },
-  "pipelineHealth.stalledErasures": {
-    definition: "Incomplete erasures that have failed at least once (attempts > 0): id, subject type, attempts, time of last failure. Never the error text or the subject.",
-    basis: "observed",
-    coverage: "listing",
-  },
   "pipelineHealth.stalledPurges": {
     definition: "Finished runs whose staged raw import rows were still being purged longer than purgeStalledAfterMs ago: the purge chain stopped with raw rows left.",
     basis: "observed",
     coverage: "listing",
   },
   "pipelineHealth.stalledImports": {
-    definition: "Running staged imports with chunks still to process and no counter movement for longer than importStalledAfterMs: the chunk chain stopped. resumeImport restarts it.",
+    definition: "Running staged imports that have not moved for longer than importStalledAfterMs, each with the phase that stopped (a closed set): staging (the file was staged but its size never declared: the importing action died; finishRun closes the run and purges its staged rows, and the file is imported again into a new run), chunks (chunks still to process: the chunk chain stopped; resumeImport restarts it) or ingest (every chunk processed, but not every inserted candidate consumed or rejected: the ingest batches stopped; resumeImport re-arms the pending candidates, a bounded slice per call). chunksExpected is null in staging.",
     basis: "observed",
     coverage: "listing",
   },
   "pipelineHealth.verificationSweep": {
-    definition: "The org's re-judge walk under the current verification rules: not_started, walking, lapsed (no slice has committed for longer than sweepLapsedAfterMs, so the slice is failing on every tick) or done; and the subjects this walk passed over because their rewind threw, with the latest one.",
+    definition: "The org's re-judge walk under the current verification rules: not_started, walking, lapsed or done. lapsed: work has been due for longer than sweepLapsedAfterMs with no slice committing, either because a started walk's slice fails on every tick, or because the cron never reached the org (no walk at all, judged from the org's creation; or a walk under older rules, judged from the org's first verdict under today's rules). not_started: due, but not yet for that long, or nothing says since when. Also the subjects this walk passed over because their rewind threw, and the latest of them, or null when that contact has since been erased.",
     basis: "observed",
     coverage: "exact",
   },
   "pipelineHealth.thresholds": { definition: "The staleness thresholds the listings above were judged with, in milliseconds.", basis: "observed", coverage: "exact" },
+
+  // --------------------------------------------------------------------------------------- stalledErasures (admin)
+  "stalledErasures.asOf": { definition: "The instant staleness is judged at, as the caller passed it.", basis: "observed", coverage: "exact" },
+  "stalledErasures.stalled": {
+    definition: "Incomplete erasures that have failed at least once (attempts > 0), or are overdue: no erasure step has COMMITTED for longer than overdueAfterMs (judged from the progress stamp each committed step writes, never from resumeAt, which the sweeper pushes forward on every pass whether or not the work then succeeds). Either kind may have zero attempts. Each: erasure id, subject type, attempts, time of last recorded failure, time of last committed step, overdue. Never the error text or the subject. Admin only.",
+    basis: "observed",
+    coverage: "listing",
+  },
+  "stalledErasures.overdueAfterMs": { definition: "The threshold overdue was judged with, in milliseconds.", basis: "observed", coverage: "exact" },
 
   // ----------------------------------------------------------------------------------------------- refusalCounts
   "refusalCounts.fromHour": { definition: "First hour of the window (epoch ms of an hour start), as the caller passed it.", basis: "observed", coverage: "exact" },

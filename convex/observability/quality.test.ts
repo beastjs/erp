@@ -105,7 +105,7 @@ async function realQualifiedLead() {
   await t.mutation(api.signals.mutations.recordSignals, {
     signals: [{ subjectType: "account", subjectId: accountId, kind: "funding", strength: "high", confidence: 1, observedAt: Date.now() - DAY_MS, sourceId: claimSource, externalId: "round-1" }],
   });
-  const runId = await admin.mutation(api.runs.mutations.startRun, { sourceId: claimSource, creditBudget: 10 });
+  const runId = await admin.action(api.runs.mutations.startRun, { sourceId: claimSource, creditBudget: 10 });
   await t.mutation(api.pipeline.stages.startPipeline, { subjectType: "contact", subjectId: contact._id, runId });
   await drain();
   const st = (await raw.run((ctx) => ctx.db.query("pipelineState").collect())).find((s) => s.subjectId === contact._id)!;
@@ -447,6 +447,7 @@ describe("METRIC_DEFINITIONS", () => {
       ...keysOf("costPerQualifiedLead", await t.query(api.observability.runs.costPerQualifiedLead, { runId })),
       ...keysOf("dataQuality", await t.query(api.observability.quality.dataQuality, { asOf: NOW })),
       ...keysOf("pipelineHealth", await health()),
+      ...keysOf("refusalCounts", await (await asMember(raw, "ad", orgId, "admin")).query(api.observability.refusals.refusalCounts, { fromHour: 0, toHour: 0 })),
     ];
     expect(returned.length).toBeGreaterThan(20); // the walk is over real results, not nothing
     for (const key of returned) expect(METRIC_DEFINITIONS, key).toHaveProperty([key]);

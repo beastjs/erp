@@ -1,9 +1,11 @@
 import { v } from "convex/values";
-import { internalMutation, mutation, query } from "../_generated/server";
+import { internal } from "../_generated/api";
+import { action, internalMutation, query } from "../_generated/server";
 import { role as roleValidator } from "../_shared/actor";
 import { requireRole, systemActor } from "../_shared/authz";
 import { withTrustedOrgForInternalOnly } from "../_shared/org";
 import { writeAudit } from "../audit/log";
+import { recordRefusals } from "../observability/refusals";
 
 /**
  * Sets (grants, or changes) a user's role in the caller's org. Role: `admin` (spec 7.1: admin manages users). The
@@ -16,8 +18,17 @@ import { writeAudit } from "../audit/log";
  * What it does NOT guarantee: that the org keeps the admin it has. `bootstrapMember` (internal, run by an operator of
  * the DEPLOYMENT) can set any role, including demoting the last admin, and it is also the way back from any lockout.
  * (Pinned by the walk in authz.test.ts.)
+ *
+ * A public ACTION so that an authorization refusal can be recorded (observability/refusals.ts); the work, and the role
+ * check, run in `setMemberRoleTxn` with the caller's identity. Call it with `useAction`.
  */
-export const setMemberRole = mutation({
+export const setMemberRole = action({
+  args: { userId: v.string(), role: roleValidator },
+  handler: async (ctx, args): Promise<null> => await recordRefusals(ctx, "setMemberRole", () => ctx.runMutation(internal.members.api.setMemberRoleTxn, args)),
+});
+
+/** The work of `setMemberRole`, in one transaction. Internal: reachable only through the action above. */
+export const setMemberRoleTxn = internalMutation({
   args: { userId: v.string(), role: roleValidator },
   handler: async (ctx, args): Promise<null> => {
     const { orgId, actor, userId } = await requireRole(ctx, "admin");

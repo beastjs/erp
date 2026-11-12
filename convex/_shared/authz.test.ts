@@ -60,10 +60,24 @@ describe("requireRole: fails closed", () => {
     for (const bad of ["root", "ADMIN", "", "operator ", null, undefined, 3]) {
       const ctx = {
         auth: { getUserIdentity: async () => ({ tokenIdentifier: tokenOf("m"), orgId }) },
-        db: { normalizeId: (_t: string, id: string) => id, query: () => ({ withIndex: () => ({ unique: async () => ({ role: bad }) }) }) },
+        db: { normalizeId: (_t: string, id: string) => id, query: () => ({ withIndex: () => ({ take: async () => [{ role: bad }] }) }) },
       };
       for (const need of ROLES) await expect(requireRole(ctx as never, need)).rejects.toThrow("malformed membership");
     }
+  });
+
+  test("every membership refusal carries its typed reason, which is what refusal recording classifies by", async () => {
+    const reasonOf = (p: Promise<unknown>) => p.then(() => "resolved", (e: { data?: unknown }) => e.data);
+    expect(await reasonOf((await as("nobody", null)).run((ctx) => requireRole(ctx, "operator")))).toEqual({ code: "forbidden", reason: "not_member" });
+    expect(await reasonOf((await as("op", "operator")).run((ctx) => requireRole(ctx, "admin")))).toEqual({ code: "forbidden", reason: "insufficient_role" });
+    await grant(raw, orgId, "dup", "operator");
+    await grant(raw, orgId, "dup", "admin");
+    expect(await reasonOf(raw.withIdentity({ subject: "dup", orgId }).run((ctx) => requireRole(ctx, "operator")))).toEqual({ code: "forbidden", reason: "malformed_membership" });
+    const noToken = { auth: { getUserIdentity: async () => ({ orgId }) }, db: { normalizeId: (_t: string, id: string) => id } };
+    expect(await reasonOf(requireRole(noToken as never, "operator"))).toEqual({ code: "forbidden", reason: "no_identity" });
+    // not an authorization refusal: no org to count it against, and a call-site typo
+    expect(await reasonOf(raw.run((ctx) => requireRole(ctx, "operator")))).toBeUndefined();
+    expect(await reasonOf((await as("ad", "admin")).run((ctx) => requireRole(ctx, "root" as never)))).toBeUndefined();
   });
 
   test("an unknown REQUIRED role is refused: a typo at a call site must not mean 'anyone'", async () => {
@@ -107,9 +121,9 @@ const calls: Array<{ name: string; min: Role; call: (t: ReturnType<typeof raw.wi
   { name: "listDeadLetters (work the dead-letter queue)", min: "operator", call: (t) => t.query(api.pipeline.deadletter.listDeadLetters, { paginationOpts: { numItems: 5, cursor: null } }) },
   { name: "createModel (edit scoring models)", min: "analyst", call: (t) => t.mutation(api.icp.api.createModel, modelArgs()) },
   { name: "createIcp (edit ICP definitions)", min: "analyst", call: (t) => t.mutation(api.icp.api.createIcp, { name: "ICP", criteria: { industries: [], geographies: [], technologies: [], decisionMakerRoles: [] } }) },
-  { name: "registerSource (manage sources)", min: "admin", call: (t) => t.mutation(api.sources.mutations.registerSource, { key: "crm", kind: "crm", trustWeight: 0.5, lawfulBasis: "consent" }) },
-  { name: "setMemberRole (manage users)", min: "admin", call: (t) => t.mutation(api.members.api.setMemberRole, { userId: "someone-else", role: "operator" }) },
-  { name: "recentAudit (read the audit log)", min: "admin", call: (t) => t.query(api.audit.api.recentAudit, { paginationOpts: { numItems: 5, cursor: null } }) },
+  { name: "registerSource (manage sources)", min: "admin", call: (t) => t.action(api.sources.mutations.registerSource, { key: "crm", kind: "crm", trustWeight: 0.5, lawfulBasis: "consent" }) },
+  { name: "setMemberRole (manage users)", min: "admin", call: (t) => t.action(api.members.api.setMemberRole, { userId: "someone-else", role: "operator" }) },
+  { name: "recentAudit (read the audit log)", min: "admin", call: (t) => t.action(api.audit.api.recentAudit, { paginationOpts: { numItems: 5, cursor: null } }) },
 ];
 
 describe("the matrix of spec 7.1, as enforced", () => {
@@ -123,19 +137,19 @@ describe("the matrix of spec 7.1, as enforced", () => {
 
   test("starting a run sets its credit budget, so it is admin: an operator and an analyst are refused", async () => {
     const admin = await as("ad", "admin");
-    const sourceId = await admin.mutation(api.sources.mutations.registerSource, { key: "crm", kind: "crm", trustWeight: 0.5, lawfulBasis: "consent" });
+    const sourceId = await admin.action(api.sources.mutations.registerSource, { key: "crm", kind: "crm", trustWeight: 0.5, lawfulBasis: "consent" });
     for (const role of ["operator", "analyst"] as const) {
       const t = await as(`u-${role}`, role);
-      await expect(t.mutation(api.runs.mutations.startRun, { sourceId, creditBudget: 10 })).rejects.toThrow("forbidden");
+      await expect(t.action(api.runs.mutations.startRun, { sourceId, creditBudget: 10 })).rejects.toThrow("forbidden");
     }
-    await expect(admin.mutation(api.runs.mutations.startRun, { sourceId, creditBudget: 10 })).resolves.toBeTruthy();
+    await expect(admin.action(api.runs.mutations.startRun, { sourceId, creditBudget: 10 })).resolves.toBeTruthy();
   });
 
   test("an operator can still work a run an admin opened: spend, finish and read it", async () => {
     const admin = await as("ad", "admin");
     const op = await as("op", "operator");
-    const sourceId = await admin.mutation(api.sources.mutations.registerSource, { key: "crm", kind: "crm", trustWeight: 0.5, lawfulBasis: "consent" });
-    const runId = await admin.mutation(api.runs.mutations.startRun, { sourceId, creditBudget: 10 });
+    const sourceId = await admin.action(api.sources.mutations.registerSource, { key: "crm", kind: "crm", trustWeight: 0.5, lawfulBasis: "consent" });
+    const runId = await admin.action(api.runs.mutations.startRun, { sourceId, creditBudget: 10 });
     await op.mutation(api.runs.mutations.consumeCredits, { runId, credits: 1 });
     await op.mutation(api.runs.mutations.finishRun, { runId });
     expect((await op.query(api.runs.queries.getRun, { runId })).status).toBe("completed");
@@ -143,11 +157,11 @@ describe("the matrix of spec 7.1, as enforced", () => {
 
   test("an admin may change another user's role but never their own", async () => {
     const admin = await as("ad", "admin");
-    await expect(admin.mutation(api.members.api.setMemberRole, { userId: tokenOf("ad"), role: "operator" })).rejects.toThrow("own role");
-    await admin.mutation(api.members.api.setMemberRole, { userId: tokenOf("new"), role: "analyst" });
+    await expect(admin.action(api.members.api.setMemberRole, { userId: tokenOf("ad"), role: "operator" })).rejects.toThrow("own role");
+    await admin.action(api.members.api.setMemberRole, { userId: tokenOf("new"), role: "analyst" });
     const created = await raw.withIdentity({ subject: "new", orgId }).query(api.members.api.myRole, {});
     expect(created).toBe("analyst");
-    await admin.mutation(api.members.api.setMemberRole, { userId: tokenOf("new"), role: "operator" });
+    await admin.action(api.members.api.setMemberRole, { userId: tokenOf("new"), role: "operator" });
     expect(await raw.withIdentity({ subject: "new", orgId }).query(api.members.api.myRole, {})).toBe("operator");
   });
 
@@ -155,7 +169,7 @@ describe("the matrix of spec 7.1, as enforced", () => {
     const admin = await as("ad", "admin");
     const user = await as("u", "analyst");
     await user.mutation(api.icp.api.createIcp, { name: "ICP", criteria: { industries: [], geographies: [], technologies: [], decisionMakerRoles: [] } });
-    await admin.mutation(api.members.api.setMemberRole, { userId: tokenOf("u"), role: "operator" });
+    await admin.action(api.members.api.setMemberRole, { userId: tokenOf("u"), role: "operator" });
     await expect(user.mutation(api.icp.api.createModel, modelArgs())).rejects.toThrow("forbidden");
   });
 
@@ -163,10 +177,10 @@ describe("the matrix of spec 7.1, as enforced", () => {
     const mine = await as("ad", "admin");
     const other = await raw.run((ctx) => ctx.db.insert("orgs", { name: "Org 2", createdAt: 0 }));
     const theirs = await as("them", "admin", other);
-    const sourceId = await theirs.mutation(api.sources.mutations.registerSource, { key: "crm", kind: "crm", trustWeight: 0.5, lawfulBasis: "consent" });
-    const runId = await theirs.mutation(api.runs.mutations.startRun, { sourceId, creditBudget: 1 });
+    const sourceId = await theirs.action(api.sources.mutations.registerSource, { key: "crm", kind: "crm", trustWeight: 0.5, lawfulBasis: "consent" });
+    const runId = await theirs.action(api.runs.mutations.startRun, { sourceId, creditBudget: 1 });
     await expect(mine.query(api.runs.queries.getRun, { runId })).rejects.toThrow("run not found");
-    const audit = await mine.query(api.audit.api.recentAudit, { paginationOpts: { numItems: 50, cursor: null } });
+    const audit = await mine.action(api.audit.api.recentAudit, { paginationOpts: { numItems: 50, cursor: null } });
     expect(audit.page.every((r) => r.orgId === orgId)).toBe(true);
     expect(audit.page.some((r) => r.targetId === runId)).toBe(false);
   });
@@ -175,7 +189,7 @@ describe("the matrix of spec 7.1, as enforced", () => {
     const users = ["A", "B", "C", "D"];
     const t = Object.fromEntries(await Promise.all(users.map(async (u) => [u, await as(u, u === "A" || u === "B" ? "admin" : "operator")])));
     const adminCount = async () => (await raw.run((ctx) => ctx.db.query("memberships").collect())).filter((m) => m.role === "admin").length;
-    const set = (by: string, target: string, role: Role) => t[by]!.mutation(api.members.api.setMemberRole, { userId: tokenOf(target), role }).then(() => true, () => false);
+    const set = (by: string, target: string, role: Role) => t[by]!.action(api.members.api.setMemberRole, { userId: tokenOf(target), role }).then(() => true, () => false);
     expect(await set("A", "C", "admin")).toBe(true);
     expect(await set("C", "A", "operator")).toBe(true);
     expect(await set("C", "B", "operator")).toBe(true);

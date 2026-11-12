@@ -441,7 +441,7 @@ describe("an active subject with nothing scheduled", () => {
 describe("budget exhaustion", () => {
   test("marks the run failed with budget_exhausted, and refuses the subject without queueing it", async () => {
     const { contactId, sourceId } = await ingestLead();
-    const runId = await t.mutation(api.runs.mutations.startRun, { sourceId, creditBudget: 0 });
+    const runId = await t.action(api.runs.mutations.startRun, { sourceId, creditBudget: 0 });
     const out = await t.mutation(api.pipeline.stages.startPipeline, { subjectType: "contact", subjectId: contactId, runId });
     expect(out).toEqual({ refused: "budget_exhausted" });
     expect(await t.query(api.runs.queries.getRun, { runId })).toMatchObject({ status: "failed", failureReason: "budget_exhausted", creditsUsed: 0 });

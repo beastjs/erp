@@ -406,7 +406,7 @@ describe("enqueue", () => {
 
   test("refuses rather than queues when the run's budget is spent", async () => {
     const sourceId = (await seed()).sourceId;
-    const runId = await t.mutation(api.runs.mutations.startRun, { sourceId, creditBudget: 2 });
+    const runId = await t.action(api.runs.mutations.startRun, { sourceId, creditBudget: 2 });
     const subjects = [await seed(), await seed(), await seed()];
     await t.mutation(api.pipeline.stages.startPipeline, { subjectType: "contact", subjectId: subjects[0]!.contactId, runId });
     await t.mutation(api.pipeline.stages.startPipeline, { subjectType: "contact", subjectId: subjects[1]!.contactId, runId });

@@ -178,16 +178,16 @@ describe("what gets audited, with before and after", () => {
   test("a change whose entry cannot be written does not happen", async () => {
     const t = await asMember(raw, "ad", orgId, "admin");
     // trustWeight 0.5 is fine; a source whose audit fields were rejected would roll the source back too
-    const sourceId = await t.mutation(api.sources.mutations.registerSource, { key: "crm", kind: "crm", trustWeight: 0.5, lawfulBasis: "consent" });
+    const sourceId = await t.action(api.sources.mutations.registerSource, { key: "crm", kind: "crm", trustWeight: 0.5, lawfulBasis: "consent" });
     expect(await rows()).toMatchObject([{ action: "source.registered", targetId: sourceId, after: { kind: "crm", trustWeight: 0.5, lawfulBasis: "consent" } }]);
   });
 
   test("starting a run records its budget; role changes record the old and new role", async () => {
     const t = await asMember(raw, "ad", orgId, "admin");
-    const sourceId = await t.mutation(api.sources.mutations.registerSource, { key: "crm", kind: "crm", trustWeight: 0.5, lawfulBasis: "consent" });
-    const runId = await t.mutation(api.runs.mutations.startRun, { sourceId, creditBudget: 250 });
-    await t.mutation(api.members.api.setMemberRole, { userId: tokenOf("x"), role: "operator" });
-    await t.mutation(api.members.api.setMemberRole, { userId: tokenOf("x"), role: "analyst" });
+    const sourceId = await t.action(api.sources.mutations.registerSource, { key: "crm", kind: "crm", trustWeight: 0.5, lawfulBasis: "consent" });
+    const runId = await t.action(api.runs.mutations.startRun, { sourceId, creditBudget: 250 });
+    await t.action(api.members.api.setMemberRole, { userId: tokenOf("x"), role: "operator" });
+    await t.action(api.members.api.setMemberRole, { userId: tokenOf("x"), role: "analyst" });
     const log = await rows();
     expect(log.find((r) => r.action === "run.started")).toMatchObject({ targetId: runId, after: { creditBudget: 250 } });
     const roles = log.filter((r) => r.action === "member.role_set");
@@ -205,23 +205,23 @@ describe("what gets audited, with before and after", () => {
 describe("reading the log", () => {
   test("is admin-only and paginated, so a growing log is never silently cut short", async () => {
     const admin = await asMember(raw, "ad", orgId, "admin");
-    await admin.mutation(api.sources.mutations.registerSource, { key: "a", kind: "crm", trustWeight: 0.5, lawfulBasis: "consent" });
-    await admin.mutation(api.sources.mutations.registerSource, { key: "b", kind: "crm", trustWeight: 0.5, lawfulBasis: "consent" });
-    await admin.mutation(api.sources.mutations.registerSource, { key: "c", kind: "crm", trustWeight: 0.5, lawfulBasis: "consent" });
+    await admin.action(api.sources.mutations.registerSource, { key: "a", kind: "crm", trustWeight: 0.5, lawfulBasis: "consent" });
+    await admin.action(api.sources.mutations.registerSource, { key: "b", kind: "crm", trustWeight: 0.5, lawfulBasis: "consent" });
+    await admin.action(api.sources.mutations.registerSource, { key: "c", kind: "crm", trustWeight: 0.5, lawfulBasis: "consent" });
     const seen: string[] = [];
     let cursor: string | null = null;
     for (let i = 0; i < 10; i++) {
-      const page: { page: Doc<"auditLog">[]; isDone: boolean; continueCursor: string } = await admin.query(api.audit.api.recentAudit, { paginationOpts: { numItems: 1, cursor } });
+      const page: { page: Doc<"auditLog">[]; isDone: boolean; continueCursor: string } = await admin.action(api.audit.api.recentAudit, { paginationOpts: { numItems: 1, cursor } });
       seen.push(...page.page.map((r) => r._id));
       if (page.isDone) break;
       cursor = page.continueCursor;
     }
     expect(seen).toHaveLength(3);
     const first = (await rows())[0]!;
-    const forTarget = await admin.query(api.audit.api.auditForTarget, { targetTable: "sources", targetId: first.targetId, paginationOpts: { numItems: 10, cursor: null } });
+    const forTarget = await admin.action(api.audit.api.auditForTarget, { targetTable: "sources", targetId: first.targetId, paginationOpts: { numItems: 10, cursor: null } });
     expect(forTarget.page).toHaveLength(1);
     const op = await asMember(raw, "op", orgId, "operator");
-    await expect(op.query(api.audit.api.recentAudit, { paginationOpts: { numItems: 1, cursor: null } })).rejects.toThrow("forbidden");
-    await expect(op.query(api.audit.api.auditForTarget, { targetTable: "sources", targetId: first.targetId, paginationOpts: { numItems: 1, cursor: null } })).rejects.toThrow("forbidden");
+    await expect(op.action(api.audit.api.recentAudit, { paginationOpts: { numItems: 1, cursor: null } })).rejects.toThrow("forbidden");
+    await expect(op.action(api.audit.api.auditForTarget, { targetTable: "sources", targetId: first.targetId, paginationOpts: { numItems: 1, cursor: null } })).rejects.toThrow("forbidden");
   });
 });

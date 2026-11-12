@@ -76,7 +76,7 @@ export type AuditAction = keyof typeof AUDIT_ACTIONS;
 export type AuditFields = Readonly<Record<string, string | number | boolean | null>>;
 
 /** True when `value` is inside `domain`. A domain that is not one of the three shapes admits NOTHING (fails closed). */
-function inDomain(domain: unknown, value: unknown): boolean {
+export function inDomain(domain: unknown, value: unknown): boolean {
   const d = domain as { enum?: unknown; int?: unknown; number?: unknown } | null | undefined;
   if (d && Array.isArray(d.enum)) return typeof value === "string" && d.enum.includes(value);
   const range = d && (Array.isArray(d.int) ? d.int : Array.isArray(d.number) ? d.number : undefined);

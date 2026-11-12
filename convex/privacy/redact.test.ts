@@ -809,7 +809,7 @@ describe("audit log: populated, append-only, and holding none of the subject's d
     return w;
   }
   const requestErasure = (id: string) =>
-    t.mutation(api.privacy.api.requestErasure, { subjectType: "contact", subjectId: id, reasonCode: "data_subject_request", legalBasis: "gdpr_art17_erasure", reference: "CASE-1001" });
+    t.action(api.privacy.api.requestErasure, { subjectType: "contact", subjectId: id, reasonCode: "data_subject_request", legalBasis: "gdpr_art17_erasure", reference: "CASE-1001" });
 
   test("the world really does populate the audit log, from a person AND from the system", async () => {
     await auditedWorld();

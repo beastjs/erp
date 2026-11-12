@@ -107,3 +107,13 @@ npx convex run members/api:bootstrapMember '{"orgId": "<orgs _id>", "userId": "<
 `userId` is the identity's `tokenIdentifier` (issuer and subject joined by `|`, e.g. `https://your-issuer.example|user_123`),
 not the bare subject. The org the caller acts in comes from the `orgId` claim on their token and must be that same `_id`.
 Add `--prod` to target production. After this, the admin grants everyone else through `members/api:setMemberRole`.
+
+## Admin-tier functions are actions
+
+These seven are public **actions**, not mutations or queries, so that an authorization refusal can be recorded
+(`observability/refusals.ts`; read with `observability/refusals:refusalCounts`): `members/api:setMemberRole`,
+`privacy/api:requestErasure`, `privacy/api:suppressIdentifier`, `runs/mutations:startRun`,
+`sources/mutations:registerSource`, `audit/api:recentAudit`, `audit/api:auditForTarget`. Clients must call them as
+actions (`useAction`, `client.action`, `npx convex run` works unchanged). `recentAudit` and `auditForTarget` are
+therefore **not reactive**: fetch again to see new entries. An authorization refusal arrives as a `ConvexError` whose
+`data` is `{ code: "forbidden", reason }`; match on `data`, not on the message text.

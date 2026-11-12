@@ -1,10 +1,11 @@
 import { v } from "convex/values";
 import { internal } from "../_generated/api";
 import type { Doc, Id } from "../_generated/dataModel";
-import { mutation, type MutationCtx } from "../_generated/server";
+import { action, internalMutation, mutation, type MutationCtx } from "../_generated/server";
 import { MAX_CREDIT_BUDGET } from "../_shared/limits";
 import { requireRole } from "../_shared/authz";
 import { writeAudit } from "../audit/log";
+import { recordRefusals } from "../observability/refusals";
 
 
 export type RunCounter =
@@ -143,9 +144,19 @@ export async function trySpendCredits(ctx: MutationCtx, orgId: Id<"orgs">, runId
   return { remaining: remaining - credits };
 }
 
-export const startRun = mutation({
+/**
+ * Starts a discovery run with a credit budget. Role: `admin`. A public ACTION so that an authorization refusal can be
+ * recorded (observability/refusals.ts); the work and the role check run in `startRunTxn` with the caller's identity.
+ */
+export const startRun = action({
   args: { sourceId: v.id("sources"), icpVersionId: v.optional(v.id("icpDefinitions")), creditBudget: v.number() },
-  handler: async (ctx, args) => {
+  handler: async (ctx, args): Promise<Id<"discoveryRuns">> => await recordRefusals(ctx, "startRun", () => ctx.runMutation(internal.runs.mutations.startRunTxn, args)),
+});
+
+/** The work of `startRun`, in one transaction. Internal: reachable only through the action above. */
+export const startRunTxn = internalMutation({
+  args: { sourceId: v.id("sources"), icpVersionId: v.optional(v.id("icpDefinitions")), creditBudget: v.number() },
+  handler: async (ctx, args): Promise<Id<"discoveryRuns">> => {
     const { orgId, actor } = await requireRole(ctx, "admin");
     // Negated conjunction: NaN fails every comparison, so it fails closed. An infinite budget is no budget. The upper
     // bound is a REFUSAL, not a clamp: the budget lands in two stores erasure cannot redact (see MAX_CREDIT_BUDGET).

@@ -30,7 +30,7 @@ beforeEach(async () => {
   t = await asMember(raw, "u1", orgId);
 });
 
-const start = (creditBudget = 10) => t.mutation(api.runs.mutations.startRun, { sourceId, icpVersionId, creditBudget });
+const start = (creditBudget = 10) => t.action(api.runs.mutations.startRun, { sourceId, icpVersionId, creditBudget });
 
 test("startRun opens a running run with zeroed accounting", async () => {
   const run = await t.query(api.runs.queries.getRun, { runId: await start(10) });
@@ -47,13 +47,13 @@ test("startRun refuses an ICP version from another org", async () => {
     const other = await ctx.db.insert("orgs", { name: "Org 2", createdAt: 0 });
     return await ctx.db.insert("icpDefinitions", { orgId: other, version: 1, name: "theirs", criteria, createdBy: { kind: "user", userId: "x", role: "analyst" }, activeFrom: 0 });
   });
-  await expect(t.mutation(api.runs.mutations.startRun, { sourceId, icpVersionId: foreign, creditBudget: 5 })).rejects.toThrow("icp version not found");
+  await expect(t.action(api.runs.mutations.startRun, { sourceId, icpVersionId: foreign, creditBudget: 5 })).rejects.toThrow("icp version not found");
 });
 
 test("startRun refuses a bad budget and a source from another org", async () => {
   // past the declared bound is REFUSED, not clamped: the budget lands in two stores erasure cannot redact (a phone number must not fit)
   for (const creditBudget of [-1, Number.NaN, Number.POSITIVE_INFINITY, MAX_CREDIT_BUDGET + 1, 15550104242]) {
-    await expect(t.mutation(api.runs.mutations.startRun, { sourceId, creditBudget })).rejects.toThrow("creditBudget must be a finite number");
+    await expect(t.action(api.runs.mutations.startRun, { sourceId, creditBudget })).rejects.toThrow("creditBudget must be a finite number");
   }
   expect(await raw.run((ctx) => ctx.db.query("discoveryRuns").collect())).toHaveLength(0);
   expect(await raw.run((ctx) => ctx.db.query("auditLog").collect())).toHaveLength(0);
@@ -62,7 +62,7 @@ test("startRun refuses a bad budget and a source from another org", async () => 
     const other = await ctx.db.insert("orgs", { name: "Org 2", createdAt: 0 });
     return ctx.db.insert("sources", { orgId: other, key: "x", kind: "csv", trustWeight: 1, lawfulBasis: "consent" });
   });
-  await expect(t.mutation(api.runs.mutations.startRun, { sourceId: foreign, creditBudget: 5 })).rejects.toThrow("source not found");
+  await expect(t.action(api.runs.mutations.startRun, { sourceId: foreign, creditBudget: 5 })).rejects.toThrow("source not found");
 });
 
 test("consumeCredits decrements the budget and records the spend", async () => {

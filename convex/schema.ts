@@ -13,6 +13,7 @@ import { auditLog } from "./audit/schema";
 import { memberships } from "./members/schema";
 import { erasureSnapshotRefs, erasures, suppressions } from "./privacy/schema";
 import { verificationSweeps, verifications } from "./verify/schema";
+import { refusalCounts } from "./observability/schema";
 
 export default defineSchema({
   claims,
@@ -43,4 +44,5 @@ export default defineSchema({
   auditLog,
   verifications,
   verificationSweeps,
+  refusalCounts,
 });

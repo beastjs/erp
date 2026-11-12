@@ -31,6 +31,8 @@ export const LIST_CAP = 25;
 export const QUALITY_SAMPLE = 500;
 /** Pipeline rows of ONE run that a run metric reads. */
 export const RUN_SCAN_CAP = 1000;
+/** Refusal buckets one refusalCounts read returns; past that `more` is true and `total` is at_least. */
+export const REFUSAL_SCAN_CAP = 1000;
 /** Milliseconds per day, for ages. */
 export const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -162,6 +164,21 @@ export const METRIC_DEFINITIONS = {
     coverage: "exact",
   },
   "pipelineHealth.thresholds": { definition: "The staleness thresholds the listings above were judged with, in milliseconds.", basis: "observed", coverage: "exact" },
+
+  // ----------------------------------------------------------------------------------------------- refusalCounts
+  "refusalCounts.fromHour": { definition: "First hour of the window (epoch ms of an hour start), as the caller passed it.", basis: "observed", coverage: "exact" },
+  "refusalCounts.toHour": { definition: "Last hour of the window (epoch ms of an hour start, inclusive), as the caller passed it.", basis: "observed", coverage: "exact" },
+  "refusalCounts.buckets": {
+    definition: `Authorization refusals of the admin-tier functions (setMemberRole, requestErasure, suppressIdentifier, startRun, registerSource, recentAudit, auditForTarget), one row per (hour, function, reason, caller class, membershipId or null), hour from the recorder's clock. Reasons: no_identity, not_member, malformed_membership, insufficient_role; business-rule refusals are never counted, nor callers whose org claim names no org. A member is named by membershipId only; anyone else is the class non_member with no identifier. Each count is a LOWER BOUND: an increment is lost when the recorder fails (a write conflict on a hot bucket that outlasts Convex's retries, or the caller's membership changing between the refusal and the record), and a lost increment never changes what the caller was told. At most ${REFUSAL_SCAN_CAP} buckets per read; more says when there are others.`,
+    basis: "observed",
+    coverage: "lower_bound",
+  },
+  "refusalCounts.more": { definition: `True when the window holds more than ${REFUSAL_SCAN_CAP} buckets and only the first ${REFUSAL_SCAN_CAP} (oldest hours first) were returned.`, basis: "observed", coverage: "exact" },
+  "refusalCounts.total": {
+    definition: "Sum of the returned buckets' counts. at_least when more is true; even when exact over the buckets, it is a lower bound of refusals, as each count is.",
+    basis: "observed",
+    coverage: "lower_bound",
+  },
 } as const satisfies Record<string, MetricDefinition>;
 
 export type MetricKey = keyof typeof METRIC_DEFINITIONS;

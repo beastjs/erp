@@ -39,7 +39,7 @@ beforeEach(async () => {
   orgId = seeded.orgId;
   sourceId = seeded.sourceId;
   t = await asMember(raw, "u1", orgId);
-  runId = await t.mutation(api.runs.mutations.startRun, { sourceId, creditBudget: 100 });
+  runId = await t.action(api.runs.mutations.startRun, { sourceId, creditBudget: 100 });
   mappingId = await t.mutation(api.sources.import.saveMapping, { name: "crm", columns: COLUMNS });
 });
 

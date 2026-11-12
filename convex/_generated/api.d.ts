@@ -31,6 +31,7 @@ import type * as members_api from "../members/api.js";
 import type * as observability_definitions from "../observability/definitions.js";
 import type * as observability_health from "../observability/health.js";
 import type * as observability_quality from "../observability/quality.js";
+import type * as observability_refusals from "../observability/refusals.js";
 import type * as observability_runs from "../observability/runs.js";
 import type * as pipeline_deadletter from "../pipeline/deadletter.js";
 import type * as pipeline_hash from "../pipeline/hash.js";
@@ -95,6 +96,7 @@ declare const fullApi: ApiFromModules<{
   "observability/definitions": typeof observability_definitions;
   "observability/health": typeof observability_health;
   "observability/quality": typeof observability_quality;
+  "observability/refusals": typeof observability_refusals;
   "observability/runs": typeof observability_runs;
   "pipeline/deadletter": typeof pipeline_deadletter;
   "pipeline/hash": typeof pipeline_hash;

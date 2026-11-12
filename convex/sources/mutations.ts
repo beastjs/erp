@@ -1,16 +1,28 @@
 import { v } from "convex/values";
 import type { Id } from "../_generated/dataModel";
-import { mutation, type MutationCtx } from "../_generated/server";
+import { internal } from "../_generated/api";
+import { action, internalMutation, type MutationCtx } from "../_generated/server";
 import { resolveOrg } from "../_shared/org";
 import { CANDIDATE_CONTRACT_VERSION, checkContractVersion, candidatePersonKey, computeDedupeHash, validateCandidate } from "./contract";
 import { candidateSuppressed } from "../privacy/suppress";
 import { lawfulBasis, sourceKind } from "./schema";
 import { requireRole } from "../_shared/authz";
 import { writeAudit } from "../audit/log";
+import { recordRefusals } from "../observability/refusals";
 
-export const registerSource = mutation({
+/**
+ * Registers a source. Role: `admin`. A public ACTION so that an authorization refusal can be recorded
+ * (observability/refusals.ts); the work and the role check run in `registerSourceTxn` with the caller's identity.
+ */
+export const registerSource = action({
   args: { key: v.string(), kind: sourceKind, trustWeight: v.number(), lawfulBasis },
-  handler: async (ctx, args) => {
+  handler: async (ctx, args): Promise<Id<"sources">> => await recordRefusals(ctx, "registerSource", () => ctx.runMutation(internal.sources.mutations.registerSourceTxn, args)),
+});
+
+/** The work of `registerSource`, in one transaction. Internal: reachable only through the action above. */
+export const registerSourceTxn = internalMutation({
+  args: { key: v.string(), kind: sourceKind, trustWeight: v.number(), lawfulBasis },
+  handler: async (ctx, args): Promise<Id<"sources">> => {
     const { orgId, actor } = await requireRole(ctx, "admin");
     const key = args.key.trim();
     // Negated conjunction on purpose: every comparison with NaN is false, so NaN fails closed.

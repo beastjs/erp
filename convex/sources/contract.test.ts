@@ -6,7 +6,7 @@ import type { Id } from "../_generated/dataModel";
 import { asMember } from "../_shared/testkit.support";
 import schema from "../schema";
 import { normalizeProfileUrl } from "../_shared/normalize";
-import { insertCandidate, registerSource } from "./mutations";
+import { insertCandidate, registerSourceTxn } from "./mutations";
 import { CANDIDATE_CONTRACT_VERSION, computeDedupeHash, validateCandidate } from "./contract";
 
 const modules = import.meta.glob("/convex/**/*.ts");
@@ -40,7 +40,7 @@ beforeEach(async () => {
 });
 
 const register = (over: Record<string, unknown> = {}) =>
-  t.mutation(api.sources.mutations.registerSource, {
+  t.action(api.sources.mutations.registerSource, {
     key: "csv-1",
     kind: "csv",
     trustWeight: 0.5,
@@ -132,7 +132,7 @@ test("the same hash in a different org is not a duplicate", async () => {
   await t.run((ctx) => insertCandidate(ctx, { candidate, sourceId }));
   const otherOrg = await raw.run((ctx) => ctx.db.insert("orgs", { name: "Org 2", createdAt: 0 }));
   const other = await asMember(raw, "u2", otherOrg);
-  const otherSource = await other.mutation(api.sources.mutations.registerSource, {
+  const otherSource = await other.action(api.sources.mutations.registerSource, {
     key: "csv-1", kind: "csv", trustWeight: 0.5, lawfulBasis: "consent",
   });
   expect(await other.run((ctx) => insertCandidate(ctx, { candidate, sourceId: otherSource }))).not.toBeNull();
@@ -141,12 +141,12 @@ test("the same hash in a different org is not a duplicate", async () => {
 test("insertCandidate is not a callable endpoint", () => {
   // Registered Convex functions carry an isMutation marker; a plain helper does not.
   expect((insertCandidate as unknown as { isMutation?: boolean }).isMutation).toBeUndefined();
-  expect((registerSource as unknown as { isMutation?: boolean }).isMutation).toBe(true);
+  expect((registerSourceTxn as unknown as { isMutation?: boolean }).isMutation).toBe(true); // the control: a registered mutation does carry it
 });
 
 test("registerSource requires a lawfulBasis", async () => {
   await expect(
-    t.mutation(api.sources.mutations.registerSource, { key: "k", kind: "csv", trustWeight: 0.5 } as never),
+    t.action(api.sources.mutations.registerSource, { key: "k", kind: "csv", trustWeight: 0.5 } as never),
   ).rejects.toThrow(/lawfulBasis/);
   await expect(register({ lawfulBasis: "because" })).rejects.toThrow(/Validator error.*because/);
   const id = await register();
@@ -166,7 +166,7 @@ test("registerSource rejects a duplicate key within an org and requires org cont
   await register();
   await expect(register()).rejects.toThrow("already registered");
   await expect(
-    raw.mutation(api.sources.mutations.registerSource, { key: "z", kind: "csv", trustWeight: 1, lawfulBasis: "consent" }),
+    raw.action(api.sources.mutations.registerSource, { key: "z", kind: "csv", trustWeight: 1, lawfulBasis: "consent" }),
   ).rejects.toThrow("no org context");
 });
 

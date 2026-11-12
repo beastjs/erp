@@ -1,9 +1,10 @@
 import { v } from "convex/values";
 import { internal } from "../_generated/api";
 import type { Id } from "../_generated/dataModel";
-import { mutation } from "../_generated/server";
+import { action, internalMutation } from "../_generated/server";
 import { requireRole } from "../_shared/authz";
 import { writeAudit } from "../audit/log";
+import { recordRefusals } from "../observability/refusals";
 import { subjectType } from "../claims/schema";
 import { eraseSubject, type ErasureResult } from "./redact";
 import { erasureReason, legalBasis, suppressionReason } from "./schema";
@@ -20,8 +21,18 @@ import { addSuppression } from "./suppress";
  *
  * Returns what this transaction finished. A subject too large for one transaction returns `complete: false` and the
  * rest is carried by `runErasure` (scheduled here, and re-armed by the cron sweeper if the chain ever dies).
+ *
+ * A public ACTION so that an authorization refusal can be recorded (observability/refusals.ts); the work, the role check
+ * and the scheduling of `runErasure` happen in `requestErasureTxn`, one transaction, with the caller's identity.
  */
-export const requestErasure = mutation({
+export const requestErasure = action({
+  args: { subjectType, subjectId: v.string(), reasonCode: erasureReason, legalBasis, reference: v.string() },
+  handler: async (ctx, args): Promise<Omit<ErasureResult, "snapshotRefs">> =>
+    await recordRefusals(ctx, "requestErasure", () => ctx.runMutation(internal.privacy.api.requestErasureTxn, args)),
+});
+
+/** The work of `requestErasure`, in one transaction. Internal: reachable only through the action above. */
+export const requestErasureTxn = internalMutation({
   args: { subjectType, subjectId: v.string(), reasonCode: erasureReason, legalBasis, reference: v.string() },
   handler: async (ctx, args): Promise<Omit<ErasureResult, "snapshotRefs">> => {
     const { orgId, actor } = await requireRole(ctx, "admin");
@@ -41,8 +52,16 @@ export const requestErasure = mutation({
  * Adds an identifier to the org's suppression list so that it cannot re-enter. Role: `admin` (retention). The
  * identifier is in this call's ARGUMENTS and nowhere else: the table stores only a keyed hash, and the audit entry
  * records the kind and reason, never the value. Idempotent: an identifier already listed writes no second audit entry.
+ * A public ACTION so that an authorization refusal can be recorded; the work runs in `suppressIdentifierTxn`.
  */
-export const suppressIdentifier = mutation({
+export const suppressIdentifier = action({
+  args: { identifier: v.string(), reason: suppressionReason },
+  handler: async (ctx, args): Promise<{ created: boolean }> =>
+    await recordRefusals(ctx, "suppressIdentifier", () => ctx.runMutation(internal.privacy.api.suppressIdentifierTxn, args)),
+});
+
+/** The work of `suppressIdentifier`, in one transaction. Internal: reachable only through the action above. */
+export const suppressIdentifierTxn = internalMutation({
   args: { identifier: v.string(), reason: suppressionReason },
   handler: async (ctx, args): Promise<{ created: boolean }> => {
     const { actor } = await requireRole(ctx, "admin");

@@ -40,4 +40,13 @@ export const discoveryRuns = defineTable({
   candidatesConsumed: v.number(),
   /** Candidates ingest turned away (contract violation) or could not process. */
   candidatesRejected: v.number(),
-});
+  /** Set by `bumpRun` whenever a counter moves: the last time the run made progress. Lets a stopped import chain be told from a slow one. */
+  progressAt: v.optional(v.number()),
+  /**
+   * Set when the run ended with staged chunks still to purge (they did not fit the terminal transaction), cleared by the
+   * purge that removes the last of them. A value older than a few minutes means the purge chain died with raw rows left.
+   */
+  purgePendingSince: v.optional(v.number()),
+})
+  .index("by_org_and_status", ["orgId", "status"])
+  .index("by_org_and_purge_pending", ["orgId", "purgePendingSince"]);

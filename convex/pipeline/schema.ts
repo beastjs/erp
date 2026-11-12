@@ -107,4 +107,7 @@ export const pipelineState = defineTable({
 })
   .index("by_org_and_subject", ["orgId", "subjectType", "subjectId"])
   .index("by_org_and_account", ["orgId", "accountId"])
-  .index("by_org_and_status_and_reason", ["orgId", "status", "deadReasonCode"]);
+  .index("by_org_and_status_and_reason", ["orgId", "status", "deadReasonCode"])
+  // Observability (Task 16): a run's subjects, and active subjects oldest-progress first, are bounded index ranges.
+  .index("by_org_and_run", ["orgId", "runId"])
+  .index("by_org_and_status_and_updated", ["orgId", "status", "updatedAt"]);

@@ -40,4 +40,6 @@ export const claims = defineTable({
   .index("by_subject", ["orgId", "subjectType", "subjectId"])
   .index("by_subject_field", ["orgId", "subjectType", "subjectId", "field"])
   // Erasure finds what is still unredacted with an exact-key read, so it is resumable with no cursor.
-  .index("by_subject_redacted", ["orgId", "subjectType", "subjectId", "redactedAt"]);
+  .index("by_subject_redacted", ["orgId", "subjectType", "subjectId", "redactedAt"])
+  // Observability (Task 16): the org's newest claims, by creation, for the declared data-quality sample.
+  .index("by_org", ["orgId"]);

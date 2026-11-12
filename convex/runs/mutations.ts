@@ -35,7 +35,13 @@ export async function purgeStagedChunks(ctx: MutationCtx, run: Doc<"discoveryRun
   for (const chunk of chunks.slice(0, PURGE_CHUNKS_PER_TXN)) {
     if (chunk.orgId === run.orgId) await ctx.db.delete(chunk._id);
   }
-  return chunks.length <= PURGE_CHUNKS_PER_TXN;
+  const done = chunks.length <= PURGE_CHUNKS_PER_TXN;
+  // Liveness marker for observability (Task 16): set while raw rows remain, cleared by the purge that removes the last.
+  // Written here, in the transaction that commits the deletes, so it is always the state of the last purge that COMMITTED.
+  // A continuation that throws is not retried, and the marker then stays set and ages: pipelineHealth lists it.
+  if (!done && run.purgePendingSince === undefined) await ctx.db.patch(run._id, { purgePendingSince: Date.now() });
+  if (done && run.purgePendingSince !== undefined) await ctx.db.patch(run._id, { purgePendingSince: undefined });
+  return done;
 }
 
 /** Runs once, in the transaction that ends a run: purge the staged rows, and schedule the rest if they do not fit. */
@@ -74,7 +80,7 @@ export async function bumpRun(
   for (const [key, n] of Object.entries(delta) as Array<[RunCounter, number]>) {
     if (n) patch[key] = (fresh[key] ?? 0) + n;
   }
-  if (Object.keys(patch).length > 0) await ctx.db.patch(run._id, patch);
+  if (Object.keys(patch).length > 0) await ctx.db.patch(run._id, { ...patch, progressAt: Date.now() });
   await settleRun(ctx, run._id);
 }
 

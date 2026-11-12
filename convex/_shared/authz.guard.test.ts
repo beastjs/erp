@@ -59,6 +59,11 @@ const MATRIX: Record<string, string> = {
   "/convex/icp/api.ts": "createIcp:analyst createModel:analyst",
   "/convex/leads/api.ts": "markInventoryState:operator markDisposition:operator",
   "/convex/members/api.ts": "setMemberRole:admin myRole:operator",
+  // Task 16. Operator: the role that runs discovery and works the dead-letter queue (spec 7.1). Ids, closed-set labels and
+  // counts only; nothing here is not already readable by an operator through getRun, listDeadLetters or the leads.
+  "/convex/observability/health.ts": "pipelineHealth:operator",
+  "/convex/observability/quality.ts": "dataQuality:operator",
+  "/convex/observability/runs.ts": "runSummary:operator costPerQualifiedLead:operator",
   "/convex/pipeline/deadletter.ts": "listDeadLetters:operator resumeSubject:operator",
   "/convex/pipeline/stages.ts": "startPipeline:operator pipelineStatus:operator",
   "/convex/privacy/api.ts": "requestErasure:admin suppressIdentifier:admin",

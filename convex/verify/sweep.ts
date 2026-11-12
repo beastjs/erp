@@ -93,8 +93,8 @@ export const sweepStaleVerdicts = internalMutation({
  * Each rewind runs as a NESTED mutation (`rejudgeSubject`), the isolation `executeStage` uses: a subject whose rewind
  * throws (a duplicate pipelineState row fails `findState` loudly) has its own writes rolled back and is passed over,
  * instead of rolling back the slice and so failing the same page on every tick forever, which would stop this org's
- * walk at that subject. The passed-over subject is reported in `failed` (returned, not stored) and stays as it was:
- * not rewound, not revived, and visible to whatever surfaces a wedged pipeline (Task 16).
+ * walk at that subject. The passed-over subject stays as it was (not rewound, not revived); this slice counts it in
+ * the org's `passedOver` and names the latest in `lastPassedOver`, which `pipelineHealth` reports (Task 16).
  */
 export const rejudgeSlice = internalMutation({
   args: { orgId: v.id("orgs") },
@@ -116,18 +116,28 @@ export const rejudgeSlice = internalMutation({
     const page = states.slice(0, REJUDGE.page);
     let rewound = 0;
     let failed = 0;
+    let lastFailed: Id<"contacts"> | undefined;
+    const failedSubjects = new Set<string>();
     for (const state of page) {
       if (!(await judgedUnderOtherRules(ctx, args.orgId, state.subjectId, logic))) continue;
       try {
         if (await ctx.runMutation(internal.verify.sweep.rejudgeSubject, { orgId: args.orgId, subjectId: state.subjectId })) rewound++;
       } catch {
         failed++;
+        // Counted per SUBJECT: a duplicated pipeline row (one cause of the throw) lists the subject twice, adjacently.
+        failedSubjects.add(state.subjectId);
+        lastFailed = state.subjectId as Id<"contacts">;
       }
     }
 
     const done = states.length <= REJUDGE.page;
     const last = page.length > 0 ? (page[page.length - 1]!.subjectId as Id<"contacts">) : after;
-    const progress = { logic, after: last, done, leaseUntil: done ? 0 : now + REJUDGE_LEASE_MS };
+    // The passed-over tally belongs to THIS walk: a walk under new rules starts again from zero. It is written here, by
+    // the slice that caught the nested failure and is about to commit, which is the only place it can be durable.
+    const sameWalk = sweepRow !== null && sweepRow.logic === logic;
+    const passedOver = (sameWalk ? (sweepRow.passedOver ?? 0) : 0) + failedSubjects.size;
+    const lastPassedOver = lastFailed ?? (sameWalk ? sweepRow.lastPassedOver : undefined);
+    const progress = { logic, after: last, done, leaseUntil: done ? 0 : now + REJUDGE_LEASE_MS, passedOver, lastPassedOver };
     if (sweepRow) await ctx.db.patch(sweepRow._id, progress);
     else await ctx.db.insert("verificationSweeps", { orgId: args.orgId, ...progress });
     if (!done) await ctx.scheduler.runAfter(0, internal.verify.sweep.rejudgeSlice, { orgId: args.orgId });

@@ -79,4 +79,10 @@ export const verificationSweeps = defineTable({
   after: v.optional(v.id("contacts")),
   done: v.boolean(),
   leaseUntil: v.number(),
+  /**
+   * Subjects this walk (under `logic`) passed over because their rewind threw, and the most recent of them. Written by the
+   * slice that CAUGHT the nested failure and committed, never by the failing transaction. Reset when a walk restarts.
+   */
+  passedOver: v.optional(v.number()),
+  lastPassedOver: v.optional(v.id("contacts")),
 }).index("by_org", ["orgId"]);

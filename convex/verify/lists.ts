@@ -6,6 +6,13 @@
  * remember to bump a number. A change to the matching CODE (not the lists) bumps the revision by hand.
  *
  * Entries are lowercase. Domains are registrable domains: a subdomain of a listed domain matches too.
+ *
+ * ENTRIES MUST NEVER BE PERSON- OR CUSTOMER-SPECIFIC: no one person's address, local part or private domain, and no
+ * customer's own domain. Verifications survive erasure (they hold no value, only a verdict on a redacted claim), and a
+ * list edit re-judges every live subject. So if an entry named one person, the history that person's ERASED subject
+ * leaves behind would show a `pass` turning into a `fail` under the rules that added that entry, and the pair (entry,
+ * flip) would reveal the erased value. Only generic, many-user classes (throwaway providers, shared-mailbox names)
+ * belong here.
  */
 
 /** Throwaway-inbox providers. A deliberately short, well-known core; a provider-backed verifier is a later plan. */

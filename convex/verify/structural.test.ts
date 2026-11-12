@@ -254,3 +254,28 @@ describe("structuralLogic: the lists are logic, so they fingerprint", () => {
     expect(structuralLogic().hash).toBe(before);
   });
 });
+
+describe("judgeClaimValue: normalized as ingest would have stored it, but only up to the longest value ingest accepts", () => {
+  test("up to MAX_STRING the value is normalized; one character past it, it is judged as stored", async () => {
+    const { judgeClaimValue } = await import("./mutations");
+    const { MAX_STRING } = await import("../sources/contract");
+    const tagged = (len: number) => {
+      const tail = "@acme.com";
+      return `jo+${"t".repeat(len - 3 - tail.length)}${tail}`;
+    };
+    expect(tagged(MAX_STRING)).toHaveLength(MAX_STRING);
+    expect(judgeClaimValue("email", tagged(MAX_STRING))).toMatchObject({ outcome: "pass", reason: "ok" }); // normalizes to jo@acme.com
+    expect(judgeClaimValue("email", tagged(MAX_STRING + 1))).toMatchObject({ outcome: "fail", reason: "too_long" }); // raw
+    expect(judgeClaimValue("phone", 42)).toMatchObject({ outcome: "unknown", reason: "not_text" });
+    expect(judgeClaimValue("phone", "call me")).toMatchObject({ outcome: "fail", reason: "syntax" }); // normalizer returns null: judged as stored
+  });
+
+  test("an over-long value never reaches the normalizer's backtracking regexes (a run of dots is quadratic in normalizeDomain)", async () => {
+    const { judgeClaimValue } = await import("./mutations");
+    // Unbounded, this input costs normalizeDomain's `\.+$` ~2e10 steps (measured: 50k dots ~1s, growing with the square).
+    const value = `a@${".".repeat(200_000)}x`;
+    const started = performance.now();
+    expect(judgeClaimValue("email", value)).toMatchObject({ outcome: "fail", reason: "too_long" });
+    expect(performance.now() - started).toBeLessThan(1000);
+  });
+});

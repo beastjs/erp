@@ -110,6 +110,8 @@ test("3. every mutation in a file that touches claims is accounted for, argument
     "/convex/pipeline/stages.ts": ["state._id", "state._id", "state._id", "state._id", "state._id", "state._id", "state._id", "existing._id", "state._id"],
     "/convex/privacy/redact.ts": ["row._id", "lead._id", "state._id", "row._id", "key._id", "row._id", "record._id", "record._id"],
     "/convex/projections/build.ts": ['"accounts"', '"contacts"'],
+    // reads projected claimIds to find stale verdicts; writes only its own verificationSweeps progress row
+    "/convex/verify/sweep.ts": ["sweepRow._id"],
   });
 });
 

@@ -9,6 +9,7 @@ import { MAX_PROJECTED_FIELDS } from "../scoring/assemble";
 import { leadIsErased, assertNotErased } from "../privacy/erased";
 import { anySuppressed, leadIdentifiers } from "../privacy/suppress";
 import { checkDistributability, dispositionFor, DEFAULT_FRESHNESS_WINDOW_DAYS } from "../qualify/distributability";
+import { uncountedFailuresSince } from "../verify/mutations";
 import { DISPOSITIONS, INVENTORY_STATES, type Disposition, type InventoryState } from "./schema";
 
 /**
@@ -21,6 +22,10 @@ import { DISPOSITIONS, INVENTORY_STATES, type Disposition, type InventoryState }
  *    new funding signal must not be scored around). `by_subject_created` orders signals by recorded-at.
  *  - a signal the score COUNTED has since lost all weight (it passed its `expiresAt`): the world moved on
  *    without any write, so no event could mark it. Spec 4.6: scores drift visibly, they do not age silently.
+ *  - a verification of the contact's projected email or phone FAILED after it, where the verdict standing when it
+ *    was taken did not (`uncountedFailuresSince`): a failure halves confidence, and this score never counted it.
+ *    Without this, verify committing a new `fail` and score then dead-lettering (no ICP) left the old scoreRun the
+ *    latest, with no newer claim, so it read as current. A fail re-judged as a fail is not news and does not count.
  * The pipeline's markScoreStale is the event-driven side of this; this is the check at the point of use.
  *
  * `now` is an argument, not a clock read here, and the answer is ADVISORY: it is never persisted and never
@@ -59,6 +64,9 @@ export async function staleReason(
       .first();
     if (newer) return `a signal about the ${subjectType} was recorded after the score`;
   }
+
+  const failed = await uncountedFailuresSince(ctx, orgId, subjects.contactId, scoreRun._creationTime);
+  if (failed.length > 0) return `a verification of the contact's ${failed.join(" and ")} failed after the score`;
 
   // A signal that carried weight when the score was taken and has none now. Scored under the score's own model.
   const params = await getScoringModel(ctx, { id: scoreRun.scoringModelId });
@@ -248,6 +256,12 @@ async function assertStillDistributable(ctx: MutationCtx, lead: Doc<"leads">, wh
   if (!lead.distributability.ok) throw new Error(`a lead that failed distributability cannot be ${what}`);
   const scoreRun = await ctx.db.get(lead.scoreRunId);
   if (!scoreRun || scoreRun.orgId !== lead.orgId) throw new Error("scoreRun not found");
+  // A failed verdict this lead's score never counted: the confidence it would ship at is no longer true. Normally the
+  // rescore that follows replaces this lead within the chain; this holds it when that rescore fails (Task 15 L5).
+  // Deliberately NOT the whole of `staleReason`: a newer claim, signal or ICP is routine and is resolved by
+  // repackaging, whereas a halving of confidence is the one change that can move a lead out of its tier.
+  const failed = await uncountedFailuresSince(ctx, lead.orgId, lead.contactId, scoreRun._creationTime);
+  if (failed.length > 0) throw new Error(`a verification of the contact's ${failed.join(" and ")} failed after the score; the lead cannot be ${what}`);
   const { account, contact } = lead.snapshot;
   const gate = checkDistributability({
     account,

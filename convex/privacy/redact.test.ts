@@ -606,7 +606,7 @@ describe("liveness: a stalled erasure is DETECTED and resumed, not merely resuma
 
   test("a cron is registered for the sweeper", () => {
     const jobs = (crons as unknown as { crons: Record<string, { name: string; schedule: unknown }> }).crons;
-    expect(Object.keys(jobs)).toEqual(["resume stalled erasures"]);
+    expect(Object.keys(jobs)).toEqual(["resume stalled erasures", "re-judge verdicts under changed rules"]);
     expect(jobs["resume stalled erasures"]).toMatchObject({ name: "privacy/sweep:sweepStalledErasures", schedule: { type: "interval", minutes: 5 } });
   });
 
@@ -925,8 +925,7 @@ describe("verifications: populated by the real pipeline, content-free, and the s
     const emailClaim = (await claimsOf("contact", w.contactId)).find((c) => c.field === "email")!;
     await erase("contact", w.contactId);
     const { recordVerification, verificationsForSubject } = await import("../verify/mutations");
-    const { verifyEmailStructure } = await import("../verify/structural");
-    await expect(t.run((ctx) => recordVerification(ctx, { subjectType: "contact", subjectId: w.contactId, claimId: emailClaim._id, result: verifyEmailStructure("a@b.co"), provider: "structural" }))).rejects.toThrow(/erased/);
+    await expect(t.run((ctx) => recordVerification(ctx, { subjectType: "contact", subjectId: w.contactId, claimId: emailClaim._id }))).rejects.toThrow(/erased/);
     expect(await t.run((ctx) => verificationsForSubject(ctx, { subjectType: "contact", subjectId: w.contactId }))).toEqual([]);
     expect(await rows()).toHaveLength(2); // nothing added
   });

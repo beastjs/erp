@@ -6,7 +6,8 @@ import type { Doc, Id } from "../_generated/dataModel";
 import { createIcpVersion, asMember } from "../_shared/testkit.support";
 import { appendClaimRecord } from "../claims/mutations";
 import { latestIcp } from "../icp/queries";
-import { inputHashFor, runStage, stageHandlers, STAGE_LOGIC_VERSION } from "../pipeline/stages";
+import { inputHashFor, runStage, stageFailure, stageHandlers, STAGE_LOGIC_VERSION } from "../pipeline/stages";
+import { setInventoryState, staleReason } from "../leads/mutations";
 import { STAGES } from "../pipeline/schema";
 import { rebuildProjection } from "../projections/build";
 import schema from "../schema";
@@ -23,6 +24,7 @@ let raw: ReturnType<typeof convexTest>;
 let t: ReturnType<ReturnType<typeof convexTest>["withIdentity"]>;
 let orgId: Id<"orgs">;
 const originals = { ...stageHandlers };
+const versions = { ...STAGE_LOGIC_VERSION };
 const listSnapshot = { disposable: [...DISPOSABLE_DOMAINS], roles: [...ROLE_LOCAL_PARTS] };
 
 beforeEach(async () => {
@@ -33,6 +35,7 @@ beforeEach(async () => {
 });
 afterEach(() => {
   Object.assign(stageHandlers, originals);
+  Object.assign(STAGE_LOGIC_VERSION, versions);
   // A test that edits a list must not leak the edit into the next one.
   (DISPOSABLE_DOMAINS as string[]).splice(0, DISPOSABLE_DOMAINS.length, ...listSnapshot.disposable);
   (ROLE_LOCAL_PARTS as string[]).splice(0, ROLE_LOCAL_PARTS.length, ...listSnapshot.roles);
@@ -77,7 +80,7 @@ describe("recordVerification", () => {
     const { contactId } = await ingestLead();
     const claimId = await claimOf(contactId, "email");
     const before = Date.now();
-    const id = await t.run((ctx) => recordVerification(ctx, { subjectType: "contact", subjectId: contactId, claimId, result: verifyEmailStructure("jo@acme.com"), provider: "structural" }));
+    const id = await t.run((ctx) => recordVerification(ctx, { subjectType: "contact", subjectId: contactId, claimId }));
     const row = (await raw.run((ctx) => ctx.db.get(id)))!;
     expect(row).toMatchObject({
       orgId,
@@ -96,40 +99,42 @@ describe("recordVerification", () => {
     expect(JSON.stringify(row).toLowerCase()).not.toMatch(/jo@|acme|555|doe/);
   });
 
-  test("the caller cannot choose the time: a verdict is stamped by the transaction, so it cannot be post-dated to be the latest", async () => {
+  test("the caller cannot choose the time, the verdict or the provider: each is refused as an argument, not ignored", async () => {
     const { contactId } = await ingestLead();
     const claimId = await claimOf(contactId, "email");
-    const before = Date.now();
-    const result = { ...verifyEmailStructure("jo@acme.com"), checkedAt: 9_999_999_999_999 };
-    const id = await t.run((ctx) => recordVerification(ctx, { subjectType: "contact", subjectId: contactId, claimId, result, provider: "structural" }));
-    expect((await raw.run((ctx) => ctx.db.get(id)))!.checkedAt).toBeLessThan(before + 60_000);
+    const base = { subjectType: "contact", subjectId: contactId, claimId };
+    for (const extra of [{ checkedAt: 9_999_999_999_999 }, { result: verifyEmailStructure("jo@acme.com") }, { provider: "structural" }, { outcome: "pass" }]) {
+      await expect(t.run((ctx) => recordVerification(ctx, { ...base, ...extra } as never))).rejects.toThrow(/computed from the claim, never supplied/);
+    }
+    const id = await t.run((ctx) => recordVerification(ctx, { subjectType: "contact", subjectId: contactId, claimId }));
+    expect((await raw.run((ctx) => ctx.db.get(id)))!.checkedAt).toBeLessThan(Date.now() + 60_000);
   });
 
-  test("refuses at the boundary: a claim that is not this subject's, not of this kind, erased or in another org; a bad provider; a lying outcome", async () => {
+  test("refuses at the boundary: a claim that is not this subject's, not a verifiable kind, erased or in another org", async () => {
     const a = await ingestLead();
     const b = await ingestLead({ email: "kay@other.com", domain: "other.com", name: "Kay Lee", phone: "+1 555 010 9999" });
-    const record = (over: Record<string, unknown>) =>
-      t.run((ctx) =>
-        recordVerification(ctx, { subjectType: "contact", subjectId: a.contactId, claimId: undefined as never, result: verifyEmailStructure("jo@acme.com"), provider: "structural", ...over }),
-      );
+    const record = (claimId: Id<"claims">) => t.run((ctx) => recordVerification(ctx, { subjectType: "contact", subjectId: a.contactId, claimId }));
     const emailClaim = await claimOf(a.contactId, "email");
-    await expect(record({ claimId: await claimOf(b.contactId, "email") })).rejects.toThrow(/claim not found/); // another subject's claim
-    await expect(record({ claimId: await claimOf(a.contactId, "phone") })).rejects.toThrow(/phone claim, not email/); // wrong kind
-    await expect(record({ claimId: emailClaim, provider: "firecrawl" })).rejects.toThrow(/provider/);
-    await expect(record({ claimId: emailClaim, result: { kind: "email", outcome: "pass", reason: "disposable" } })).rejects.toThrow(/disagree/);
-    await expect(record({ claimId: emailClaim, result: { kind: "email", outcome: "fail", reason: "ok" } })).rejects.toThrow(/disagree/);
-    await expect(record({ claimId: emailClaim, result: { kind: "email", outcome: "fail", reason: "bad_length" } })).rejects.toThrow(/does not apply/); // a phone reason on an email
-    await expect(record({ claimId: emailClaim, result: { kind: "ssn", outcome: "pass", reason: "ok" } })).rejects.toThrow(/verifiable/);
+    await expect(record(await claimOf(b.contactId, "email"))).rejects.toThrow(/claim not found/); // another subject's claim
+    await expect(record(await claimOf(a.contactId, "title"))).rejects.toThrow(/a title claim is not a verifiable kind/);
     // another org's subject
     const otherOrg = await raw.run((ctx) => ctx.db.insert("orgs", { name: "Org 2", createdAt: 0 }));
     const t2 = await asMember(raw, "u2", otherOrg);
-    await expect(
-      t2.run((ctx) => recordVerification(ctx, { subjectType: "contact", subjectId: a.contactId, claimId: emailClaim, result: verifyEmailStructure("jo@acme.com"), provider: "structural" })),
-    ).rejects.toThrow(/subject not found/);
+    await expect(t2.run((ctx) => recordVerification(ctx, { subjectType: "contact", subjectId: a.contactId, claimId: emailClaim }))).rejects.toThrow(/subject not found/);
     // a redacted claim
     await raw.run((ctx) => ctx.db.patch(emailClaim, { value: null, redactedAt: 1 }));
-    await expect(record({ claimId: emailClaim })).rejects.toThrow(/erased/);
+    await expect(record(emailClaim)).rejects.toThrow(/erased/);
     expect(await rowsFor(a.contactId)).toHaveLength(0);
+  });
+
+  test("the verdict is judged on the claim's own stored value, whatever the projection shows", async () => {
+    const { contactId, sourceId } = await ingestLead();
+    // A losing email claim on a disposable domain: judged by its own value, not by the winner the projection displays.
+    const loser = await t.run((ctx) =>
+      appendClaimRecord(ctx, { subjectType: "contact", subjectId: contactId, field: "email", value: "jo@mailinator.com", sourceId, method: "extracted", confidence: 0.5, observedAt: 0 }),
+    );
+    const id = await t.run((ctx) => recordVerification(ctx, { subjectType: "contact", subjectId: contactId, claimId: loser }));
+    expect(await raw.run((ctx) => ctx.db.get(id))).toMatchObject({ claimId: loser, outcome: "fail", reason: "disposable" });
   });
 
   test("an erasure in progress already refuses: the subject is erased from the first slice, before every claim is redacted", async () => {
@@ -139,16 +144,16 @@ describe("recordVerification", () => {
     expect((await t.run((ctx) => eraseSubject(ctx, { subjectType: "contact", subjectId: lead.contactId, request }, { budget: 1 }))).complete).toBe(false);
     const live = ((await all("claims")) as Doc<"claims">[]).find((c) => c.subjectId === lead.contactId && c.field === "email" && c.redactedAt === undefined);
     expect(live, "the partial erasure must leave the email claim unredacted for this test to mean anything").toBeTruthy();
-    await expect(
-      t.run((ctx) => recordVerification(ctx, { subjectType: "contact", subjectId: lead.contactId, claimId: live!._id, result: verifyEmailStructure("a@b.co"), provider: "structural" })),
-    ).rejects.toThrow(/erased/);
+    await expect(t.run((ctx) => recordVerification(ctx, { subjectType: "contact", subjectId: lead.contactId, claimId: live!._id }))).rejects.toThrow(/erased/);
   });
 
-  test("the claim must be the subject's own even when the ids look right: a claim id from a different table is refused by the validator", async () => {
+  test("the claim must be the subject's own even when the ids look right: a contact's id passed as a claim id is refused by the subject check", async () => {
+    // Not a validator refusal (a plain helper has no arg validator): `db.get` returns the CONTACT, which has no
+    // subjectType or subjectId, so the claim-belongs-to-this-subject check is what refuses it.
     const { contactId } = await ingestLead();
     await expect(
-      t.run((ctx) => recordVerification(ctx, { subjectType: "contact", subjectId: contactId, claimId: contactId as unknown as Id<"claims">, result: verifyEmailStructure("a@b.co"), provider: "structural" })),
-    ).rejects.toThrow();
+      t.run((ctx) => recordVerification(ctx, { subjectType: "contact", subjectId: contactId, claimId: contactId as unknown as Id<"claims"> })),
+    ).rejects.toThrow(/claim not found for this subject/);
   });
 });
 
@@ -500,5 +505,169 @@ describe("the coupling the score hash relies on", () => {
     });
     expect(r.confidence).toBe(0.5);
     expect(r.confidence).toBeGreaterThanOrEqual(model.confidenceFloors.C);
+  });
+});
+
+// ------------------------------------------------------------------------------------------------ review fixes (Task 15)
+
+/** Rewrites the contact's projected email to `claim`, as a resolver that ranks differently would. No claim is added. */
+async function projectEmail(ctx: { db: any }, contactId: Id<"contacts">, claim: Doc<"claims">) {
+  const c = (await ctx.db.get(contactId))!;
+  const field = { field: "email", value: claim.value, claimId: claim._id, method: claim.method, confidence: claim.confidence, observedAt: claim.observedAt };
+  const fields = [...c.fields.filter((f: { field: string }) => f.field !== "email"), field].sort((a, b) => (a.field < b.field ? -1 : a.field > b.field ? 1 : 0));
+  await ctx.db.patch(contactId, { fields, display: { ...c.display, email: claim.value } });
+}
+
+describe("M1: a resolver change reaches verify and score, though no claim was added", () => {
+  /** A finished lead whose contact also holds a LOSING email claim (extracted ranks under observed). */
+  async function withLoser(loser: string) {
+    const lead = await ingestLead();
+    const b = await t.run((ctx) =>
+      appendClaimRecord(ctx, { subjectType: "contact", subjectId: lead.contactId, field: "email", value: loser, sourceId: lead.sourceId, method: "extracted", confidence: 0.5, observedAt: Date.now() - 1000 }),
+    );
+    await makeIcp();
+    await funding(lead.accountId, lead.sourceId);
+    await start(lead.contactId);
+    await drain();
+    expect(await claimOf(lead.contactId, "email")).not.toBe(b); // control: the loser really loses today
+    expect((await rowsFor(lead.contactId)).some((r) => r.claimId === b)).toBe(false);
+    const claimB = (await raw.run((ctx) => ctx.db.get(b)))!;
+    return { ...lead, claimB };
+  }
+  /** A resolver fix: bump its version (as the fix would) and make it rank the loser first. */
+  function shipResolverFix(claimB: Doc<"claims">, contactId: Id<"contacts">) {
+    STAGE_LOGIC_VERSION.resolve += 1;
+    stageHandlers.resolve = async (ctx, subject) => {
+      const r = await originals.resolve(ctx, subject);
+      if (subject.state.subjectId === contactId) await projectEmail(ctx, contactId, claimB);
+      return r;
+    };
+  }
+
+  test("the new winner is judged: a disposable address that a resolver fix promotes is verified and penalised, not skipped", async () => {
+    const { contactId, claimB } = await withLoser("jo@mailinator.com");
+    const before = await confidenceOf(contactId);
+    shipResolverFix(claimB, contactId);
+    await start(contactId);
+    await drain();
+    expect(await claimOf(contactId, "email")).toBe(claimB._id);
+    expect((await rowsFor(contactId)).find((r) => r.claimId === claimB._id)).toMatchObject({ outcome: "fail", reason: "disposable" });
+    expect(await confidenceOf(contactId)).toBeCloseTo(before * 0.5, 7);
+  });
+
+  test("a resolver fix that re-projects to a GOOD address still rescores: the score reads the projection", async () => {
+    const { contactId, claimB } = await withLoser("jo.doe@acme.com");
+    const runs = (await all("scoreRuns")).filter((r) => r.subjectId === contactId).length;
+    shipResolverFix(claimB, contactId);
+    await start(contactId);
+    await drain();
+    expect((await rowsFor(contactId)).find((r) => r.claimId === claimB._id)).toMatchObject({ outcome: "pass" });
+    expect((await all("scoreRuns")).filter((r) => r.subjectId === contactId)).toHaveLength(runs + 1);
+  });
+
+  test("the verify hash names the claims it will judge: a projection that changed underneath it, with no version bump, re-runs verify", async () => {
+    const { contactId, claimB } = await withLoser("jo@mailinator.com");
+    await raw.run((ctx) => projectEmail(ctx, contactId, claimB));
+    const st = (await all("pipelineState")).find((s) => s.subjectId === contactId)!;
+    await raw.run((ctx) => ctx.db.patch(st._id, { stage: "verify", status: "active" }));
+    expect((await t.run((ctx) => runStage(ctx, { subjectType: "contact", subjectId: contactId, stage: "verify" }))).status).toBe("done");
+    expect((await rowsFor(contactId)).find((r) => r.claimId === claimB._id)).toMatchObject({ outcome: "fail", reason: "disposable" });
+  });
+});
+
+describe("M3: one stored shape, one verdict, whichever path the value came in by", () => {
+  /** A value typed by an operator through `appendClaim` is stored as typed; ingest would have stored it normalized. */
+  async function typed(field: "email" | "phone", value: string) {
+    const lead = await ingestLead({ phone: null });
+    await t.run(async (ctx) => {
+      await appendClaimRecord(ctx, { subjectType: "contact", subjectId: lead.contactId, field, value, sourceId: lead.sourceId, method: "observed", confidence: 1, observedAt: Date.now() });
+      await rebuildProjection(ctx, { subjectType: "contact", subjectId: lead.contactId });
+      await verifySubject(ctx, { subjectType: "contact", subjectId: lead.contactId });
+    });
+    expect((await t.run(async (ctx) => (await ctx.db.get(lead.contactId))!.fields.find((f: { field: string }) => f.field === field)!.value))).toBe(value); // stored raw
+    return (await rowsFor(lead.contactId)).filter((r) => r.kind === field).pop()!;
+  }
+
+  test.each([
+    ["an extension after #", "+1 555 010 4242 #123"],
+    ["a tel: URI with ;ext=", "tel:+1-555-010-4242;ext=123"],
+    ["the word extension", "+1 555 010 4242 extension 12"],
+    ["non-breaking spaces", "+1\u00a0555\u00a0010\u00a04242"],
+    ["non-breaking hyphens (U+2011)", "+1\u2011555\u2011010\u20114242"],
+  ])("a valid phone written with %s passes, as its ingested form does", async (_name, value) => {
+    expect(await typed("phone", value)).toMatchObject({ outcome: "pass", reason: "ok" });
+  });
+
+  test.each([
+    ["a fullwidth @ (folded by NFKC)", "jo\uff20acme.com"],
+    ["a trailing dot on the domain", "Jo@Acme.com."],
+  ])("a valid email written with %s passes, as its ingested form does", async (_name, value) => {
+    expect(await typed("email", value)).toMatchObject({ outcome: "pass", reason: "ok" });
+  });
+
+  test("a disposable address is still a disposable address however it is spelled", async () => {
+    expect(await typed("email", "Jo@Mailinator.com.")).toMatchObject({ outcome: "fail", reason: "disposable" });
+  });
+});
+
+describe("L2: the recorder computes the verdict; a caller cannot hand it one", () => {
+  test("recording on a disposable address yields fail/disposable, and a caller-supplied verdict is refused, not believed", async () => {
+    const { contactId } = await ingestLead({ email: "jo@mailinator.com" });
+    const claimId = await claimOf(contactId, "email");
+    const lie = { subjectType: "contact", subjectId: contactId, claimId, result: { kind: "email", outcome: "pass", reason: "ok" }, provider: "structural" };
+    await expect(t.run((ctx) => recordVerification(ctx, lie as never))).rejects.toThrow(/computed from the claim/);
+    expect(await rowsFor(contactId)).toHaveLength(0);
+    const id = await t.run((ctx) => recordVerification(ctx, { subjectType: "contact", subjectId: contactId, claimId }));
+    expect(await raw.run((ctx) => ctx.db.get(id))).toMatchObject({ kind: "email", outcome: "fail", reason: "disposable", provider: "structural" });
+  });
+});
+
+describe("L5: a failed verdict the score never counted makes that score stale, and its lead unshippable", () => {
+  async function scoredLead(over: Parameters<typeof ingestLead>[0] = {}) {
+    const lead = await ingestLead(over);
+    await makeIcp();
+    await funding(lead.accountId, lead.sourceId);
+    await start(lead.contactId);
+    await drain();
+    const scoreRun = (await all("scoreRuns")).filter((r) => r.subjectId === lead.contactId).pop()! as Doc<"scoreRuns">;
+    return { ...lead, scoreRun };
+  }
+  async function shipped() {
+    const lead = await scoredLead();
+    const leadRow = ((await all("leads")) as Doc<"leads">[]).find((l) => l.contactId === lead.contactId)!;
+    expect(leadRow).toMatchObject({ inventoryState: "Available" });
+    expect(leadRow.distributability.ok).toBe(true);
+    return { ...lead, leadId: leadRow._id };
+  }
+  const stale = (l: Awaited<ReturnType<typeof scoredLead>>) => t.run((ctx) => staleReason(ctx, orgId, l.scoreRun, { accountId: l.accountId, contactId: l.contactId }, Date.now()));
+  const reserve = (leadId: Id<"leads">) => t.run((ctx) => setInventoryState(ctx, { leadId, state: "Reserved" }));
+
+  test("verify commits a new fail, then score dead-letters: the old score is stale and the old lead cannot be reserved", async () => {
+    const l = await shipped();
+    expect(await stale(l)).toBeNull();
+    (DISPOSABLE_DOMAINS as string[]).push("acme.com");
+    stageHandlers.score = async () => {
+      throw stageFailure("no_such_record", "icp", "the org has no ICP to score against");
+    };
+    await start(l.contactId);
+    await drain();
+    expect((await all("pipelineState")).find((s) => s.subjectId === l.contactId)).toMatchObject({ status: "deadlettered", stage: "score" });
+    expect((await all("scoreRuns")).filter((r) => r.subjectId === l.contactId).pop()!._id).toBe(l.scoreRun._id); // still the latest
+    expect(await stale(l)).toMatch(/verification of the contact's email failed after the score/);
+    await expect(reserve(l.leadId)).rejects.toThrow(/verification of the contact's email failed after the score/);
+  });
+
+  test("control: a failure the score already counted, re-judged as a failure under new rules, is not news (no needless rescore)", async () => {
+    const l = await scoredLead({ email: "jo@mailinator.com" }); // halved below the C floor: scored, rejected, never packaged
+    expect(l.scoreRun.tier).toBe("Reject");
+    (DISPOSABLE_DOMAINS as string[]).push("other.example");
+    expect(await t.run((ctx) => verifySubject(ctx, { subjectType: "contact", subjectId: l.contactId }))).toBe(2);
+    expect((await rowsFor(l.contactId)).filter((r) => r.kind === "email").map((r) => r.outcome)).toEqual(["fail", "fail"]);
+    expect(await stale(l)).toBeNull();
+  });
+
+  test("control: a good lead with no new verdict still reserves", async () => {
+    const l = await shipped();
+    await expect(reserve(l.leadId)).resolves.toBeNull();
   });
 });

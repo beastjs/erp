@@ -19,6 +19,15 @@ const product = (all: Files): Files => Object.fromEntries(Object.entries(all).fi
  *   B  that file never patches, replaces or deletes, and inserts at exactly one site.
  *   C  a file that reaches rows WITHOUT naming the table (it imports the helpers and is handed a row) may not mutate
  *      anything but the pinned targets below. Matched on the SHAPE of the call's first argument, not a variable name.
+ *
+ * BLIND SPOTS, recorded rather than fixed (none is live; each needs code written to evade the nets):
+ *   - an ALIASED db handle: `const d = ctx.db; d.patch(r._id, ...)` is not `db.patch(`, so B and C read no mutation;
+ *   - an insert through a VARIABLE table name: `ctx.db.insert(TABLE, row)` with `const TABLE = "verifications"` in
+ *     another file names the table nowhere A looks in the inserting file, and B counts only the literal spelling;
+ *   - a WRAPPER file: a file that imports the helpers and only RETURNS a verification row to a third file, which
+ *     then mutates it, leaves that third file importing no verify file, so C does not consider it a consumer;
+ *   - C's pins are LITERAL TEXT: `stages.ts` is pinned as the spelling `state._id` (x8) and `existing._id`, so a new
+ *     write to a verification row through a variable that happens to be spelled `state` passes as a pinned target.
  */
 const MUTATIONS = "/convex/verify/mutations.ts";
 
@@ -83,6 +92,14 @@ const netC = (all: Files, pinned: Record<string, string[]>) =>
     .sort();
 
 const real = product(files);
+/** Every consumer that mutates, and exactly what it mutates. A new entry is a decision, made here. */
+const PINNED_CONSUMERS = (): Record<string, string[]> => ({
+  "/convex/pipeline/stages.ts": PINNED_STAGES,
+  // setInventoryState / setDisposition: the lead's two writes. It reads verdicts for staleness (Task 15 L5), never writes one.
+  "/convex/leads/mutations.ts": ["lead._id", "lead._id"],
+  // the re-judge sweep's own progress row (`verificationSweeps`), never a verification.
+  "/convex/verify/sweep.ts": ["sweepRow._id"],
+});
 const realStages = mutatedTargets(real["/convex/pipeline/stages.ts"]!);
 
 test("the nets read real code: the table is named only by verify/mutations.ts, which really inserts, and stages.ts really reaches the helpers and mutates", () => {
@@ -93,6 +110,11 @@ test("the nets read real code: the table is named only by verify/mutations.ts, w
   expect(reachesWithoutNaming("/convex/pipeline/stages.ts", real["/convex/pipeline/stages.ts"]!)).toBe(true);
   expect(realStages.length).toBeGreaterThan(5);
   expect(reachesWithoutNaming("/convex/scoring/assemble.ts", real["/convex/scoring/assemble.ts"]!)).toBe(true);
+  // The other pinned consumers are real consumers that really mutate, so their pins are not vacuous.
+  for (const path of Object.keys(PINNED_CONSUMERS())) {
+    expect(reachesWithoutNaming(path, real[path]!), path).toBe(true);
+    expect(mutatedTargets(real[path]!), path).toEqual(PINNED_CONSUMERS()[path]);
+  }
 });
 
 test("stages.ts's mutations are exactly the ones it had before verification existed (all on pipelineState)", () => {
@@ -156,6 +178,11 @@ const MUTANTS: Array<{ name: string; tree: Files; caught: Array<"A" | "B" | "C">
     caught: ["C"],
   },
   {
+    name: "the leads module, which now reads verdicts, gains an unreviewed mutation",
+    tree: withEdit("/convex/leads/mutations.ts", (s) => s + "\nexport const f = (ctx, v) => ctx.db.patch(v._id, { outcome: \"pass\" });"),
+    caught: ["C"],
+  },
+  {
     name: "stages.ts gains an unreviewed mutation",
     tree: withEdit("/convex/pipeline/stages.ts", (s) => s + "\nexport const f = (ctx, other) => ctx.db.patch(other._id, { x: 1 });"),
     caught: ["C"],
@@ -167,7 +194,7 @@ test.each(MUTANTS)("mutant: $name", ({ tree, caught }) => {
     [
       ["A", netA(tree).length > 0],
       ["B", netB(tree).length > 0],
-      ["C", netC(tree, { "/convex/pipeline/stages.ts": PINNED_STAGES }).length > 0],
+      ["C", netC(tree, PINNED_CONSUMERS()).length > 0],
     ] as const
   )
     .filter(([, hit]) => hit)
@@ -182,5 +209,5 @@ test("each net is load-bearing: every net catches a mutant that the other two mi
 test("the clean tree passes (the mutants differ from it, not from a broken baseline)", () => {
   expect(netA(real)).toEqual([]);
   expect(netB(real)).toEqual([]);
-  expect(netC(real, { "/convex/pipeline/stages.ts": PINNED_STAGES })).toEqual([]);
+  expect(netC(real, PINNED_CONSUMERS())).toEqual([]);
 });

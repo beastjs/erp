@@ -124,8 +124,12 @@ export function scanEmail(s: string, probe?: Probe): EmailScan {
   return { ok: true, atIndex: at, plusIndex: plus, dots: [dotA, dotB, dotC], nonAscii };
 }
 
-/** Bump by hand when the matching CODE changes (the lists fingerprint themselves). */
-export const STRUCTURAL_RULES_REVISION = 2;
+/**
+ * Bump by hand when the matching CODE changes (the lists fingerprint themselves). 2: a bare 16..21-digit phone is
+ * `unknown/ambiguous_length`, not `fail/bad_length`. 3: a claim value is judged in its normalized form
+ * (verify/mutations.ts `judgeClaimValue`), so raw values an operator typed are re-judged.
+ */
+export const STRUCTURAL_RULES_REVISION = 3;
 
 export type LogicLists = { revision: number; disposable: readonly string[]; roles: readonly string[] };
 const currentLists = (): LogicLists => ({ revision: STRUCTURAL_RULES_REVISION, disposable: DISPOSABLE_DOMAINS, roles: ROLE_LOCAL_PARTS });

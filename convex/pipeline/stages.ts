@@ -14,6 +14,7 @@ import { trySpendCredits } from "../runs/mutations";
 import { scoreLead } from "../scoring/assemble";
 import { MAX_SIGNALS, activeSignals } from "../signals/mutations";
 import { verificationsForSubject, verifySubject } from "../verify/mutations";
+import { VERIFICATION_KINDS } from "../verify/schema";
 import { structuralLogic } from "../verify/structural";
 import { requireRole, systemActor } from "../_shared/authz";
 import { writeAudit } from "../audit/log";
@@ -183,6 +184,18 @@ export async function inputHashFor(ctx: MutationCtx, orgId: Id<"orgs">, state: D
   // changing merely because scoring ran, which would make the first score look like new input forever after.
   const scoringModelId = stage === "score" || stage === "qualify" ? (await ensureActiveScoringModel(ctx))._id : null;
   const version = `logic:${STAGE_LOGIC_VERSION[stage]}`;
+  // verify and score read the PROJECTION, which the resolver writes: which claim wins a field is resolve's logic, not
+  // the claims alone. So a resolver fix (a bump of resolve's version) is an input to both, or a replay re-projects,
+  // flips the winning email with no new claim, and then skips verify (the new winner is never judged) and score.
+  const resolver = `resolve:${STAGE_LOGIC_VERSION.resolve}`;
+  // The claims verify will judge, as the projection names them NOW (resolve has run before verify does). Covers a
+  // projection that changed by any other path too: the judged claim is an input, not just the set it was drawn from.
+  const judged = async () => {
+    const id = ctx.db.normalizeId(tableFor(state.subjectType), state.subjectId);
+    const subject = id && (await ctx.db.get(id));
+    if (!subject || subject.orgId !== orgId) return [];
+    return [...VERIFICATION_KINDS].map((kind) => `judges:${kind}:${subject.fields.find((f) => f.field === kind)?.claimId ?? "none"}`);
+  };
   // What the scorer takes from verify: ONLY a failed verdict moves a score (`verificationFactor`: pass and unknown are
   // neutral), so only failures are inputs. Hashing pass/unknown too would rescore, and replace the Available lead of,
   // every contact whose role-list edit turned a pass into an unknown, for an identical score. A test pins that
@@ -201,11 +214,11 @@ export async function inputHashFor(ctx: MutationCtx, orgId: Id<"orgs">, state: D
       return stageInputHash({ claimIds: [...ownIds, ...(await accountClaimIds())], icpVersionId: null, scoringModelId: null, extra: [version] });
     case "verify":
       // The lists are logic: their fingerprint is an input, so a list edit forces a re-run rather than a skip.
-      return stageInputHash({ claimIds: [...ownIds, ...(await accountClaimIds())], icpVersionId: null, scoringModelId: null, extra: [version, `rules:${structuralLogic().hash}`] });
+      return stageInputHash({ claimIds: [...ownIds, ...(await accountClaimIds())], icpVersionId: null, scoringModelId: null, extra: [version, resolver, `rules:${structuralLogic().hash}`, ...(await judged())] });
     case "signals":
       return stageInputHash({ claimIds: [], icpVersionId: null, scoringModelId: null, extra: [version, ...(await signals())] });
     case "score":
-      return stageInputHash({ claimIds: [...ownIds, ...(await accountClaimIds())], icpVersionId, scoringModelId, extra: [version, ...(await signals()), ...(await verdicts())] });
+      return stageInputHash({ claimIds: [...ownIds, ...(await accountClaimIds())], icpVersionId, scoringModelId, extra: [version, resolver, ...(await signals()), ...(await verdicts())] });
     case "qualify":
       return stageInputHash({ claimIds: [], icpVersionId, scoringModelId, extra: [version, `scoreRun:${state.scoreRunId ?? "none"}`] });
     case "package":
@@ -533,13 +546,20 @@ const accountFanouts = new WeakMap<object, Set<string>>();
 /** Contacts rewound per continuation, so no single mutation walks an unbounded account. */
 const REWIND_PAGE = 50;
 
-async function rewindToResolve(ctx: MutationCtx, state: Doc<"pipelineState">): Promise<void> {
+/**
+ * THE rewind: sends a subject that has finished (or got past `resolve`) back to `resolve`. Used by `markScoreStale`
+ * for new evidence and by the verification re-judge sweep (verify/sweep.ts) for new rules; there is no second one.
+ * Refuses an erased subject and a dead-lettered one: neither new evidence nor new rules resurrect them. Returns
+ * whether it rewound.
+ */
+export async function rewindToResolve(ctx: MutationCtx, state: Doc<"pipelineState">): Promise<boolean> {
   // An erased subject stays stopped: an account-level change fans out to every contact at it, erased ones included.
-  if (state.finishedReason === ERASED_REASON) return;
+  if (state.finishedReason === ERASED_REASON) return false;
   // Nothing past `resolve` has completed for a subject still at or before it; its hashes will see the new evidence on their own.
-  if (state.status === "deadlettered" || (state.status === "active" && stageIndex(state.stage) <= stageIndex("resolve"))) return;
+  if (state.status === "deadlettered" || (state.status === "active" && stageIndex(state.stage) <= stageIndex("resolve"))) return false;
   await ctx.db.patch(state._id, { stage: "resolve", status: "active", attempt: 0, finishedReason: undefined, updatedAt: Date.now() });
   await advance(ctx, { subjectType: state.subjectType, subjectId: state.subjectId });
+  return true;
 }
 
 /**

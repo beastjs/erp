@@ -61,3 +61,22 @@ export const verifications = defineTable({
 })
   // The latest verdict on one claim is an exact-key read, newest first.
   .index("by_org_and_claim", ["orgId", "claimId"]);
+
+/*
+ * One row per org: how far the re-judge sweep (verify/sweep.ts) has walked under the CURRENT rules. This is what makes
+ * the sweep cheap when nothing is stale: once `done` is set for today's `logic`, a tick reads this one row per org and
+ * schedules nothing. A rules change (a list edit or a revision bump) changes `logic`, which reads as "not done" and
+ * restarts the walk from the first subject.
+ *
+ * Content-free like `verifications`: ids, a number and a boolean. `after` is the last pipelineState `subjectId` the
+ * walk finished (an opaque contact id), so the walk resumes by an exact index range, not by a stored cursor string.
+ * `leaseUntil` is written ONLY by a slice that committed: a slice that throws leaves the previous one's lease, which
+ * expires, and the next tick resumes from the last committed `after`. Nothing records a failure (Task 13's rule).
+ */
+export const verificationSweeps = defineTable({
+  orgId: v.id("orgs"),
+  logic: v.number(),
+  after: v.optional(v.id("contacts")),
+  done: v.boolean(),
+  leaseUntil: v.number(),
+}).index("by_org", ["orgId"]);

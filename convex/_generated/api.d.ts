@@ -59,6 +59,7 @@ import type * as sources_xlsx from "../sources/xlsx.js";
 import type * as verify_lists from "../verify/lists.js";
 import type * as verify_mutations from "../verify/mutations.js";
 import type * as verify_structural from "../verify/structural.js";
+import type * as verify_sweep from "../verify/sweep.js";
 
 import type {
   ApiFromModules,
@@ -118,6 +119,7 @@ declare const fullApi: ApiFromModules<{
   "verify/lists": typeof verify_lists;
   "verify/mutations": typeof verify_mutations;
   "verify/structural": typeof verify_structural;
+  "verify/sweep": typeof verify_sweep;
 }>;
 
 /**

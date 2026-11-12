@@ -61,7 +61,8 @@ export const COMPANY_STRING_FIELDS = [
 ] as const;
 export const ACQUISITION_STRING_FIELDS = ["campaign", "channel", "queryContext", "landingPage", "referral"] as const;
 
-const MAX_STRING = 2048;
+/** The longest string a candidate field may carry. verify/mutations.ts normalizes a claim value only up to this length, so it judges every value ingest could have stored exactly as ingest stored it. */
+export const MAX_STRING = 2048;
 const MAX_TECH_STACK = 100;
 
 type Obj = Record<string, unknown>;

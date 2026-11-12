@@ -140,7 +140,7 @@ module
   interface SpinnerSectionProps {
     pending: boolean
     size: ButtonSize
-    icon: "icon" | "account" | "arrow-down" | "arrow-left" | "arrow-right" | "beast" | "book" | "bookmark" | "check-circle" | "chevron-down" | "clear" | "close" | "copy" | "download" | "folder" | "gym" | "image" | "images" | "launch" | "mechanics" | "menu" | "new-folder" | "paint" | "paste" | "plus" | "re-up.ph" | "search" | "send" | "sidebar" | "spinner-ring" | "switch" | "theme" | "timeline" | "wrench" | undefined
+    icon?: IconName
     condition: boolean
   }
 

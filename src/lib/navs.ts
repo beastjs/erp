@@ -1,4 +1,4 @@
-import type { IconName } from '@/lib/icons/types'
+import type { IconName } from '@/lib/icons'
 
 export type NavItem = {
   href: string
